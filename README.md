@@ -29,6 +29,13 @@ beam hook claude-code < payload.json # forward a hook payload for the given agen
 
 beam agent list                     # supported agents and payload verification status
 beam agent install cursor           # wire beam's hook into that agent's own config, non-destructively
+
+beam service install                # run the collector as a background service (starts on login)
+beam service status                 # is it installed / running
+beam service stop                   # stop it
+beam service start                  # start it again
+beam service uninstall              # remove it
+beam service logs                   # where its log files are (or the command to follow them)
 ```
 
 `scan` runs entirely offline unless `--save` is passed — no collector required. `hook` never throws or blocks the calling agent; capture failures are logged to stderr only. This mirrors Beam's core rule: **observation must never become enforcement.**
@@ -49,6 +56,19 @@ Different agents send different JSON shapes to their hooks. `beam hook <agent>` 
 Run `beam agent list` for the current status of each. Adding a new agent means one entry in `src/agents.ts` (config path + how to merge the hook block) and, if its stdin payload uses different field names than `tool_name`/`tool_input`/`session_id`/`cwd`/`hook_event_name`, one adapter function in `src/hook-adapters.ts`.
 
 This is an intentionally small first slice of what a full multi-agent observer covers (see [Numbat](https://github.com/perplexityai/numbat) for the much larger prior art: 25+ agents, forensic on-disk artifact extraction without live hooks, a CEL rule engine, enforcement/blocking, and portable case bundles). Beam does not yet do artifact extraction, a real rule engine beyond flat regexes, or enforcement — those are tracked as future slices, not silently unsupported.
+
+## Running as a background service
+
+`beam serve` in a terminal works, but closing that terminal stops the collector. `beam service install` instead registers it as a real background service:
+
+- **macOS**: a `launchd` user agent at `~/Library/LaunchAgents/ai.beam.collector.plist` (`RunAtLoad` + `KeepAlive`, so it starts on login and restarts if it crashes).
+- **Linux**: a `systemd --user` unit at `~/.config/systemd/user/beam.service` (`enable --now`, `Restart=always`).
+
+Both embed the resolved `BEAM_DATA_DIR` directly into the service definition (launchd/systemd don't inherit your shell's environment), so `BEAM_DATA_DIR=/custom/path beam service install` keeps using that path even after a reboot. Logs go to `$BEAM_DATA_DIR/logs/`.
+
+This is a userspace HTTP server, same as running `beam serve` yourself — not kernel-level capture. Beam has nothing to observe at the kernel level: the actual signal comes from agents calling `beam hook <agent>` at the moment they're about to act, the same way whether run in a terminal or as a background service.
+
+Windows isn't supported yet (`beam service *` will say so and tell you to run `beam serve` directly).
 
 ## Configuration
 

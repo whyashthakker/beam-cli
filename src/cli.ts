@@ -5,6 +5,7 @@ import { startServer } from "./serve.js";
 import { captureHook, importEvents, readToken, scanFile } from "./client.js";
 import { AGENTS } from "./agents.js";
 import { installHook } from "./install.js";
+import { installService, serviceLogPaths, serviceStatus, startService, stopService, uninstallService } from "./service.js";
 
 const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
 
@@ -19,6 +20,37 @@ program.command("serve")
   .action(async (options: { port?: string }) => {
     const result = await startServer({ port: options.port ? Number(options.port) : undefined });
     console.log(`Beam collector: ${result.url}\nMode: observe only\nLocal storage: ${result.directory}\nPairing token: ${result.token}`);
+  });
+
+const service = program.command("service").description("Run the collector as a background service (launchd on macOS, systemd --user on Linux)");
+
+service.command("install")
+  .description("Install and start the collector as a background service that survives reboots")
+  .option("-p, --port <port>", "port to listen on")
+  .action(async (options: { port?: string }) => {
+    const result = await installService({ port: options.port ? Number(options.port) : undefined });
+    console.log(`✔ Installed and started the beam service (${result.platform})\n  config: ${result.configPath}`);
+  });
+
+service.command("uninstall")
+  .description("Stop and remove the background service")
+  .action(async () => { await uninstallService(); console.log("✔ Removed the beam service."); });
+
+service.command("start").description("Start the installed background service").action(async () => { await startService(); console.log("✔ Started."); });
+service.command("stop").description("Stop the installed background service").action(async () => { await stopService(); console.log("✔ Stopped."); });
+
+service.command("status")
+  .description("Show whether the background service is installed and running")
+  .action(async () => {
+    const result = await serviceStatus();
+    console.log(`platform: ${result.platform}\ninstalled: ${result.managed}\nrunning: ${result.running ?? "unknown"}\nconfig: ${result.configPath}`);
+  });
+
+service.command("logs")
+  .description("Print the background service's log file paths (or the command to follow them)")
+  .action(async () => {
+    const paths = await serviceLogPaths();
+    console.log(paths.err ? `stdout: ${paths.out}\nstderr: ${paths.err}` : paths.out);
   });
 
 program.command("token")
