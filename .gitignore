@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+.data/
+.DS_Store
+*.tgz
+.npmrc
+.npm/
+npm-debug.log*
+.build-watch.log
+.build-watch.pid
