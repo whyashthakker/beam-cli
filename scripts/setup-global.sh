@@ -44,3 +44,11 @@ fi
 echo
 echo "Detecting installed agents and wiring beam's hook into every one found (Claude Code, Codex, Cursor, Copilot CLI, Gemini CLI)..."
 beam agent install-all
+
+echo
+if beam token >/dev/null 2>&1; then
+  echo "Opening beam studio..."
+  beam studio
+else
+  echo "Run 'beam start' or 'beam service install' to start the collector, then 'beam studio' to see activity."
+fi
