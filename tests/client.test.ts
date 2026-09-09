@@ -127,6 +127,12 @@ describe("scanFile", () => {
 });
 
 describe("captureHook", () => {
+  // Isolate the data dir so no real ~/.beam/identity.json or policy.json leaks in
+  // and triggers workspace forwarding / enforcement during these unit tests.
+  beforeEach(async () => {
+    process.env.BEAM_DATA_DIR = await tempDir("beam-hook-");
+  });
+
   function withStdin(payload: string): void {
     const stream = Readable.from([payload]);
     Object.defineProperty(process, "stdin", { value: stream, configurable: true });

@@ -5,6 +5,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { createCollector } from "./server.js";
 import { getDataDirectory } from "./config.js";
 import { loadCustomRules } from "./custom-rules.js";
+import { readIdentity } from "./enroll.js";
+import { syncPolicy } from "./forward.js";
 
 function toWebRequest(req: IncomingMessage): Promise<Request> {
   return new Promise((resolvePromise, reject) => {
@@ -43,7 +45,7 @@ export interface StartServerOptions {
   rulesHome?: string;
 }
 
-export async function startServer(options: StartServerOptions = {}): Promise<{ url: string; token: string; directory: string; customRules: { path: string; loaded: number; errors: string[] }; close: () => void }> {
+export async function startServer(options: StartServerOptions = {}): Promise<{ url: string; token: string; directory: string; customRules: { path: string; loaded: number; errors: string[] }; policySync: boolean; close: () => void }> {
   const directory = options.directory ?? getDataDirectory();
   await mkdir(directory, { recursive: true, mode: 0o700 });
   // Loaded once per process into core.ts's shared rule set; a file edit needs a restart to apply.
@@ -85,5 +87,19 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
     });
   });
 
-  return { url: `http://${hostname}:${boundPort}`, token, directory, customRules, close: () => server.close() };
+  // Keep the cached policy fresh so `beam hook` can enforce it without a network call.
+  let policyTimer: NodeJS.Timeout | undefined;
+  const identity = await readIdentity();
+  if (identity) {
+    const poll = () => { void syncPolicy().catch(() => {}); };
+    poll();
+    policyTimer = setInterval(poll, 60_000);
+    policyTimer.unref?.();
+  }
+
+  return {
+    url: `http://${hostname}:${boundPort}`, token, directory, customRules,
+    policySync: Boolean(identity),
+    close: () => { if (policyTimer) clearInterval(policyTimer); server.close(); },
+  };
 }

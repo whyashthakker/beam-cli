@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { getBeamHome, getCollectorUrl, getDataDirectory } from "./config.js";
 import { normalize, scanText, type Event, type Scan } from "./core.js";
 import { adaptHookPayload } from "./hook-adapters.js";
+import { forwardEvents } from "./forward.js";
+import { evaluate, readPolicy } from "./policy.js";
 import { extractAgent } from "./extract.js";
 import { loadCustomRules } from "./custom-rules.js";
 
@@ -108,9 +110,57 @@ export async function captureHook(sourceAgent = "claude-code"): Promise<void> {
       data.tool_name = data.tool_name ?? "UserPromptSubmit";
       data.command = data.command ?? data.prompt;
     }
-    await send("/ingest", JSON.stringify(data));
-    // No hook response means no approval/denial; observation must never become enforcement.
+
+    // 1. Enforcement first — a local file read, so it works even if the collector is down.
+    //    Only acts when a manager has set the policy to advisory/enforce; observe mode
+    //    (the default) is a no-op and Beam stays observation-only.
+    const toolInput = data.tool_input && typeof data.tool_input === "object"
+      ? (data.tool_input as Record<string, unknown>) : {};
+    const decision = evaluate(await readPolicy().catch(() => null), {
+      agent: sourceAgent,
+      tool: String(data.tool_name ?? ""),
+      command: String(data.command ?? toolInput.command ?? ""),
+    });
+
+    let event = safeNormalize(data);
+    if (decision.action === "deny") {
+      if (event) event = { ...event, findings: [...event.findings, blockedFinding(decision.reason)] };
+      emitDeny(sourceAgent, decision.reason ?? "Blocked by workspace policy.");
+    } else if (decision.action === "warn") {
+      process.stderr.write(`\n⚠ Beam policy (advisory): ${decision.reason}\n`);
+    }
+
+    // 2. Local capture (best-effort — a failure here must not skip enforcement or throw).
+    try { await send("/ingest", JSON.stringify(data)); }
+    catch (e) { console.error(e instanceof Error ? e.message : String(e)); }
+
+    // 3. Forward to the workspace if enrolled (fire-and-forget, never blocks).
+    if (event) { try { await forwardEvents(event); } catch { /* offline */ } }
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function safeNormalize(data: Record<string, unknown>): Event | null {
+  try { return normalize(data); } catch { return null; }
+}
+
+function blockedFinding(reason = "Blocked by workspace policy."): Event["findings"][number] {
+  return { id: "policy.blocked", title: "Blocked by workspace policy", severity: "high", explanation: reason, evidence: "" };
+}
+
+// Claude Code / Codex PreToolUse contract: a JSON decision on stdout denies the tool call.
+// Other agents get a stderr note only (their block contracts differ and aren't verified).
+function emitDeny(agent: string, reason: string): void {
+  if (agent === "claude-code" || agent === "codex") {
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: `Beam: ${reason}`,
+      },
+    }));
+  } else {
+    process.stderr.write(`\n✖ Beam policy would block this (${agent} enforcement not wired): ${reason}\n`);
   }
 }

@@ -9,6 +9,7 @@ import { installAllDetectedHooks, installHook } from "./install.js";
 import { installService, serviceLogPaths, serviceStatus, startService, stopService, uninstallService } from "./service.js";
 import { getCollectorUrl, getIdentityPath } from "./config.js";
 import { enrollDevice, readIdentity } from "./enroll.js";
+import { syncPolicy } from "./forward.js";
 import { openBrowser } from "./open-browser.js";
 import { ruleCatalog } from "./core.js";
 import { loadCustomRules } from "./custom-rules.js";
@@ -28,7 +29,8 @@ program.command("start")
     const result = await startServer({ port: options.port ? Number(options.port) : undefined });
     const rulesNote = result.customRules.loaded ? `\nCustom rules loaded: ${result.customRules.loaded} from ${result.customRules.path}` : "";
     for (const message of result.customRules.errors) console.error(`✖ ${message}`);
-    console.log(`Beam collector running.\nMode: observe only\nLocal storage: ${result.directory}${rulesNote}\nRun 'beam token' for the pairing token.`);
+    const policyNote = result.policySync ? "\nPolicy sync: on (every 60s)" : "\nPolicy sync: off (device not enrolled — run 'beam enroll')";
+    console.log(`Beam collector running.\nMode: observe only\nLocal storage: ${result.directory}${rulesNote}${policyNote}\nRun 'beam token' for the pairing token.`);
   });
 
 const service = program.command("service").description("Run the collector as a background service (launchd on macOS, systemd --user on Linux)");
@@ -98,6 +100,15 @@ program.command("whoami")
     const identity = await readIdentity();
     if (!identity) throw new Error("This device is not enrolled. Run 'beam enroll --code <code>'.");
     console.log(`device: ${identity.deviceId}\norg:    ${identity.orgId}\napi:    ${identity.apiBase}\nhost:   ${identity.hostname} (${identity.os})\nsince:  ${identity.enrolledAt}`);
+  });
+
+program.command("sync")
+  .description("Pull the latest policy from your Beam workspace into ~/.beam/data/policy.json")
+  .action(async () => {
+    const result = await syncPolicy();
+    if (result.status === "not-enrolled") throw new Error("This device is not enrolled. Run 'beam enroll --code <code>'.");
+    if (result.status === "unreachable") throw new Error("Could not reach the Beam workspace. Check the network or 'beam whoami'.");
+    console.log(result.status === "updated" ? `✔ Policy v${result.version} synced → ${result.path}` : "✔ Policy already up to date.");
   });
 
 program.command("token")
