@@ -2,7 +2,7 @@
   "name": "beam",
   "version": "0.1.0",
   "description": "Beam - local observation and heuristic risk scanning for AI agent activity",
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "bin": {
     "beam": "dist/cli.js"
