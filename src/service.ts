@@ -44,7 +44,7 @@ export function macPlist(port: number, dataDir: string): string {
   <array>
     <string>${escape(exec)}</string>
     <string>${escape(cli)}</string>
-    <string>serve</string>
+    <string>start</string>
     <string>--port</string>
     <string>${port}</string>
   </array>
@@ -100,7 +100,7 @@ export function systemdUnit(port: number, dataDir: string): string {
 Description=Beam collector
 
 [Service]
-ExecStart=${exec} ${cli} serve --port ${port}
+ExecStart=${exec} ${cli} start --port ${port}
 Environment=BEAM_DATA_DIR=${dataDir}
 Restart=always
 RestartSec=2
@@ -138,7 +138,7 @@ async function systemdStatus(home?: string): Promise<ServiceInfo> {
 // --- dispatch ---
 
 function unsupported(): never {
-  throw new Error(`'beam service' is not supported on ${osPlatform()} yet. Run 'beam serve' directly instead.`);
+  throw new Error(`'beam service' is not supported on ${osPlatform()} yet. Run 'beam start' directly instead.`);
 }
 
 export async function installService(options: ServiceOptions = {}): Promise<ServiceInfo> {

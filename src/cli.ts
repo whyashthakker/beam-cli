@@ -14,7 +14,7 @@ const program = new Command()
   .description("Local observation and heuristic risk scanning for AI agent activity")
   .version(packageJson.version);
 
-program.command("serve")
+program.command("start")
   .description("Start the local Beam collector (binds to 127.0.0.1)")
   .option("-p, --port <port>", "port to listen on")
   .action(async (options: { port?: string }) => {

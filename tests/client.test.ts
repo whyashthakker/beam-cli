@@ -45,7 +45,7 @@ describe("readToken", () => {
   it("throws a clear message when no token file exists", async () => {
     const dir = await tempDir("beam-missing-");
     process.env.BEAM_DATA_DIR = dir;
-    await expect(readToken()).rejects.toThrow("beam serve");
+    await expect(readToken()).rejects.toThrow("beam start");
   });
 });
 

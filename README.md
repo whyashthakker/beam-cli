@@ -15,8 +15,8 @@ This installs dependencies, builds, `npm link`s the `beam` binary globally, and 
 ## Commands
 
 ```bash
-beam serve                          # start the local collector (binds 127.0.0.1:4319)
-beam serve --port 4400              # use a different port
+beam start                          # start the local collector (binds 127.0.0.1:4319)
+beam start --port 4400              # use a different port
 
 beam token                          # print the collector's pairing token
 
@@ -59,16 +59,16 @@ This is an intentionally small first slice of what a full multi-agent observer c
 
 ## Running as a background service
 
-`beam serve` in a terminal works, but closing that terminal stops the collector. `beam service install` instead registers it as a real background service:
+`beam start` in a terminal works, but closing that terminal stops the collector. `beam service install` instead registers it as a real background service:
 
 - **macOS**: a `launchd` user agent at `~/Library/LaunchAgents/ai.beam.collector.plist` (`RunAtLoad` + `KeepAlive`, so it starts on login and restarts if it crashes).
 - **Linux**: a `systemd --user` unit at `~/.config/systemd/user/beam.service` (`enable --now`, `Restart=always`).
 
 Both embed the resolved `BEAM_DATA_DIR` directly into the service definition (launchd/systemd don't inherit your shell's environment), so `BEAM_DATA_DIR=/custom/path beam service install` keeps using that path even after a reboot. Logs go to `$BEAM_DATA_DIR/logs/`.
 
-This is a userspace HTTP server, same as running `beam serve` yourself — not kernel-level capture. Beam has nothing to observe at the kernel level: the actual signal comes from agents calling `beam hook <agent>` at the moment they're about to act, the same way whether run in a terminal or as a background service.
+This is a userspace HTTP server, same as running `beam start` yourself — not kernel-level capture. Beam has nothing to observe at the kernel level: the actual signal comes from agents calling `beam hook <agent>` at the moment they're about to act, the same way whether run in a terminal or as a background service.
 
-Windows isn't supported yet (`beam service *` will say so and tell you to run `beam serve` directly).
+Windows isn't supported yet (`beam service *` will say so and tell you to run `beam start` directly).
 
 ## Configuration
 
@@ -76,7 +76,7 @@ Windows isn't supported yet (`beam service *` will say so and tell you to run `b
 - `BEAM_DATA_DIR` — where events/scans/token are stored (default `$BEAM_HOME/data`).
 - `BEAM_TOKEN` — pairing token (skips reading the token file).
 - `BEAM_COLLECTOR_URL` — collector origin the CLI talks to (default `http://127.0.0.1:4319`); must stay on HTTP loopback.
-- `BEAM_PORT` — port `beam serve` binds to (default `4319`).
+- `BEAM_PORT` — port `beam start` binds to (default `4319`).
 - `BEAM_ALLOWED_ORIGINS` — comma-separated browser origins allowed to call the collector (for a future local UI).
 
 ## Connect a Claude Code hook

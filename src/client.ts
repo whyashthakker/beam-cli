@@ -8,7 +8,7 @@ export async function readToken(): Promise<string> {
   if (process.env.BEAM_TOKEN) return process.env.BEAM_TOKEN;
   const tokenPath = join(getDataDirectory(), "token");
   try { return (await readFile(tokenPath, "utf8")).trim(); }
-  catch { throw new Error(`No token file at ${tokenPath}. Run 'beam serve' first.`); }
+  catch { throw new Error(`No token file at ${tokenPath}. Run 'beam start' first.`); }
 }
 
 async function send(route: string, body: string): Promise<unknown> {
