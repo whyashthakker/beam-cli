@@ -18,6 +18,8 @@ This installs dependencies, builds, `npm link`s the `beam` binary globally, and 
 beam start                          # start the local collector (binds 127.0.0.1:4319)
 beam start --port 4400              # use a different port
 
+beam studio                         # open the activity dashboard in your browser
+
 beam token                          # print the collector's pairing token
 
 beam import events.ndjson           # send normalized events to /ingest
@@ -29,6 +31,7 @@ beam hook claude-code < payload.json # forward a hook payload for the given agen
 
 beam agent list                     # supported agents and payload verification status
 beam agent install cursor           # wire beam's hook into that agent's own config, non-destructively
+beam agent install-all              # detect every agent actually installed on this machine and wire them all
 
 beam service install                # run the collector as a background service (starts on login)
 beam service status                 # is it installed / running
@@ -40,9 +43,23 @@ beam service logs                   # where its log files are (or the command to
 
 `scan` runs entirely offline unless `--save` is passed — no collector required. `hook` never throws or blocks the calling agent; capture failures are logged to stderr only. This mirrors Beam's core rule: **observation must never become enforcement.**
 
+## Studio (activity dashboard)
+
+`beam start` or `beam service install` also serves a dashboard at `GET /` and `GET /studio` on the collector itself — no separate app, no build step, no dependency added to the package (plain HTML/CSS/JS, no fonts or CDNs). `beam studio` opens it in your default browser for you.
+
+- **Activity** — every captured event, searchable and filterable by agent/risk, with a detail drawer per action.
+- **Findings** — the subset with heuristic matches, with a per-event "mark reviewed" (a record of your assessment, never an approval or block).
+- **Skill & MCP scan** — paste or check a file's content and see findings live, same engine as `beam scan`.
+
+The page itself carries no secret and needs no auth to load — only the API calls it makes do. `beam studio` reads the pairing token from disk and passes it once via a URL that's immediately scrubbed from the address bar (`history.replaceState`) after the page reads it. From there it's saved in that browser's `localStorage` (scoped to the collector's own origin, `127.0.0.1:4319` — no other site or app can read it), so reloading the tab or closing and reopening the browser stays connected without re-pairing. If the collector ever rejects the stored token (e.g. `beam service uninstall && beam service install` generates a new one), the page detects that and clears it automatically rather than looping silently. Use the **Disconnect** button to clear it yourself.
+
+Sessions and Usage views from the original Sentinel console aren't ported yet — Activity/Findings/Scan cover the core loop first.
+
 ## Multi-agent coverage
 
 Different agents send different JSON shapes to their hooks. `beam hook <agent>` picks the right adapter for the agent id you pass, and `beam agent install <agent>` writes beam's hook into that agent's real config file in its own native format, merging with (never overwriting) whatever hooks are already there.
+
+`npm run setup:global` runs `beam agent install-all` automatically at the end, so every agent it can detect on your machine gets wired without you having to know which ones you have installed. Detection uses each agent's own real, pre-existing files (e.g. `~/.codex/config.toml`, `~/.copilot/config.json`) — never a file beam itself writes — so an agent that was never actually installed won't get a hook, and one that's already wired won't get a duplicate entry on a second run.
 
 | Agent id | Config file `agent install` writes | Payload |
 |---|---|---|

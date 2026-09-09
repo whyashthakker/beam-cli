@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { normalize, parseInput, ruleCatalog, scanText } from "./core.js";
 import { Store } from "./store.js";
 import { inventory } from "./inventory.js";
+import { studioPage } from "./studio.js";
 
 export async function createCollector(options: { directory: string; token: string; origins?: string[] }) {
   const store = new Store(options.directory); await store.init();
@@ -21,6 +22,10 @@ export async function createCollector(options: { directory: string; token: strin
       headers["Access-Control-Allow-Private-Network"] = "true";
     }
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers });
+    // The studio shell carries no secret (a static page); it pairs with its own token in-browser.
+    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/studio")) {
+      return new Response(studioPage(), { headers: { ...headers, "Content-Type": "text/html; charset=utf-8" } });
+    }
     const provided = Buffer.from(req.headers.get("authorization") ?? "");
     if (provided.length !== secret.length || !timingSafeEqual(provided, secret)) return json({ error: "Pairing token is missing or incorrect." }, 401);
     if (req.headers.get("content-encoding")) return json({ error: "Compressed requests are not supported; disable gzip in the exporter." }, 415);

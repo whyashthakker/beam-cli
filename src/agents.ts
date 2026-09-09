@@ -70,35 +70,43 @@ export const AGENTS: AgentDefinition[] = [
   },
   {
     id: "codex", name: "Codex",
-    configs: [".codex/config.toml", ".codex/hooks.json"], artifacts: [".codex/sessions"],
+    configs: [".codex/config.toml"], artifacts: [".codex/sessions", ".codex/archived_sessions"],
     hookConfigPath: ".codex/hooks.json", hookEventName: "PreToolUse",
     mergeHookConfig: mergeClaudeStyleHooks("PreToolUse"), adapter: "passthrough", verifiedPayload: true,
     notes: "Same hooks.json shape and stdin payload fields as Claude Code (session_id, cwd, hook_event_name, tool_name, tool_input, tool_use_id)."
   },
   {
     id: "cursor", name: "Cursor",
-    configs: [".cursor/hooks.json"], artifacts: [".cursor/projects"],
+    // ".cursor/hooks.json" is the file beam itself writes on install, so it can never be used to
+    // detect a pre-existing Cursor install (circular). The bare ".cursor" directory is what
+    // Cursor itself creates just from being used, so it's a real presence signal.
+    configs: [".cursor"], artifacts: [".cursor/projects"],
     hookConfigPath: ".cursor/hooks.json", hookEventName: "preToolUse",
     mergeHookConfig: mergeCursorHooks("preToolUse"), adapter: "passthrough", verifiedPayload: true,
     notes: "Payload verified against cursor.com/docs/hooks; extra fields (model, conversation_id, ...) are ignored, not misread."
   },
   {
     id: "copilot-cli", name: "GitHub Copilot CLI",
-    configs: [".copilot/hooks/beam.json"], artifacts: [".copilot/session-state"],
+    // Same circularity as Cursor above: ".copilot/hooks/beam.json" is our own output.
+    // ".copilot/config.json" is what the real Copilot CLI writes on its own first run.
+    configs: [".copilot/config.json"], artifacts: [".copilot/session-state"],
     hookConfigPath: ".copilot/hooks/beam.json", hookEventName: "preToolUse",
     mergeHookConfig: mergeCopilotHooks("preToolUse"), adapter: "copilot-camel", verifiedPayload: true,
     notes: "Payload verified against docs.github.com Copilot hooks reference (camelCase: sessionId, cwd, toolName, toolArgs)."
   },
   {
     id: "gemini", name: "Gemini CLI",
-    configs: [".gemini/settings.json"], artifacts: [".gemini/tmp"],
+    // settings.json only exists once hooks/other settings are configured; the bare ".gemini"
+    // directory (created by any use of the Gemini CLI, e.g. mcp_config.json, projects/) is the
+    // reliable presence signal.
+    configs: [".gemini", ".gemini/settings.json"], artifacts: [".gemini/tmp"],
     hookConfigPath: ".gemini/settings.json", hookEventName: "BeforeTool",
     mergeHookConfig: mergeClaudeStyleHooks("BeforeTool"), adapter: "generic", verifiedPayload: false,
     notes: "Config wiring only. Gemini CLI's BeforeTool stdin schema is not published; capture uses a best-effort generic field adapter and may miss fields."
   },
   {
     id: "opencode", name: "OpenCode",
-    configs: [".config/opencode/opencode.json"], artifacts: [".local/share/opencode"],
+    configs: [".config/opencode/opencode.json", ".config/opencode/opencode.jsonc"], artifacts: [".local/share/opencode"],
     hookConfigPath: null, hookEventName: null,
     mergeHookConfig: null, adapter: "generic", verifiedPayload: false,
     notes: "OpenCode uses a generated TypeScript plugin, not a JSON hook file; beam does not generate plugin code yet. Discovery only."

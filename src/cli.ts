@@ -4,8 +4,10 @@ import { Command } from "commander";
 import { startServer } from "./serve.js";
 import { captureHook, importEvents, readToken, scanFile } from "./client.js";
 import { AGENTS } from "./agents.js";
-import { installHook } from "./install.js";
+import { installAllDetectedHooks, installHook } from "./install.js";
 import { installService, serviceLogPaths, serviceStatus, startService, stopService, uninstallService } from "./service.js";
+import { getCollectorUrl } from "./config.js";
+import { openBrowser } from "./open-browser.js";
 
 const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
 
@@ -19,7 +21,7 @@ program.command("start")
   .option("-p, --port <port>", "port to listen on")
   .action(async (options: { port?: string }) => {
     const result = await startServer({ port: options.port ? Number(options.port) : undefined });
-    console.log(`Beam collector: ${result.url}\nMode: observe only\nLocal storage: ${result.directory}\nPairing token: ${result.token}`);
+    console.log(`Beam collector running.\nMode: observe only\nLocal storage: ${result.directory}\nRun 'beam token' for the pairing token.`);
   });
 
 const service = program.command("service").description("Run the collector as a background service (launchd on macOS, systemd --user on Linux)");
@@ -51,6 +53,19 @@ service.command("logs")
   .action(async () => {
     const paths = await serviceLogPaths();
     console.log(paths.err ? `stdout: ${paths.out}\nstderr: ${paths.err}` : paths.out);
+  });
+
+program.command("studio")
+  .description("Open the local activity dashboard in your browser")
+  .action(async () => {
+    const origin = getCollectorUrl().origin;
+    let token: string;
+    try { token = await readToken(); }
+    catch (e) { throw new Error(`${(e as Error).message} 'beam studio' needs the collector running first.`); }
+    try { await fetch(`${origin}/health`, { signal: AbortSignal.timeout(2000) }); }
+    catch { throw new Error("Cannot reach the collector. Run 'beam start' or 'beam service install' first."); }
+    openBrowser(`${origin}/?token=${encodeURIComponent(token)}`);
+    console.log("Opening beam studio in your browser…");
   });
 
 program.command("token")
@@ -93,6 +108,21 @@ agent.command("install")
   .action(async (agentId: string) => {
     const result = await installHook(agentId);
     console.log(result.alreadyInstalled ? `✔ Already installed for ${result.agent}\n  → ${result.path}` : `✔ Installed beam hook for ${result.agent}\n  → ${result.path}`);
+  });
+
+agent.command("install-all")
+  .description("Detect which agents are actually installed on this machine and wire beam's hook into all of them")
+  .action(async () => {
+    const results = await installAllDetectedHooks();
+    for (const r of results) {
+      if (r.status === "installed") console.log(`✔ Installed for ${r.name}\n  → ${r.path}`);
+      else if (r.status === "already-installed") console.log(`✔ Already installed for ${r.name}`);
+      else if (r.status === "not-supported") console.log(`— ${r.name} detected, but hook install isn't built for it yet`);
+      else if (r.status === "error") console.log(`✖ ${r.name}: ${r.error}`);
+      // "not-detected" agents are omitted entirely to keep this output about what's actually on this machine.
+    }
+    const acted = results.filter(r => r.status === "installed" || r.status === "already-installed");
+    if (!acted.length) console.log("No supported agents detected on this machine. Run 'beam agent list' to see what's supported.");
   });
 
 program.parseAsync().catch((error: unknown) => {

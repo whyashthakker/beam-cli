@@ -66,6 +66,24 @@ describe("Beam collector", () => {
     expect((await app.request("/ingest", "x".repeat(2_000_001))).status).toBe(413);
     expect((await app.request("/ingest", "x", { "Content-Encoding": "gzip" })).status).toBe(415);
   });
+  it("serves the studio dashboard at / and /studio without a token", async () => {
+    const app = await setup();
+    for (const path of ["/", "/studio"]) {
+      const res = await app.fetch(new Request(`http://127.0.0.1:4319${path}`));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("Content-Type")).toContain("text/html");
+      const body = await res.text();
+      expect(body).toContain("beam studio");
+      expect(body).not.toMatch(/\\"/);
+    }
+  });
+
+  it("still enforces the loopback-host check for the studio route", async () => {
+    const app = await setup();
+    const res = await app.fetch(new Request("http://evil.invalid/studio"));
+    expect(res.status).toBe(403);
+  });
+
   it("discovery checks presence but does not imply instrumentation", async () => {
     const app = await setup(); await mkdir(join(app.directory, ".claude")); await writeFile(join(app.directory, ".claude", "settings.json"), "invalid config contents are not read");
     const result = await inventory([], app.directory); const claude = result.find(a => a.agent === "claude-code")!;

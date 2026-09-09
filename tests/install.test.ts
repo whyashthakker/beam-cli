@@ -2,7 +2,7 @@ import path from "node:path";
 import os from "node:os";
 import fs from "node:fs/promises";
 import { afterEach, describe, expect, it } from "@jest/globals";
-import { installHook } from "../src/install.js";
+import { installAllDetectedHooks, installHook } from "../src/install.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -77,5 +77,55 @@ describe("installHook", () => {
     await fs.mkdir(path.join(home, ".claude"), { recursive: true });
     await fs.writeFile(path.join(home, ".claude", "settings.json"), "{ not valid json");
     await expect(installHook("claude-code", home)).rejects.toThrow("invalid JSON");
+  });
+});
+
+describe("installAllDetectedHooks", () => {
+  it("only acts on agents whose real (non-circular) presence signal exists on disk", async () => {
+    const home = await tempHome();
+    // Simulate a machine with only Claude Code and Copilot CLI actually installed.
+    await fs.mkdir(path.join(home, ".claude"), { recursive: true });
+    await fs.writeFile(path.join(home, ".claude", "settings.json"), "{}");
+    await fs.mkdir(path.join(home, ".copilot"), { recursive: true });
+    await fs.writeFile(path.join(home, ".copilot", "config.json"), "{}");
+
+    const results = await installAllDetectedHooks(home);
+    const byAgent = Object.fromEntries(results.map(r => [r.agent, r.status]));
+    expect(byAgent["claude-code"]).toBe("installed");
+    expect(byAgent["copilot-cli"]).toBe("installed");
+    expect(byAgent["cursor"]).toBe("not-detected");
+    expect(byAgent["codex"]).toBe("not-detected");
+    expect(byAgent["gemini"]).toBe("not-detected");
+
+    const claudeConfig = JSON.parse(await fs.readFile(path.join(home, ".claude", "settings.json"), "utf8"));
+    expect(claudeConfig.hooks.PreToolUse[0].hooks[0].command).toBe("beam hook claude-code");
+  });
+
+  it("is idempotent across repeated runs (e.g. re-running setup)", async () => {
+    const home = await tempHome();
+    await fs.mkdir(path.join(home, ".claude"), { recursive: true });
+    await fs.writeFile(path.join(home, ".claude", "settings.json"), "{}");
+
+    await installAllDetectedHooks(home);
+    const second = await installAllDetectedHooks(home);
+    expect(second.find(r => r.agent === "claude-code")?.status).toBe("already-installed");
+  });
+
+  it("reports 'not-detected' for every agent when none of their real config paths exist", async () => {
+    const home = await tempHome();
+    const results = await installAllDetectedHooks(home);
+    expect(results.every(r => r.status === "not-detected")).toBe(true);
+  });
+
+  it("does not treat beam's own hook file as proof an agent is installed (no circular detection)", async () => {
+    const home = await tempHome();
+    // Only beam's own output files exist -- nothing a real Cursor/Copilot install would create.
+    await fs.mkdir(path.join(home, ".cursor"), { recursive: true });
+    await fs.rm(path.join(home, ".cursor"), { recursive: true, force: true });
+    await fs.mkdir(path.join(home, ".copilot", "hooks"), { recursive: true });
+    await fs.writeFile(path.join(home, ".copilot", "hooks", "beam.json"), "{}");
+
+    const results = await installAllDetectedHooks(home);
+    expect(results.find(r => r.agent === "copilot-cli")?.status).toBe("not-detected");
   });
 });
