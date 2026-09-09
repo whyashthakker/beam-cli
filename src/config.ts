@@ -14,3 +14,13 @@ export function getCollectorUrl(): URL {
   if (url.protocol !== "http:" || !["localhost", "127.0.0.1"].includes(url.hostname)) throw new Error("Collector must be on HTTP loopback.");
   return url;
 }
+
+// The Beam workspace API (dashboard / control plane) this device enrolls with and
+// reports to. Not loopback-restricted — this is the remote SaaS endpoint.
+export function getApiUrl(): string {
+  return (process.env.BEAM_API_URL || "http://127.0.0.1:3200").replace(/\/+$/, "");
+}
+
+export function getIdentityPath(): string {
+  return path.join(getDataDirectory(), "identity.json");
+}

@@ -7,7 +7,8 @@ import { supportsExtraction } from "./extract.js";
 import { AGENTS } from "./agents.js";
 import { installAllDetectedHooks, installHook } from "./install.js";
 import { installService, serviceLogPaths, serviceStatus, startService, stopService, uninstallService } from "./service.js";
-import { getCollectorUrl } from "./config.js";
+import { getCollectorUrl, getIdentityPath } from "./config.js";
+import { enrollDevice, readIdentity } from "./enroll.js";
 import { openBrowser } from "./open-browser.js";
 import { ruleCatalog } from "./core.js";
 import { loadCustomRules } from "./custom-rules.js";
@@ -72,6 +73,31 @@ program.command("studio")
     catch { throw new Error("Cannot reach the collector. Run 'beam start' or 'beam service install' first."); }
     openBrowser(`${origin}/?token=${encodeURIComponent(token)}`);
     console.log("Opening beam studio in your browser…");
+  });
+
+program.command("enroll")
+  .description("Enroll this device with your Beam workspace using a code from your manager")
+  .requiredOption("--code <code>", "enrollment code, e.g. BEAM-XXXX-XXXX-XXXX")
+  .option("--url <url>", "Beam API base URL (default $BEAM_API_URL or http://127.0.0.1:3200)")
+  .action(async (options: { code: string; url?: string }) => {
+    const existing = await readIdentity();
+    if (existing) console.error(`Replacing the existing enrollment (device ${existing.deviceId}).`);
+    const identity = await enrollDevice(options);
+    console.log(
+      `✔ Enrolled device ${identity.deviceId}\n` +
+      `  org:      ${identity.orgId}\n` +
+      `  api:      ${identity.apiBase}\n` +
+      `  identity: ${getIdentityPath()} (0600)\n\n` +
+      `Next: beam agent install-all && beam start`
+    );
+  });
+
+program.command("whoami")
+  .description("Show this device's enrollment, if any")
+  .action(async () => {
+    const identity = await readIdentity();
+    if (!identity) throw new Error("This device is not enrolled. Run 'beam enroll --code <code>'.");
+    console.log(`device: ${identity.deviceId}\norg:    ${identity.orgId}\napi:    ${identity.apiBase}\nhost:   ${identity.hostname} (${identity.os})\nsince:  ${identity.enrolledAt}`);
   });
 
 program.command("token")
