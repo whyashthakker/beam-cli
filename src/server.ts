@@ -14,7 +14,10 @@ export async function createCollector(options: { directory: string; token: strin
     const headers: Record<string, string> = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Vary": "Origin" };
     const json = (data: unknown, status = 200) => Response.json(data, { status, headers });
     if (!["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) return json({ error: "Loopback host required." }, 403);
-    if (origin && !origins.has(origin)) return json({ error: "Origin not permitted." }, 403);
+    // Studio is served by this same collector, so its own fetch() calls are same-origin --
+    // browsers still attach an Origin header to same-origin POSTs, so that must be allowed
+    // unconditionally rather than only checked against the cross-origin management-app allowlist.
+    if (origin && origin !== url.origin && !origins.has(origin)) return json({ error: "Origin not permitted." }, 403);
     if (origin) {
       headers["Access-Control-Allow-Origin"] = origin;
       headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";

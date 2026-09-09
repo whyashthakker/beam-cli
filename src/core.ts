@@ -64,7 +64,7 @@ export function scanText(name: string, content: string, kind: "skill" | "mcp"): 
 }
 type Obj = Record<string, unknown>;
 function obj(v: unknown): Obj { return v && typeof v === "object" && !Array.isArray(v) ? v as Obj : {}; }
-function str(v: unknown, fallback = ""): string { return typeof v === "string" ? v : fallback; }
+function str(v: unknown, fallback = ""): string { return typeof v === "string" && v.length > 0 ? v : fallback; }
 function number(v: unknown): number | undefined { const n = typeof v === "number" || typeof v === "string" ? Number(v) : NaN; return Number.isFinite(n) && n >= 0 ? n : undefined; }
 function attributes(v: unknown): Obj {
   return Array.isArray(v) ? Object.fromEntries(v.map(a => { const row = obj(a); const value = obj(row.value); return [str(row.key), value.stringValue ?? value.intValue ?? value.doubleValue ?? value.boolValue]; })) : {};
@@ -111,7 +111,7 @@ export function normalize(raw: Obj): Event {
   const url = str(raw.url ?? input.url);
   let type = str(raw.event_type ?? raw.observed_event_type);
   if (!type) {
-    if (["Bash", "bash", "Shell", "shell", "exec_command"].includes(tool) && command) type = "command.exec";
+    if (["Bash", "bash", "Shell", "shell", "exec_command", "shell_command", "exec"].includes(tool) && command) type = "command.exec";
     else if (["Read", "read_file"].includes(tool)) type = "file.read";
     else if (["Write", "Edit", "write_file", "apply_patch"].includes(tool)) type = "file.write";
     else if (["browser.navigate", "browser_navigate"].includes(tool)) type = "browser.navigate";

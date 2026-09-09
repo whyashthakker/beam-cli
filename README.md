@@ -72,7 +72,22 @@ Different agents send different JSON shapes to their hooks. `beam hook <agent>` 
 
 Run `beam agent list` for the current status of each. Adding a new agent means one entry in `src/agents.ts` (config path + how to merge the hook block) and, if its stdin payload uses different field names than `tool_name`/`tool_input`/`session_id`/`cwd`/`hook_event_name`, one adapter function in `src/hook-adapters.ts`.
 
-This is an intentionally small first slice of what a full multi-agent observer covers (see [Numbat](https://github.com/perplexityai/numbat) for the much larger prior art: 25+ agents, forensic on-disk artifact extraction without live hooks, a CEL rule engine, enforcement/blocking, and portable case bundles). Beam does not yet do artifact extraction, a real rule engine beyond flat regexes, or enforcement — those are tracked as future slices, not silently unsupported.
+This is an intentionally small first slice of what a full multi-agent observer covers (see [Numbat](https://github.com/perplexityai/numbat) for the much larger prior art: 25+ agents, a CEL rule engine, enforcement/blocking, and portable case bundles). Beam does not yet do a real rule engine beyond flat regexes, or enforcement — those are tracked as future slices, not silently unsupported.
+
+## Forensic extraction (no hook required)
+
+`beam agent extract <agent>` reads an agent's own existing session/transcript files directly — no hook needed, and it works for history from *before* Beam was ever installed:
+
+```bash
+beam agent extract claude-code              # preview: normalizes locally, prints JSON, nothing sent anywhere
+beam agent extract claude-code --limit 20   # cap how many events the preview prints (default 200)
+beam agent extract claude-code --save       # import into the running collector (dedupes by event_id)
+beam agent extract codex --save
+```
+
+Supported today: **`claude-code`** (`~/.claude/projects/**/*.jsonl` — reads `tool_use` blocks out of assistant turns) and **`codex`** (`~/.codex/{sessions,archived_sessions}/**/*.jsonl` — reads `function_call` and `custom_tool_call` response items). Every extracted event gets `source: "extract"` and `phase: "observed"` so it's visibly distinct from a live hook capture (which is `"proposed"`/`"completed hook"`). Preview mode normalizes (and therefore redacts) locally without ever contacting the collector; `--save` sends the raw records through the same `/ingest` pipeline a live hook uses, batched under the collector's 2,000-record-per-request cap. Bounded like everything else in Beam: 50 MB max per transcript file, 20,000 parsed lines per file, 2,000 files walked per run.
+
+Other agents aren't wired yet — `beam agent extract <agent>` fails clearly rather than silently returning nothing for one that isn't supported.
 
 ## Running as a background service
 

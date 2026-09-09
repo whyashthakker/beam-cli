@@ -2,7 +2,8 @@
 import fs from "node:fs";
 import { Command } from "commander";
 import { startServer } from "./serve.js";
-import { captureHook, importEvents, readToken, scanFile } from "./client.js";
+import { captureHook, extractPreview, extractSave, importEvents, readToken, scanFile } from "./client.js";
+import { supportsExtraction } from "./extract.js";
 import { AGENTS } from "./agents.js";
 import { installAllDetectedHooks, installHook } from "./install.js";
 import { installService, serviceLogPaths, serviceStatus, startService, stopService, uninstallService } from "./service.js";
@@ -108,6 +109,23 @@ agent.command("install")
   .action(async (agentId: string) => {
     const result = await installHook(agentId);
     console.log(result.alreadyInstalled ? `✔ Already installed for ${result.agent}\n  → ${result.path}` : `✔ Installed beam hook for ${result.agent}\n  → ${result.path}`);
+  });
+
+agent.command("extract")
+  .description("Forensic extraction: read an agent's existing session/transcript files directly, no hook or live capture required")
+  .argument("<agent>", `agent id (currently: claude-code, codex)`)
+  .option("--save", "import extracted records into the running collector instead of just previewing them")
+  .option("--limit <n>", "cap how many events the offline preview prints", "200")
+  .action(async (agentId: string, options: { save?: boolean; limit?: string }) => {
+    if (!supportsExtraction(agentId)) throw new Error(`Forensic extraction isn't built for '${agentId}' yet. Supported: claude-code, codex.`);
+    if (options.save) {
+      const result = await extractSave(agentId);
+      console.log(`Found ${result.found} historical action${result.found === 1 ? "" : "s"} in ${agentId}'s session files.\n✔ Imported: ${result.accepted}\n— Already had: ${result.duplicates}\n— Skipped (unsupported record type): ${result.skipped}`);
+    } else {
+      const result = await extractPreview(agentId, Number(options.limit) || 200);
+      console.log(JSON.stringify(result.events, null, 2));
+      console.log(`\n${result.found} historical action${result.found === 1 ? "" : "s"} found (showing ${result.previewed}). This was NOT sent to the collector -- rerun with --save to import.`);
+    }
   });
 
 agent.command("install-all")

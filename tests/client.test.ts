@@ -3,7 +3,7 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
-import { captureHook, importEvents, readToken, scanFile } from "../src/client.js";
+import { captureHook, extractPreview, extractSave, importEvents, readToken, scanFile } from "../src/client.js";
 
 const temporaryDirectories: string[] = [];
 const originalEnv = { ...process.env };
@@ -146,5 +146,62 @@ describe("captureHook", () => {
     await expect(captureHook()).resolves.toBeUndefined();
     expect(errorSpy).toHaveBeenCalled();
     errorSpy.mockRestore();
+  });
+});
+
+async function writeJsonl(filePath: string, rows: unknown[]): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, rows.map(r => JSON.stringify(r)).join("\n") + "\n");
+}
+
+describe("extractPreview", () => {
+  it("normalizes locally and never contacts the collector", async () => {
+    const home = await tempDir("beam-extract-preview-");
+    await writeJsonl(path.join(home, ".claude", "projects", "p", "s.jsonl"), [
+      { type: "assistant", session_id: "s1", cwd: "/repo", timestamp: "2026-01-01T00:00:00.000Z", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "echo API_KEY=super-secret-value" } }] } },
+    ]);
+    global.fetch = jest.fn() as unknown as typeof fetch;
+    const result = await extractPreview("claude-code", 200, home);
+    expect(result.found).toBe(1);
+    expect(global.fetch).not.toHaveBeenCalled();
+    // normalize() redacts before this ever reaches the caller, even in preview mode.
+    expect(JSON.stringify(result.events)).not.toContain("super-secret-value");
+  });
+
+  it("caps the preview at the given limit while still reporting the true total found", async () => {
+    const home = await tempDir("beam-extract-limit-");
+    const rows = Array.from({ length: 5 }, (_, i) => ({ type: "assistant", session_id: "s", cwd: "/repo", timestamp: "2026-01-01T00:00:00.000Z", message: { content: [{ type: "tool_use", id: `t${i}`, name: "Bash", input: { command: "ls" } }] } }));
+    await writeJsonl(path.join(home, ".claude", "projects", "p", "s.jsonl"), rows);
+    const result = await extractPreview("claude-code", 2, home);
+    expect(result.found).toBe(5);
+    expect(result.previewed).toBe(2);
+    expect(result.events).toHaveLength(2);
+  });
+});
+
+describe("extractSave", () => {
+  it("batches sends of more than 2000 records so the collector's per-request cap is never hit", async () => {
+    process.env.BEAM_TOKEN = "t";
+    const home = await tempDir("beam-extract-batch-");
+    const rows = Array.from({ length: 4500 }, (_, i) => ({ type: "assistant", session_id: "s", cwd: "/repo", timestamp: "2026-01-01T00:00:00.000Z", message: { content: [{ type: "tool_use", id: `t${i}`, name: "Bash", input: { command: "ls" } }] } }));
+    await writeJsonl(path.join(home, ".claude", "projects", "p", "s.jsonl"), rows);
+    const batchSizes: number[] = [];
+    global.fetch = (async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      batchSizes.push(body.length);
+      return new Response(JSON.stringify({ accepted: body.length, duplicates: 0, skipped: 0 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const result = await extractSave("claude-code", home);
+    expect(batchSizes).toEqual([2000, 2000, 500]);
+    expect(result).toEqual({ found: 4500, accepted: 4500, duplicates: 0, skipped: 0 });
+  });
+
+  it("reports zero found without making any request when there is nothing to extract", async () => {
+    process.env.BEAM_TOKEN = "t";
+    const home = await tempDir("beam-extract-empty-");
+    global.fetch = jest.fn() as unknown as typeof fetch;
+    const result = await extractSave("claude-code", home);
+    expect(result).toEqual({ found: 0, accepted: 0, duplicates: 0, skipped: 0 });
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 });

@@ -1,8 +1,10 @@
 import { readFile, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { getCollectorUrl, getDataDirectory } from "./config.js";
-import { scanText, type Scan } from "./core.js";
+import { normalize, scanText, type Event, type Scan } from "./core.js";
 import { adaptHookPayload } from "./hook-adapters.js";
+import { extractAgent } from "./extract.js";
 
 export async function readToken(): Promise<string> {
   if (process.env.BEAM_TOKEN) return process.env.BEAM_TOKEN;
@@ -40,6 +42,33 @@ export async function scanFile(filePath: string, options: ScanOptions = {}): Pro
   const kind = options.mcp ? "mcp" : "skill";
   if (options.save) return send("/scan", JSON.stringify({ name: filePath, content, kind }));
   return scanText(filePath, content, kind);
+}
+
+const INGEST_BATCH_SIZE = 2000; // matches the collector's own per-request record cap
+
+export interface ExtractPreviewResult { found: number; previewed: number; events: Event[] }
+export interface ExtractSaveResult { found: number; accepted: number; duplicates: number; skipped: number }
+
+// Without --save: extract and normalize locally (so redaction still applies) without touching
+// the collector at all -- a read-only preview of what would be imported.
+export async function extractPreview(agentId: string, limit = 200, home = homedir()): Promise<ExtractPreviewResult> {
+  const records = await extractAgent(agentId, home);
+  const events: Event[] = [];
+  for (const record of records) { try { events.push(normalize(record)); } catch { /* skip a record normalize() can't accept */ } }
+  return { found: events.length, previewed: Math.min(events.length, limit), events: events.slice(0, limit) };
+}
+
+// With --save: send the raw (pre-normalize) records to /ingest so the server's own pipeline --
+// dedupe by event_id, redact, bounded persistence -- handles them exactly like a live hook would.
+export async function extractSave(agentId: string, home = homedir()): Promise<ExtractSaveResult> {
+  const records = await extractAgent(agentId, home);
+  const totals = { accepted: 0, duplicates: 0, skipped: 0 };
+  for (let i = 0; i < records.length; i += INGEST_BATCH_SIZE) {
+    const batch = records.slice(i, i + INGEST_BATCH_SIZE);
+    const result = await send("/ingest", JSON.stringify(batch)) as { accepted: number; duplicates: number; skipped: number };
+    totals.accepted += result.accepted; totals.duplicates += result.duplicates; totals.skipped += result.skipped;
+  }
+  return { found: records.length, ...totals };
 }
 
 async function readStdin(limitBytes: number): Promise<string> {

@@ -28,6 +28,16 @@ describe("Beam collector", () => {
     expect(allowed.headers.get("Access-Control-Allow-Origin")).toBe("http://localhost:3200");
     expect(allowed.headers.get("Cache-Control")).toBe("no-store");
   });
+  it("allows Studio's own same-origin POSTs even though the browser sends an Origin header for them", async () => {
+    // Regression: browsers attach Origin to same-origin fetch() POSTs too, not just cross-origin
+    // ones. Studio is served by this same collector, so its own "mark reviewed" call must not be
+    // rejected just because it isn't in the (separate, cross-origin) management-app allowlist.
+    const app = await setup();
+    await app.request("/ingest", { event_type: "command.exec", command: "ls" });
+    const event = app.store.events[0];
+    const res = await app.request("/review", { id: event.id, reviewed: true }, { Origin: "http://127.0.0.1:4319" });
+    expect(res.status).toBe(200);
+  });
   it("CORS preflight admits only explicit local UI origins", async () => {
     const app = await setup();
     const res = await app.fetch(new Request("http://127.0.0.1:4319/ingest", { method: "OPTIONS", headers: { Origin: "http://localhost:3200" } }));
