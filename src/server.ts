@@ -3,8 +3,9 @@ import { normalize, parseInput, ruleCatalog, scanText } from "./core.js";
 import { Store } from "./store.js";
 import { inventory } from "./inventory.js";
 import { studioPage } from "./studio.js";
+import { loadCustomRules } from "./custom-rules.js";
 
-export async function createCollector(options: { directory: string; token: string; origins?: string[] }) {
+export async function createCollector(options: { directory: string; token: string; origins?: string[]; rulesHome?: string }) {
   const store = new Store(options.directory); await store.init();
   const origins = new Set(options.origins ?? ["http://localhost:3200", "http://127.0.0.1:3200"]);
   const secret = Buffer.from(`Bearer ${options.token}`);
@@ -35,8 +36,10 @@ export async function createCollector(options: { directory: string; token: strin
     try {
       if (req.method === "GET" && url.pathname === "/agents") return json(await inventory(store.events));
       if (req.method === "GET" && url.pathname === "/health") return json({ name: "Beam", version: "0.1.0", mode: "observe", events: store.events.length, retention: store.maxEvents });
-      if (req.method === "GET" && url.pathname === "/state") return json({ events: store.events, scans: store.scans, reviews: store.reviews, rules: ruleCatalog, retention: store.maxEvents });
+      if (req.method === "GET" && url.pathname === "/state") return json({ events: store.events, scans: store.scans, reviews: store.reviews, rules: ruleCatalog(), retention: store.maxEvents });
       if (req.method === "GET" && url.pathname === "/export") return new Response(store.events.map(e => JSON.stringify(e)).join("\n"), { headers: { ...headers, "Content-Type": "application/x-ndjson", "Content-Disposition": 'attachment; filename="beam-events.ndjson"' } });
+      // Reloads ~/.beam/rules.json into this running process without a restart.
+      if (req.method === "POST" && url.pathname === "/rules/reload") return json(await loadCustomRules(options.rulesHome));
       if (req.method !== "POST" || !["/ingest", "/v1/logs", "/scan", "/review"].includes(url.pathname)) return json({ error: "Route not found." }, 404);
       // Bound streamed bodies too; Content-Length alone cannot protect chunked requests.
       const reader = req.body?.getReader(); let size = 0; const chunks: Uint8Array[] = [];

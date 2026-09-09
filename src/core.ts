@@ -23,24 +23,37 @@ export function redact(text: string): string {
     .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[REDACTED]@")
     .replace(/(https?:\/\/[^\s?#"']+)\?[^\s"']*/gi, "$1?[REDACTED QUERY]");
 }
+export type RuleCategory = "exec" | "exfil" | "impact" | "integrity" | "persistence" | "privilege" | "recon" | "secrets" | "source_control" | "custom";
+export type Rule = { id: string; title: string; severity: Severity; category: RuleCategory; explanation: string; match: (s: string) => boolean };
+
 const secret = /(?:\.env(?:\b|[./])|\.ssh[\\/]|id_rsa|id_ed25519|\.aws[\\/]credentials|(?:api[_-]?key|access[_-]?token|password|secret)\b)/i;
 const egress = /(?:https?:\/\/|\bcurl\b|\bwget\b|\bupload\b|\bwebhook\b|\bsend\b|\bexfiltrat\w*)/i;
-const rules: { id: string; title: string; severity: Severity; explanation: string; match: (s: string) => boolean }[] = [
-  { id: "destructive.delete", title: "Destructive operation", severity: "high", explanation: "Review the target and backups before allowing a recursive delete or destructive data operation.", match: s => /\brm\s+[^\n]*(?:-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|--recursive)|\b(?:drop\s+(?:table|database)|truncate\s+(?:table\s+)?\w+)|\bRemove-Item\b[^\n]*(?:-Recurse|-Force)|\bgit\s+(?:reset\s+--hard|clean\s+-[^\n]*f)/i.test(s) },
-  { id: "credentials.access", title: "Sensitive credential reference", severity: "medium", explanation: "This action or instruction references a credential location. Confirm the agent needs access.", match: s => secret.test(s) },
-  { id: "credentials.egress", title: "Possible credential exposure", severity: "critical", explanation: "Credential references and outbound delivery appear together. Inspect the destination and data before running this.", match: s => secret.test(s) && egress.test(s) },
-  { id: "execution.remote", title: "Remote code execution pattern", severity: "high", explanation: "Downloaded content is piped directly into a shell without review.", match: s => /\b(?:curl|wget)\b[^\n]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh\b/i.test(s) },
-  { id: "execution.obfuscated", title: "Encoded execution", severity: "high", explanation: "Encoded content is decoded for execution. Review the decoded payload separately; Beam never executes it.", match: s => /\bbase64\b[^\n]*(?:-d|--decode)[^\n]*\|\s*(?:ba)?sh|\b(?:powershell|pwsh)\b[^\n]*-(?:enc|encodedcommand)\b/i.test(s) },
-  { id: "recon.network_sweep", title: "Network sweep", severity: "medium", explanation: "A scanner targets a network range. Verify scope and authorization before the agent probes other systems (ATT&CK T1046).", match: s => /\b(?:nmap|masscan|rustscan)\b/i.test(s) && /(?:\d{1,3}\.){3}\d{1,3}\/\d{1,2}|(?:\d{1,3}\.){3}\d{1,3}-\d{1,3}/.test(s) },
-  { id: "privilege.elevation", title: "Elevated privileges", severity: "medium", explanation: "The action requests elevated privileges or broad write permissions.", match: s => /\bsudo\s|\bchmod\s+(?:-R\s+)?777\b/i.test(s) },
-  { id: "network.metadata", title: "Cloud metadata access", severity: "high", explanation: "Cloud metadata endpoints can expose temporary instance credentials.", match: s => /169\.254\.169\.254|metadata\.google\.internal/i.test(s) },
-  { id: "persistence.config", title: "Security-sensitive configuration", severity: "high", explanation: "A persistence or agent configuration target is referenced. Check the intended change and trust boundary.", match: s => /authorized_keys|\bcrontab\b|LaunchAgents[\\/]|ANTHROPIC_BASE_URL/i.test(s) },
-  { id: "network.reverse-shell", title: "Reverse shell pattern", severity: "critical", explanation: "This pattern can connect a command shell to another machine.", match: s => /\/dev\/tcp\/|\bnc\b[^\n]*\s-e\s|socket[\s\S]{0,200}subprocess/i.test(s) },
-  { id: "instructions.override", title: "Instruction override attempt", severity: "high", explanation: "Instructions attempt to override existing safeguards or conceal activity from the user.", match: s => /ignore\s+(?:all\s+)?(?:previous|prior|system|safety)\s+(?:instructions|rules|prompts)|(?:do not|don't|never)\s+(?:tell|inform|notify)\s+(?:the\s+)?user|disable\s+(?:security|safety|logging|audit)/i.test(s) },
+const builtinRules: Rule[] = [
+  { id: "destructive.delete", title: "Destructive operation", severity: "high", category: "impact", explanation: "Review the target and backups before allowing a recursive delete or destructive data operation.", match: s => /\brm\s+[^\n]*(?:-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|--recursive)|\b(?:drop\s+(?:table|database)|truncate\s+(?:table\s+)?\w+)|\bRemove-Item\b[^\n]*(?:-Recurse|-Force)|\bgit\s+(?:reset\s+--hard|clean\s+-[^\n]*f)/i.test(s) },
+  { id: "credentials.access", title: "Sensitive credential reference", severity: "medium", category: "secrets", explanation: "This action or instruction references a credential location. Confirm the agent needs access.", match: s => secret.test(s) },
+  { id: "credentials.egress", title: "Possible credential exposure", severity: "critical", category: "exfil", explanation: "Credential references and outbound delivery appear together. Inspect the destination and data before running this.", match: s => secret.test(s) && egress.test(s) },
+  { id: "execution.remote", title: "Remote code execution pattern", severity: "high", category: "exec", explanation: "Downloaded content is piped directly into a shell without review.", match: s => /\b(?:curl|wget)\b[^\n]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh\b/i.test(s) },
+  { id: "execution.obfuscated", title: "Encoded execution", severity: "high", category: "exec", explanation: "Encoded content is decoded for execution. Review the decoded payload separately; Beam never executes it.", match: s => /\bbase64\b[^\n]*(?:-d|--decode)[^\n]*\|\s*(?:ba)?sh|\b(?:powershell|pwsh)\b[^\n]*-(?:enc|encodedcommand)\b/i.test(s) },
+  { id: "recon.network_sweep", title: "Network sweep", severity: "medium", category: "recon", explanation: "A scanner targets a network range. Verify scope and authorization before the agent probes other systems (ATT&CK T1046).", match: s => /\b(?:nmap|masscan|rustscan)\b/i.test(s) && /(?:\d{1,3}\.){3}\d{1,3}\/\d{1,2}|(?:\d{1,3}\.){3}\d{1,3}-\d{1,3}/.test(s) },
+  { id: "privilege.elevation", title: "Elevated privileges", severity: "medium", category: "privilege", explanation: "The action requests elevated privileges or broad write permissions.", match: s => /\bsudo\s|\bchmod\s+(?:-R\s+)?777\b/i.test(s) },
+  { id: "network.metadata", title: "Cloud metadata access", severity: "high", category: "secrets", explanation: "Cloud metadata endpoints can expose temporary instance credentials.", match: s => /169\.254\.169\.254|metadata\.google\.internal/i.test(s) },
+  { id: "persistence.config", title: "Security-sensitive configuration", severity: "high", category: "persistence", explanation: "A persistence or agent configuration target is referenced. Check the intended change and trust boundary.", match: s => /authorized_keys|\bcrontab\b|LaunchAgents[\\/]|ANTHROPIC_BASE_URL/i.test(s) },
+  { id: "network.reverse-shell", title: "Reverse shell pattern", severity: "critical", category: "exec", explanation: "This pattern can connect a command shell to another machine.", match: s => /\/dev\/tcp\/|\bnc\b[^\n]*\s-e\s|socket[\s\S]{0,200}subprocess/i.test(s) },
+  { id: "instructions.override", title: "Instruction override attempt", severity: "high", category: "integrity", explanation: "Instructions attempt to override existing safeguards or conceal activity from the user.", match: s => /ignore\s+(?:all\s+)?(?:previous|prior|system|safety)\s+(?:instructions|rules|prompts)|(?:do not|don't|never)\s+(?:tell|inform|notify)\s+(?:the\s+)?user|disable\s+(?:security|safety|logging|audit)/i.test(s) },
+  { id: "source_control.history_rewrite", title: "Git history rewrite", severity: "medium", category: "source_control", explanation: "Force-pushing or rewriting shared history can silently discard other people's commits. Confirm the branch isn't shared before proceeding.", match: s => /\bgit\s+push\s+[^\n]*(?:--force(?:-with-lease)?|-f\b)|\bgit\s+filter-(?:branch|repo)\b/i.test(s) },
+  { id: "integrity.tls_bypass", title: "Certificate or signature verification disabled", severity: "medium", category: "integrity", explanation: "Disabling TLS/certificate verification removes protection against a tampered or impersonated destination.", match: s => /\bcurl\b[^\n]*(?:-k\b|--insecure)|\bwget\b[^\n]*--no-check-certificate|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*['"]?0|\bgit\b[^\n]*-c\s+http\.sslVerify=false/i.test(s) },
 ];
-export const ruleCatalog = rules.map(({ match: _, ...rule }) => rule);
+
+// Loaded from disk at startup (see custom-rules.ts); empty until loadCustomRules() runs.
+let customRules: Rule[] = [];
+export function setCustomRules(rules: Rule[]): void { customRules = rules; }
+function activeRules(): Rule[] { return [...builtinRules, ...customRules]; }
+
+export function ruleCatalog(): Omit<Rule, "match">[] {
+  return activeRules().map(({ match: _, ...rule }) => rule);
+}
 export function detect(text: string): Finding[] {
-  return rules.filter(r => r.match(text)).map(r => ({ id: r.id, title: r.title, severity: r.severity, explanation: r.explanation, evidence: redact(text).slice(0, 600) }));
+  return activeRules().filter(r => r.match(text)).map(r => ({ id: r.id, title: r.title, severity: r.severity, explanation: r.explanation, evidence: redact(text).slice(0, 600) }));
 }
 export function scanText(name: string, content: string, kind: "skill" | "mcp"): Scan {
   if (!content.trim() || content.length > 500_000) throw new Error("Provide non-empty text, up to 500 KB.");

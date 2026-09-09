@@ -1,6 +1,7 @@
 import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Event, Scan } from "./core.js";
+import { detectSequenceFindings } from "./sequences.js";
 
 export class Store {
   events: Event[] = [];
@@ -46,8 +47,21 @@ export class Store {
     return this.serialized(async () => {
       const ids = new Set(this.events.map(e => e.id));
       const fresh = rows.filter(r => { if (ids.has(r.id)) return false; ids.add(r.id); return true; });
-      const next = [...this.events, ...fresh].slice(-this.maxEvents);
+      let next = [...this.events, ...fresh].slice(-this.maxEvents);
       if (fresh.length) {
+        // Re-evaluate cross-event sequence rules, but only for sessions this batch actually
+        // touched -- bounds the cost regardless of total store size.
+        const touchedSessions = new Set(fresh.map(e => e.session));
+        const bySession = new Map<string, Event[]>();
+        for (const e of next) {
+          if (!touchedSessions.has(e.session)) continue;
+          const list = bySession.get(e.session);
+          if (list) list.push(e); else bySession.set(e.session, [e]);
+        }
+        for (const sessionEvents of bySession.values()) {
+          const attach = detectSequenceFindings(sessionEvents);
+          if (attach.size) next = next.map(e => attach.has(e.id) ? { ...e, findings: [...e.findings, ...attach.get(e.id)!] } : e);
+        }
         // Atomic replacement bounds disk use and makes retry after uncertain delivery idempotent.
         await this.replace("events", next);
         this.events = next;

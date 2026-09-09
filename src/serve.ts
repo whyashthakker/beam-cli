@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createCollector } from "./server.js";
 import { getDataDirectory } from "./config.js";
+import { loadCustomRules } from "./custom-rules.js";
 
 function toWebRequest(req: IncomingMessage): Promise<Request> {
   return new Promise((resolvePromise, reject) => {
@@ -38,11 +39,17 @@ export interface StartServerOptions {
   port?: number;
   hostname?: string;
   origins?: string[];
+  /** Root to load ~/.beam/rules.json from; defaults to the real BEAM_HOME. Tests override this. */
+  rulesHome?: string;
 }
 
-export async function startServer(options: StartServerOptions = {}): Promise<{ url: string; token: string; directory: string; close: () => void }> {
+export async function startServer(options: StartServerOptions = {}): Promise<{ url: string; token: string; directory: string; customRules: { path: string; loaded: number; errors: string[] }; close: () => void }> {
   const directory = options.directory ?? getDataDirectory();
   await mkdir(directory, { recursive: true, mode: 0o700 });
+  // Loaded once per process into core.ts's shared rule set; a file edit needs a restart to apply.
+  // Errors are returned, not logged here -- the caller (cli.ts) owns all console output, since
+  // this same function also runs unattended inside the background service process.
+  const customRules = await loadCustomRules(options.rulesHome);
   let token = options.token ?? process.env.BEAM_TOKEN;
   if (!token) {
     const tokenPath = join(directory, "token");
@@ -55,7 +62,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
   }
   if (token.length < 32) throw new Error("BEAM_TOKEN must contain at least 32 characters.");
 
-  const app = await createCollector({ directory, token, origins: options.origins ?? process.env.BEAM_ALLOWED_ORIGINS?.split(",").map(s => s.trim()) });
+  const app = await createCollector({ directory, token, origins: options.origins ?? process.env.BEAM_ALLOWED_ORIGINS?.split(",").map(s => s.trim()), rulesHome: options.rulesHome });
   const port = options.port ?? Number(process.env.BEAM_PORT || 4319);
   const hostname = options.hostname ?? "127.0.0.1";
 
@@ -78,5 +85,5 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
     });
   });
 
-  return { url: `http://${hostname}:${boundPort}`, token, directory, close: () => server.close() };
+  return { url: `http://${hostname}:${boundPort}`, token, directory, customRules, close: () => server.close() };
 }

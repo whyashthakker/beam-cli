@@ -2,13 +2,16 @@
 import fs from "node:fs";
 import { Command } from "commander";
 import { startServer } from "./serve.js";
-import { captureHook, extractPreview, extractSave, importEvents, readToken, scanFile } from "./client.js";
+import { captureHook, extractPreview, extractSave, importEvents, readToken, reloadRemoteRules, scanFile } from "./client.js";
 import { supportsExtraction } from "./extract.js";
 import { AGENTS } from "./agents.js";
 import { installAllDetectedHooks, installHook } from "./install.js";
 import { installService, serviceLogPaths, serviceStatus, startService, stopService, uninstallService } from "./service.js";
 import { getCollectorUrl } from "./config.js";
 import { openBrowser } from "./open-browser.js";
+import { ruleCatalog } from "./core.js";
+import { loadCustomRules } from "./custom-rules.js";
+import { sequenceRuleCatalog } from "./sequences.js";
 
 const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
 
@@ -22,7 +25,9 @@ program.command("start")
   .option("-p, --port <port>", "port to listen on")
   .action(async (options: { port?: string }) => {
     const result = await startServer({ port: options.port ? Number(options.port) : undefined });
-    console.log(`Beam collector running.\nMode: observe only\nLocal storage: ${result.directory}\nRun 'beam token' for the pairing token.`);
+    const rulesNote = result.customRules.loaded ? `\nCustom rules loaded: ${result.customRules.loaded} from ${result.customRules.path}` : "";
+    for (const message of result.customRules.errors) console.error(`✖ ${message}`);
+    console.log(`Beam collector running.\nMode: observe only\nLocal storage: ${result.directory}${rulesNote}\nRun 'beam token' for the pairing token.`);
   });
 
 const service = program.command("service").description("Run the collector as a background service (launchd on macOS, systemd --user on Linux)");
@@ -141,6 +146,38 @@ agent.command("install-all")
     }
     const acted = results.filter(r => r.status === "installed" || r.status === "already-installed");
     if (!acted.length) console.log("No supported agents detected on this machine. Run 'beam agent list' to see what's supported.");
+  });
+
+const rule = program.command("rule").description("Inspect the active detection rule catalog");
+
+rule.command("list")
+  .alias("ls")
+  .description("List every active rule (built-in, custom, and cross-event sequence rules) grouped by category")
+  .action(async () => {
+    const customResult = await loadCustomRules();
+    const catalog = ruleCatalog();
+    const byCategory = new Map<string, typeof catalog>();
+    for (const r of catalog) {
+      const list = byCategory.get(r.category);
+      if (list) list.push(r); else byCategory.set(r.category, [r]);
+    }
+    for (const [category, entries] of [...byCategory.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      console.log(`\n${category}`);
+      for (const r of entries) console.log(`  ${r.id}\t${r.severity}\t${r.title}`);
+    }
+    console.log(`\nsequence (cross-event, evaluated per session)`);
+    for (const r of sequenceRuleCatalog) console.log(`  ${r.id}\t${r.severity}\t${r.title} (${r.steps.length} steps)`);
+    const customCount = catalog.filter(r => r.category === "custom").length;
+    console.log(`\n${catalog.length} single-event rule${catalog.length === 1 ? "" : "s"} (${customCount} custom), ${sequenceRuleCatalog.length} sequence rule${sequenceRuleCatalog.length === 1 ? "" : "s"}.`);
+    if (customResult.errors.length) { console.log(`\nCustom rule file issues (${customResult.path}):`); for (const e of customResult.errors) console.log(`  ✖ ${e}`); }
+  });
+
+rule.command("reload")
+  .description("Reload ~/.beam/rules.json into the running collector, without restarting it")
+  .action(async () => {
+    const result = await reloadRemoteRules();
+    console.log(`Loaded ${result.loaded} custom rule${result.loaded === 1 ? "" : "s"} from ${result.path}.`);
+    for (const e of result.errors) console.log(`✖ ${e}`);
   });
 
 program.parseAsync().catch((error: unknown) => {

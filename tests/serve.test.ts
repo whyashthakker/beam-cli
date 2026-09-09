@@ -15,7 +15,7 @@ afterEach(async () => {
 describe("startServer", () => {
   it("boots a real HTTP server, generates a token, and serves /health", async () => {
     const directory = await mkdtemp(join(tmpdir(), "beam-serve-")); dirs.push(directory);
-    const result = await startServer({ directory, port: 0 });
+    const result = await startServer({ directory, port: 0, rulesHome: directory });
     servers.push(result);
     expect(result.token).toHaveLength(64);
     const res = await fetch(`${result.url}/health`, { headers: { Authorization: `Bearer ${result.token}` } });
@@ -25,10 +25,10 @@ describe("startServer", () => {
 
   it("reuses a persisted token across restarts", async () => {
     const directory = await mkdtemp(join(tmpdir(), "beam-serve-token-")); dirs.push(directory);
-    const first = await startServer({ directory, port: 0 });
+    const first = await startServer({ directory, port: 0, rulesHome: directory });
     servers.push(first);
     first.close();
-    const second = await startServer({ directory, port: 0 });
+    const second = await startServer({ directory, port: 0, rulesHome: directory });
     servers.push(second);
     expect(second.token).toBe(first.token);
   });

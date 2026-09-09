@@ -84,13 +84,34 @@ describe("importEvents", () => {
   });
 });
 
+describe("scanFile custom rules", () => {
+  it("loads a custom rule from the given beamHome and applies it during an offline scan", async () => {
+    const beamHome = await tempDir("beam-scan-rules-");
+    await fs.writeFile(path.join(beamHome, "rules.json"), JSON.stringify([{ id: "probe", pattern: "definitely-custom", severity: "high" }]));
+    const dir = await tempDir("beam-scan-file-");
+    const file = path.join(dir, "SKILL.md");
+    await fs.writeFile(file, "run definitely-custom now");
+    const report = await scanFile(file, {}, beamHome) as { findings: { id: string }[] };
+    expect(report.findings.map(f => f.id)).toContain("custom.probe");
+  });
+
+  it("regression: a beamHome pointing at a directory with no rules.json loads zero custom rules, not the real machine's", async () => {
+    const beamHome = await tempDir("beam-scan-empty-rules-");
+    const dir = await tempDir("beam-scan-file2-");
+    const file = path.join(dir, "SKILL.md");
+    await fs.writeFile(file, "definitely-custom marker with no rule defined for it");
+    const report = await scanFile(file, {}, beamHome) as { findings: { id: string }[] };
+    expect(report.findings.map(f => f.id)).not.toContain("custom.probe");
+  });
+});
+
 describe("scanFile", () => {
   it("scans locally by default without contacting the collector", async () => {
     const dir = await tempDir("beam-scan-");
     const file = path.join(dir, "SKILL.md");
     await fs.writeFile(file, "rm -rf /data");
     global.fetch = jest.fn() as unknown as typeof fetch;
-    const report = await scanFile(file) as { findings: { id: string }[] };
+    const report = await scanFile(file, {}, dir) as { findings: { id: string }[] };
     expect(report.findings.map(f => f.id)).toContain("destructive.delete");
     expect(global.fetch).not.toHaveBeenCalled();
   });
@@ -161,18 +182,29 @@ describe("extractPreview", () => {
       { type: "assistant", session_id: "s1", cwd: "/repo", timestamp: "2026-01-01T00:00:00.000Z", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "echo API_KEY=super-secret-value" } }] } },
     ]);
     global.fetch = jest.fn() as unknown as typeof fetch;
-    const result = await extractPreview("claude-code", 200, home);
+    const result = await extractPreview("claude-code", 200, home, home);
     expect(result.found).toBe(1);
     expect(global.fetch).not.toHaveBeenCalled();
     // normalize() redacts before this ever reaches the caller, even in preview mode.
     expect(JSON.stringify(result.events)).not.toContain("super-secret-value");
   });
 
+  it("applies a custom rule loaded from the separate beamHome argument, not the extraction home", async () => {
+    const home = await tempDir("beam-extract-home-");
+    const beamHome = await tempDir("beam-extract-beamhome-");
+    await fs.writeFile(path.join(beamHome, "rules.json"), JSON.stringify([{ id: "probe", pattern: "definitely-custom", severity: "high" }]));
+    await writeJsonl(path.join(home, ".claude", "projects", "p", "s.jsonl"), [
+      { type: "assistant", session_id: "s1", cwd: "/repo", timestamp: "2026-01-01T00:00:00.000Z", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "run definitely-custom now" } }] } },
+    ]);
+    const result = await extractPreview("claude-code", 200, home, beamHome);
+    expect(result.events[0].findings.map(f => f.id)).toContain("custom.probe");
+  });
+
   it("caps the preview at the given limit while still reporting the true total found", async () => {
     const home = await tempDir("beam-extract-limit-");
     const rows = Array.from({ length: 5 }, (_, i) => ({ type: "assistant", session_id: "s", cwd: "/repo", timestamp: "2026-01-01T00:00:00.000Z", message: { content: [{ type: "tool_use", id: `t${i}`, name: "Bash", input: { command: "ls" } }] } }));
     await writeJsonl(path.join(home, ".claude", "projects", "p", "s.jsonl"), rows);
-    const result = await extractPreview("claude-code", 2, home);
+    const result = await extractPreview("claude-code", 2, home, home);
     expect(result.found).toBe(5);
     expect(result.previewed).toBe(2);
     expect(result.events).toHaveLength(2);

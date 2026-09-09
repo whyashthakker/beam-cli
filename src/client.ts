@@ -1,10 +1,11 @@
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getCollectorUrl, getDataDirectory } from "./config.js";
+import { getBeamHome, getCollectorUrl, getDataDirectory } from "./config.js";
 import { normalize, scanText, type Event, type Scan } from "./core.js";
 import { adaptHookPayload } from "./hook-adapters.js";
 import { extractAgent } from "./extract.js";
+import { loadCustomRules } from "./custom-rules.js";
 
 export async function readToken(): Promise<string> {
   if (process.env.BEAM_TOKEN) return process.env.BEAM_TOKEN;
@@ -35,12 +36,22 @@ export async function importEvents(filePath: string): Promise<unknown> {
   return send("/ingest", await boundedFile(filePath));
 }
 
+export interface RuleReloadResult { path: string; loaded: number; errors: string[] }
+
+export async function reloadRemoteRules(): Promise<RuleReloadResult> {
+  return send("/rules/reload", "{}") as Promise<RuleReloadResult>;
+}
+
 export interface ScanOptions { mcp?: boolean; save?: boolean }
 
-export async function scanFile(filePath: string, options: ScanOptions = {}): Promise<Scan | unknown> {
+export async function scanFile(filePath: string, options: ScanOptions = {}, beamHome = getBeamHome()): Promise<Scan | unknown> {
   const content = await boundedFile(filePath);
   const kind = options.mcp ? "mcp" : "skill";
   if (options.save) return send("/scan", JSON.stringify({ name: filePath, content, kind }));
+  // Offline scanning should flag the same things the live collector would -- load any custom
+  // rules from disk first, same as the server does at startup. Note: beamHome is ~/.beam, not
+  // the OS home directory -- distinct from extractPreview/extractSave's `home` below.
+  await loadCustomRules(beamHome);
   return scanText(filePath, content, kind);
 }
 
@@ -50,8 +61,12 @@ export interface ExtractPreviewResult { found: number; previewed: number; events
 export interface ExtractSaveResult { found: number; accepted: number; duplicates: number; skipped: number }
 
 // Without --save: extract and normalize locally (so redaction still applies) without touching
-// the collector at all -- a read-only preview of what would be imported.
-export async function extractPreview(agentId: string, limit = 200, home = homedir()): Promise<ExtractPreviewResult> {
+// the collector at all -- a read-only preview of what would be imported. `home` is the OS home
+// directory (where ~/.claude, ~/.codex etc. live); `beamHome` is the separate ~/.beam config
+// root that rules.json lives under -- passing one where the other belongs silently loads zero
+// custom rules instead of erroring, so keep them distinct rather than reusing one parameter.
+export async function extractPreview(agentId: string, limit = 200, home = homedir(), beamHome = getBeamHome()): Promise<ExtractPreviewResult> {
+  await loadCustomRules(beamHome);
   const records = await extractAgent(agentId, home);
   const events: Event[] = [];
   for (const record of records) { try { events.push(normalize(record)); } catch { /* skip a record normalize() can't accept */ } }

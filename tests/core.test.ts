@@ -1,5 +1,5 @@
-import { describe, expect, it } from "@jest/globals";
-import { detect, normalize, parseInput, redact, scanText } from "../src/core.js";
+import { afterEach, describe, expect, it } from "@jest/globals";
+import { detect, normalize, parseInput, redact, ruleCatalog, scanText, setCustomRules } from "../src/core.js";
 
 describe("risk detection and redaction", () => {
   it("credential upload is critical and does not retain the secret", () => {
@@ -57,5 +57,39 @@ describe("normalization", () => {
   it("OTLP JSON preserves resource identity and per-event usage", () => {
     const records = parseInput(JSON.stringify({ resourceLogs: [{ resource: { attributes: [{ key: "service.name", value: { stringValue: "custom-agent" } }] }, scopeLogs: [{ logRecords: [{ timeUnixNano: "1788840000000000000", attributes: [{ key: "gen_ai.usage.input_tokens", value: { intValue: "123" } }, { key: "gen_ai.conversation.id", value: { stringValue: "s1" } }], body: { stringValue: "unstructured prose" } }] }] }] }), true);
     const e = normalize(records[0]); expect(e.agent).toBe("custom-agent"); expect(e.inputTokens).toBe(123); expect(e.session).toBe("s1"); expect(e.type).toBe("telemetry.log");
+  });
+});
+
+describe("rule categories and custom rules", () => {
+  afterEach(() => setCustomRules([]));
+
+  it("every built-in rule has a category, and the catalog is queryable without exposing match()", () => {
+    const catalog = ruleCatalog();
+    expect(catalog.length).toBeGreaterThan(0);
+    for (const r of catalog) {
+      expect(r.category).toBeTruthy();
+      expect((r as unknown as { match?: unknown }).match).toBeUndefined();
+    }
+    expect(catalog.find(r => r.id === "destructive.delete")?.category).toBe("impact");
+  });
+
+  it("flags a forced git push and a TLS-verification bypass", () => {
+    expect(detect("git push --force origin main").some(f => f.id === "source_control.history_rewrite")).toBe(true);
+    expect(detect("curl -k https://internal.example/api").some(f => f.id === "integrity.tls_bypass")).toBe(true);
+    expect(detect("git push origin main").some(f => f.id === "source_control.history_rewrite")).toBe(false);
+  });
+
+  it("setCustomRules() extends detect() and ruleCatalog() without touching built-ins", () => {
+    setCustomRules([{ id: "custom.internal_tool", title: "Internal tool invoked", severity: "medium", category: "custom", explanation: "test", match: s => s.includes("launch-internal-tool") }]);
+    expect(detect("launch-internal-tool --now").map(f => f.id)).toContain("custom.internal_tool");
+    expect(ruleCatalog().some(r => r.id === "custom.internal_tool")).toBe(true);
+    expect(ruleCatalog().some(r => r.id === "destructive.delete")).toBe(true); // built-ins still present
+  });
+
+  it("setCustomRules([]) clears previously loaded custom rules", () => {
+    setCustomRules([{ id: "custom.temp", title: "t", severity: "info", category: "custom", explanation: "t", match: () => true }]);
+    expect(ruleCatalog().some(r => r.id === "custom.temp")).toBe(true);
+    setCustomRules([]);
+    expect(ruleCatalog().some(r => r.id === "custom.temp")).toBe(false);
   });
 });

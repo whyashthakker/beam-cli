@@ -33,6 +33,9 @@ beam agent list                     # supported agents and payload verification 
 beam agent install cursor           # wire beam's hook into that agent's own config, non-destructively
 beam agent install-all              # detect every agent actually installed on this machine and wire them all
 
+beam rule list                      # the active rule catalog (built-in + custom + sequence), grouped by category
+beam rule reload                    # apply edits to ~/.beam/rules.json into the running collector, no restart
+
 beam service install                # run the collector as a background service (starts on login)
 beam service status                 # is it installed / running
 beam service stop                   # stop it
@@ -72,7 +75,7 @@ Different agents send different JSON shapes to their hooks. `beam hook <agent>` 
 
 Run `beam agent list` for the current status of each. Adding a new agent means one entry in `src/agents.ts` (config path + how to merge the hook block) and, if its stdin payload uses different field names than `tool_name`/`tool_input`/`session_id`/`cwd`/`hook_event_name`, one adapter function in `src/hook-adapters.ts`.
 
-This is an intentionally small first slice of what a full multi-agent observer covers (see [Numbat](https://github.com/perplexityai/numbat) for the much larger prior art: 25+ agents, a CEL rule engine, enforcement/blocking, and portable case bundles). Beam does not yet do a real rule engine beyond flat regexes, or enforcement — those are tracked as future slices, not silently unsupported.
+This is an intentionally small first slice of what a full multi-agent observer could cover. Wider agent coverage, enforcement/blocking, and portable case bundles aren't built yet — tracked as future slices, not silently unsupported.
 
 ## Forensic extraction (no hook required)
 
@@ -88,6 +91,24 @@ beam agent extract codex --save
 Supported today: **`claude-code`** (`~/.claude/projects/**/*.jsonl` — reads `tool_use` blocks out of assistant turns) and **`codex`** (`~/.codex/{sessions,archived_sessions}/**/*.jsonl` — reads `function_call` and `custom_tool_call` response items). Every extracted event gets `source: "extract"` and `phase: "observed"` so it's visibly distinct from a live hook capture (which is `"proposed"`/`"completed hook"`). Preview mode normalizes (and therefore redacts) locally without ever contacting the collector; `--save` sends the raw records through the same `/ingest` pipeline a live hook uses, batched under the collector's 2,000-record-per-request cap. Bounded like everything else in Beam: 50 MB max per transcript file, 20,000 parsed lines per file, 2,000 files walked per run.
 
 Other agents aren't wired yet — `beam agent extract <agent>` fails clearly rather than silently returning nothing for one that isn't supported.
+
+## Rule engine
+
+Detection has three layers now, all active in both `beam scan` (offline) and the running collector:
+
+- **Categorized built-in rules** — every rule has a `category` (`exec`, `exfil`, `impact`, `integrity`, `persistence`, `privilege`, `recon`, `secrets`, `source_control`), not just a flat id. `beam rule list` shows the full catalog grouped by category.
+- **Custom rules from `~/.beam/rules.json`** — extend detection without touching Beam's source. A JSON array of `{ id, pattern, severity, title?, explanation?, category? }`; `pattern` is a regex (case-insensitive). Loaded once at collector startup; a malformed entry is skipped and reported (`beam rule list` / `beam start`'s output shows why), never crashes the rest of detection.
+
+  ```json
+  [
+    { "id": "internal_host", "pattern": "wiki\\.internal\\.corp", "severity": "high", "category": "exfil", "title": "Internal wiki referenced" }
+  ]
+  ```
+
+  `beam rule reload` applies edits to the running collector immediately, no restart needed.
+- **Cross-event sequence rules** — some risk only shows up as a *pattern of actions*, not one action in isolation: a credential read followed by network activity later in the same session, or a network scan followed by remote code execution, even across separate, unrelated-looking tool calls that a single-event regex could never connect. Beam re-evaluates a session's recent events (last 50) whenever new events land, and attaches one composite finding to the event that completes the pattern — idempotently, so re-ingesting the same history never duplicates it.
+
+All three feed the same `Finding[]` shape everywhere — Studio, `/export`, `/state` — so there's nothing separate to look at.
 
 ## Running as a background service
 
@@ -140,6 +161,7 @@ All routes require `Authorization: Bearer <token>` and are bound to loopback onl
 - `POST /v1/logs` — OTLP/HTTP **JSON** (not protobuf).
 - `POST /scan` — `{ "name": "SKILL.md", "kind": "skill", "content": "..." }` (or `kind: "mcp"`; max 500 KB).
 - `POST /review` — `{ "id": "...", "reviewed": true }`.
+- `POST /rules/reload` — reload `~/.beam/rules.json` into this running process; returns `{ path, loaded, errors }`.
 - `GET /export` — redacted event NDJSON.
 
 ## Limits and guarantees

