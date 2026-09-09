@@ -2,6 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { getCollectorUrl, getDataDirectory } from "./config.js";
 import { scanText, type Scan } from "./core.js";
+import { adaptHookPayload } from "./hook-adapters.js";
 
 export async function readToken(): Promise<string> {
   if (process.env.BEAM_TOKEN) return process.env.BEAM_TOKEN;
@@ -54,7 +55,8 @@ async function readStdin(limitBytes: number): Promise<string> {
 export async function captureHook(sourceAgent = "claude-code"): Promise<void> {
   try {
     const input = await readStdin(100_000);
-    const data = JSON.parse(input) as Record<string, unknown>;
+    const raw = JSON.parse(input) as Record<string, unknown>;
+    const data = adaptHookPayload(sourceAgent, raw);
     data.source_agent = sourceAgent;
     data.source_type = "hook";
     if (data.hook_event_name === "UserPromptSubmit" && typeof data.prompt === "string") {

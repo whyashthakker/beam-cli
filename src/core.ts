@@ -111,7 +111,7 @@ export function normalize(raw: Obj): Event {
   const url = str(raw.url ?? input.url);
   let type = str(raw.event_type ?? raw.observed_event_type);
   if (!type) {
-    if (["Bash", "bash", "exec_command", "shell"].includes(tool) && command) type = "command.exec";
+    if (["Bash", "bash", "Shell", "shell", "exec_command"].includes(tool) && command) type = "command.exec";
     else if (["Read", "read_file"].includes(tool)) type = "file.read";
     else if (["Write", "Edit", "write_file", "apply_patch"].includes(tool)) type = "file.write";
     else if (["browser.navigate", "browser_navigate"].includes(tool)) type = "browser.navigate";
@@ -134,7 +134,7 @@ export function normalize(raw: Obj): Event {
     session: clean(str(raw.session_id ?? raw.session, "unassigned")), type: clean(type), tool: clean(tool), summary: redact(detail).slice(0, 4000),
     project: clean(str(raw.project_path ?? raw.cwd)), source: clean(str(raw.source_type, raw.hook_event_name ? "hook" : "import")),
     endpoint: clean(str(obj(raw.endpoint).hostname ?? raw.hostname, "local")), model: clean(str(raw.model)),
-    phase: raw.hook_event_name === "PreToolUse" ? "proposed" : raw.hook_event_name === "PostToolUse" ? "completed hook" : "observed",
+    phase: (() => { const event = str(raw.hook_event_name).toLowerCase(); return event === "pretooluse" ? "proposed" : event === "posttooluse" ? "completed hook" : "observed"; })(),
     provenance: { recordId: clean(stableId), schemaVersion: clean(str(raw.schema_version)),
       citedEventIds: Array.isArray(raw.cited_event_ids) ? raw.cited_event_ids.filter((v): v is string => typeof v === "string").slice(0, 100).map(clean) : [],
       tags: Array.isArray(raw.tags) ? raw.tags.filter((v): v is string => typeof v === "string").slice(0, 100).map(clean) : [],
