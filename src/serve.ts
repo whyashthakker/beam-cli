@@ -9,6 +9,7 @@ import { loadCustomRules } from "./custom-rules.js";
 import { readIdentity } from "./enroll.js";
 import { syncPolicy } from "./forward.js";
 import { installAllDetectedHooks, type InstallAllResult } from "./install.js";
+import { startOsMonitor } from "./os-monitor.js";
 
 function toWebRequest(req: IncomingMessage): Promise<Request> {
   return new Promise((resolvePromise, reject) => {
@@ -47,6 +48,8 @@ export interface StartServerOptions {
   rulesHome?: string;
   /** Home directory to scan/write agent hook configs into; defaults to the real home. Tests override this. */
   agentHome?: string;
+  /** Whether to run OS-level process/network monitoring (see os-monitor.ts). Defaults to on; tests disable it. */
+  osMonitor?: boolean;
 }
 
 export async function startServer(options: StartServerOptions = {}): Promise<{ url: string; token: string; directory: string; customRules: { path: string; loaded: number; errors: string[] }; policySync: boolean; agentInstalls: InstallAllResult[]; close: () => void }> {
@@ -106,9 +109,14 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
     policyTimer.unref?.();
   }
 
+  // Observes AI agent activity directly (process start/exit, network connections) so agents that
+  // don't cooperate with any hook -- or that run through a GUI/IDE surface with no hook path at
+  // all -- still get captured. See os-monitor.ts. macOS only; a no-op elsewhere.
+  const osMonitor = options.osMonitor === false ? { stop: () => {} } : await startOsMonitor(async events => { await app.store.addEvents(events); });
+
   return {
     url: `http://${hostname}:${boundPort}`, token, directory, customRules, agentInstalls,
     policySync: Boolean(identity),
-    close: () => { if (policyTimer) clearInterval(policyTimer); server.close(); },
+    close: () => { if (policyTimer) clearInterval(policyTimer); osMonitor.stop(); server.close(); },
   };
 }

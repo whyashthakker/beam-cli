@@ -15,7 +15,7 @@ afterEach(async () => {
 describe("startServer", () => {
   it("boots a real HTTP server, generates a token, and serves /health", async () => {
     const directory = await mkdtemp(join(tmpdir(), "beam-serve-")); dirs.push(directory);
-    const result = await startServer({ directory, port: 0, rulesHome: directory, agentHome: directory });
+    const result = await startServer({ directory, port: 0, rulesHome: directory, agentHome: directory, osMonitor: false });
     servers.push(result);
     expect(result.token).toHaveLength(64);
     const res = await fetch(`${result.url}/health`, { headers: { Authorization: `Bearer ${result.token}` } });
@@ -25,10 +25,10 @@ describe("startServer", () => {
 
   it("reuses a persisted token across restarts", async () => {
     const directory = await mkdtemp(join(tmpdir(), "beam-serve-token-")); dirs.push(directory);
-    const first = await startServer({ directory, port: 0, rulesHome: directory, agentHome: directory });
+    const first = await startServer({ directory, port: 0, rulesHome: directory, agentHome: directory, osMonitor: false });
     servers.push(first);
     first.close();
-    const second = await startServer({ directory, port: 0, rulesHome: directory, agentHome: directory });
+    const second = await startServer({ directory, port: 0, rulesHome: directory, agentHome: directory, osMonitor: false });
     servers.push(second);
     expect(second.token).toBe(first.token);
   });
@@ -41,7 +41,7 @@ describe("startServer", () => {
     await mkdir(join(agentHome, ".codex"), { recursive: true });
     await writeFile(join(agentHome, ".codex", "config.toml"), "model = \"test\"\n");
 
-    const result = await startServer({ directory, port: 0, rulesHome: directory, agentHome });
+    const result = await startServer({ directory, port: 0, rulesHome: directory, agentHome, osMonitor: false });
     servers.push(result);
 
     const codex = result.agentInstalls.find(r => r.agent === "codex");
