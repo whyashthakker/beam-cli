@@ -11,6 +11,7 @@ npm install
 
 echo "Building"
 npm run build
+chmod +x dist/cli.js
 
 echo "Linking beam globally"
 npm link
