@@ -30,7 +30,14 @@ program.command("start")
     const rulesNote = result.customRules.loaded ? `\nCustom rules loaded: ${result.customRules.loaded} from ${result.customRules.path}` : "";
     for (const message of result.customRules.errors) console.error(`✖ ${message}`);
     const policyNote = result.policySync ? "\nPolicy sync: on (every 60s)" : "\nPolicy sync: off (device not enrolled — run 'beam enroll')";
-    console.log(`Beam collector running.\nMode: observe only\nLocal storage: ${result.directory}${rulesNote}${policyNote}\nRun 'beam token' for the pairing token.`);
+    const newlyInstalled = result.agentInstalls.filter(r => r.status === "installed");
+    const installNote = newlyInstalled.length
+      ? `\nAgent hooks installed: ${newlyInstalled.map(r => r.name).join(", ")}`
+      : "";
+    for (const r of result.agentInstalls) {
+      if (r.status === "error") console.error(`✖ Could not wire beam's hook into ${r.name}: ${r.error}`);
+    }
+    console.log(`Beam collector running.\nMode: observe only\nLocal storage: ${result.directory}${rulesNote}${policyNote}${installNote}\nRun 'beam agent list' to see every detected agent's capture status.\nRun 'beam token' for the pairing token.`);
   });
 
 const service = program.command("service").description("Run the collector as a background service (launchd on macOS, systemd --user on Linux)");

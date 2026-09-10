@@ -1,4 +1,5 @@
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -7,6 +8,7 @@ import { getDataDirectory } from "./config.js";
 import { loadCustomRules } from "./custom-rules.js";
 import { readIdentity } from "./enroll.js";
 import { syncPolicy } from "./forward.js";
+import { installAllDetectedHooks, type InstallAllResult } from "./install.js";
 
 function toWebRequest(req: IncomingMessage): Promise<Request> {
   return new Promise((resolvePromise, reject) => {
@@ -43,11 +45,18 @@ export interface StartServerOptions {
   origins?: string[];
   /** Root to load ~/.beam/rules.json from; defaults to the real BEAM_HOME. Tests override this. */
   rulesHome?: string;
+  /** Home directory to scan/write agent hook configs into; defaults to the real home. Tests override this. */
+  agentHome?: string;
 }
 
-export async function startServer(options: StartServerOptions = {}): Promise<{ url: string; token: string; directory: string; customRules: { path: string; loaded: number; errors: string[] }; policySync: boolean; close: () => void }> {
+export async function startServer(options: StartServerOptions = {}): Promise<{ url: string; token: string; directory: string; customRules: { path: string; loaded: number; errors: string[] }; policySync: boolean; agentInstalls: InstallAllResult[]; close: () => void }> {
   const directory = options.directory ?? getDataDirectory();
   await mkdir(directory, { recursive: true, mode: 0o700 });
+  // Wire beam's hook into every detected-but-not-yet-wired agent on every start, so a newly
+  // installed agent (or one that showed up after the last `beam start`) starts getting captured
+  // without a separate manual `beam agent install-all` step. Never blocks or fails startup --
+  // a single agent's config being unwritable shouldn't stop the collector from serving.
+  const agentInstalls = await installAllDetectedHooks(options.agentHome ?? homedir()).catch(() => [] as InstallAllResult[]);
   // Loaded once per process into core.ts's shared rule set; a file edit needs a restart to apply.
   // Errors are returned, not logged here -- the caller (cli.ts) owns all console output, since
   // this same function also runs unattended inside the background service process.
@@ -98,7 +107,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
   }
 
   return {
-    url: `http://${hostname}:${boundPort}`, token, directory, customRules,
+    url: `http://${hostname}:${boundPort}`, token, directory, customRules, agentInstalls,
     policySync: Boolean(identity),
     close: () => { if (policyTimer) clearInterval(policyTimer); server.close(); },
   };
