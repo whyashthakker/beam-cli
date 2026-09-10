@@ -178,3 +178,11 @@ npm test
 npm run typecheck
 npm run build
 ```
+
+## Related
+
+- [beam-mcp](https://github.com/whyashthakker/beam-mcp) — an MCP server exposing this CLI's scanning to MCP-compatible hosts. Open source.
+
+## License
+
+AGPL-3.0-only — see [LICENSE](./LICENSE).
