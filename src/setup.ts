@@ -1,11 +1,17 @@
 import { createInterface } from "node:readline/promises";
-import { installAllDetectedHooks } from "./install.js";
+import { detectAgents, installHook } from "./install.js";
 import { readIdentity } from "./enroll.js";
 import { startConnect } from "./connect.js";
 import { installEnterprisePackage } from "./enterprise-install.js";
 import { installService } from "./service.js";
 import { openBrowser } from "./open-browser.js";
 import { getIdentityPath } from "./config.js";
+import { checkbox, renderTable, withSpinner } from "./prompts.js";
+
+const TOTAL_STEPS = 4;
+function step(n: number, title: string): void {
+  console.log(`\nStep ${n}/${TOTAL_STEPS}: ${title}`);
+}
 
 async function promptYesNo(question: string, defaultYes = true): Promise<boolean> {
   const suffix = defaultYes ? "[Y/n]" : "[y/N]";
@@ -24,64 +30,102 @@ async function promptYesNo(question: string, defaultYes = true): Promise<boolean
 }
 
 // One-shot onboarding for a machine that already has `beam` installed: wires beam's hook into
-// every detected agent, connects the device if it isn't already, and optionally starts the
-// background service. Any step that genuinely needs root (currently just installing the
-// beam-enterprise package into global node_modules) transparently falls back to sudo via
-// runWithSudoFallback -- service install never does, since it must write into the invoking
-// user's own home directory, not root's.
+// whichever detected agents the user picks, connects the device if it isn't already, and
+// optionally starts the background service. Any step that genuinely needs root (currently just
+// installing the beam-enterprise package into global node_modules) transparently falls back to
+// sudo via runWithSudoFallback -- service install never does, since it must write into the
+// invoking user's own home directory, not root's.
 export async function runSetup(): Promise<void> {
-  console.log("Setting up Beam...\n");
+  console.log("Setting up Beam — 4 quick steps.");
 
-  console.log("Detecting installed AI agents and wiring beam's hook into each one...");
-  const hookResults = await installAllDetectedHooks();
-  for (const r of hookResults) {
-    if (r.status === "installed") console.log(`  ✔ Installed for ${r.name}`);
-    else if (r.status === "already-installed") console.log(`  ✔ Already installed for ${r.name}`);
-    else if (r.status === "not-supported") console.log(`  — ${r.name} detected, but hook install isn't built for it yet`);
-    else if (r.status === "error") console.log(`  ✖ ${r.name}: ${r.error}`);
-  }
-  if (!hookResults.some(r => r.status === "installed" || r.status === "already-installed")) {
+  const agentRows: string[] = [];
+  let dashboardStatus = "not connected";
+  let serviceStatus = "not started";
+
+  // --- Step 1: detect agents, then let the user choose which ones get the hook ---
+  step(1, "Detecting AI agents on this machine");
+  const detected = await detectAgents();
+  const installable = detected.filter(a => a.hookConfigPath && a.mergeHookConfig);
+  const unsupported = detected.filter(a => !a.hookConfigPath || !a.mergeHookConfig);
+
+  if (!detected.length) {
     console.log("  No supported agents detected on this machine.");
+  } else {
+    for (const a of unsupported) console.log(`  — ${a.name}: hook install isn't built for it yet`);
   }
 
+  if (installable.length) {
+    const picked = await checkbox(
+      `  Found ${installable.length} agent${installable.length === 1 ? "" : "s"} — pick which get beam's hook:`,
+      installable.map(a => ({ label: a.name, checked: true }))
+    );
+    const toInstall = picked.map(i => installable[i]);
+    for (const agent of toInstall) {
+      try {
+        const result = await withSpinner(`Installing hook for ${agent.name}`, () => installHook(agent.id));
+        agentRows.push(`${agent.name}${result.alreadyInstalled ? " (already installed)" : ""}`);
+      } catch (e) {
+        agentRows.push(`${agent.name} — failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    const skipped = installable.filter(a => !toInstall.includes(a));
+    for (const a of skipped) console.log(`  — Skipped ${a.name} (run 'beam agent install ${a.id}' later if you change your mind)`);
+  }
+
+  // --- Step 2: connect this device to the dashboard (dashboard-v1, or BEAM_DASHBOARD_URL) ---
+  step(2, "Connecting to your Beam dashboard");
   let identity = await readIdentity();
   if (identity) {
-    console.log(`\n✔ Already connected (device ${identity.deviceId}).`);
+    console.log(`  Already connected (device ${identity.deviceId}).`);
+    dashboardStatus = `connected (${identity.deviceId})`;
   } else {
-    const shouldConnect = await promptYesNo("\nConnect this device to your Beam workspace now?");
+    const shouldConnect = await promptYesNo("  Connect this device to your Beam dashboard now?");
     if (shouldConnect) {
       const session = await startConnect();
-      console.log(`\nConnect Beam CLI to Agentbeam:\n${session.url}`);
+      console.log(`  Open this to finish pairing:\n  ${session.url}`);
       openBrowser(session.url);
-      console.log("Waiting for you to finish in the browser…");
-      identity = await session.poll();
+      identity = await withSpinner("Waiting for you to finish in the browser", () => session.poll());
       console.log(
-        `✔ Connected device ${identity.deviceId}\n` +
-        `  org:      ${identity.orgId}\n` +
-        `  api:      ${identity.apiBase}\n` +
-        `  identity: ${getIdentityPath()} (0600)`
+        `    org:      ${identity.orgId}\n` +
+        `    api:      ${identity.apiBase}\n` +
+        `    identity: ${getIdentityPath()} (0600)`
       );
+      dashboardStatus = `connected (${identity.deviceId})`;
 
-      const enterprise = await installEnterprisePackage(identity);
-      if (enterprise.status === "installed") console.log("✔ beam-enterprise installed (OS-level monitoring enabled).");
-      else if (enterprise.status === "error") console.error(`✖ Could not install beam-enterprise: ${enterprise.message}`);
+      const enterprise = await withSpinner("Checking for beam-enterprise", () => installEnterprisePackage(identity!));
+      if (enterprise.status === "installed") console.log("  beam-enterprise installed (OS-level monitoring enabled).");
+      else if (enterprise.status === "error") console.error(`  Could not install beam-enterprise: ${enterprise.message}`);
       // "not-entitled": org isn't on the enterprise plan -- nothing to print, this is the normal case.
     } else {
-      console.log("Skipped. Run 'beam connect' whenever you're ready.");
+      console.log("  Skipped. Run 'beam connect' whenever you're ready.");
     }
   }
 
-  const shouldStart = await promptYesNo("\nStart the beam background service now (survives reboot/logout)?");
+  // --- Step 3: background collector service ---
+  step(3, "Starting the background collector");
+  const shouldStart = await promptYesNo("  Start the beam background service now (survives reboot/logout)?");
   if (shouldStart) {
     try {
-      const result = await installService();
-      console.log(`✔ Installed and started the beam service (${result.platform})\n  config: ${result.configPath}`);
+      const result = await withSpinner("Installing and starting the beam service", () => installService());
+      serviceStatus = `running (${result.platform})`;
     } catch (err) {
-      console.error(`✖ Could not start the beam service: ${(err as Error).message}`);
+      serviceStatus = `failed: ${(err as Error).message}`;
     }
   } else {
-    console.log("Skipped. Run 'beam service install' (background) or 'beam start' (foreground) whenever you want it running.");
+    console.log("  Skipped. Run 'beam service install' (background) or 'beam start' (foreground) whenever you want it running.");
+    serviceStatus = "skipped";
   }
 
-  console.log("\nSetup complete. Run 'beam studio' to see activity, or 'beam agent list' to check hook status.");
+  // --- Step 4: summary ---
+  step(4, "Done");
+  console.log();
+  console.log(renderTable([
+    { label: "Agent hooks", value: agentRows.length ? agentRows.join(", ") : "none" },
+    { label: "Dashboard", value: dashboardStatus },
+    { label: "Service", value: serviceStatus },
+  ]));
+  console.log("\nUseful next commands:");
+  console.log("  beam studio          open the activity dashboard");
+  console.log("  beam service status  check whether the collector is running");
+  console.log("  beam agent list      check hook status per agent");
 }
