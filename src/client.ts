@@ -130,12 +130,18 @@ export async function captureHook(sourceAgent = "claude-code"): Promise<void> {
       process.stderr.write(`\n⚠ Beam policy (advisory): ${decision.reason}\n`);
     }
 
-    // 2. Local capture (best-effort — a failure here must not skip enforcement or throw).
+    // 2. Local capture (best-effort — a failure here must not skip enforcement or throw). The
+    //    running collector (serve.ts) also batches this event into its own workspace forward --
+    //    see ForwardQueue in forward.ts -- so most events reach the dashboard in groups rather
+    //    than one request per action.
     try { await send("/ingest", JSON.stringify(data)); }
     catch (e) { console.error(e instanceof Error ? e.message : String(e)); }
 
-    // 3. Forward to the workspace if enrolled (fire-and-forget, never blocks).
-    if (event) { try { await forwardEvents(event); } catch { /* offline */ } }
+    // 3. A policy-blocked action carries a finding the collector's own normalize() can't
+    //    reconstruct (it only knows about *this* process's policy decision) -- forward it to the
+    //    workspace immediately rather than folding it into the batch, so a manager sees a block
+    //    without waiting on unrelated traffic to fill the batch.
+    if (event && decision.action === "deny") { try { await forwardEvents(event); } catch { /* offline */ } }
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
   }

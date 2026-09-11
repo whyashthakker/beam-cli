@@ -112,7 +112,12 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
   // Observes AI agent activity directly (process start/exit, network connections) so agents that
   // don't cooperate with any hook -- or that run through a GUI/IDE surface with no hook path at
   // all -- still get captured. See os-monitor.ts. macOS only; a no-op elsewhere.
-  const osMonitor = options.osMonitor === false ? { stop: () => {} } : await startOsMonitor(async events => { await app.store.addEvents(events); });
+  const osMonitor = options.osMonitor === false ? { stop: () => {} } : await startOsMonitor(async events => {
+    await app.store.addEvents(events);
+    // Same batched forward as hook-captured events (see server.ts's /ingest handler) --
+    // otherwise OS-monitor rows would only ever show up in the local studio view.
+    app.forwardQueue.push(events);
+  });
 
   return {
     url: `http://${hostname}:${boundPort}`, token, directory, customRules, agentInstalls,

@@ -4,12 +4,14 @@ import { Store } from "./store.js";
 import { inventory } from "./inventory.js";
 import { studioPage } from "./studio.js";
 import { loadCustomRules } from "./custom-rules.js";
+import { ForwardQueue, forwardReview, forwardScan } from "./forward.js";
 
 export async function createCollector(options: { directory: string; token: string; origins?: string[]; rulesHome?: string }) {
   const store = new Store(options.directory); await store.init();
+  const forwardQueue = new ForwardQueue();
   const origins = new Set(options.origins ?? ["http://localhost:3200", "http://127.0.0.1:3200"]);
   const secret = Buffer.from(`Bearer ${options.token}`);
-  return { store, async fetch(req: Request): Promise<Response> {
+  return { store, forwardQueue, async fetch(req: Request): Promise<Response> {
     const origin = req.headers.get("origin");
     const url = new URL(req.url);
     const headers: Record<string, string> = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Vary": "Origin" };
@@ -50,16 +52,22 @@ export async function createCollector(options: { directory: string; token: strin
         if (records.length > 2000) throw new Error("Batch exceeds 2,000 records.");
         // Some exporters also emit indicator, summary and enforcement records; those are not action events.
         const supported = records.filter(r => !r.record_type || ["event", "finding"].includes(String(r.record_type)));
-        const result = await store.addEvents(supported.map(normalize));
+        const normalized = supported.map(normalize);
+        const result = await store.addEvents(normalized);
+        forwardQueue.push(normalized);
         return json(url.pathname === "/v1/logs" ? {} : { ...result, skipped: records.length - supported.length });
       }
       const data = JSON.parse(body);
       if (url.pathname === "/scan") {
         if (typeof data.content !== "string" || typeof data.name !== "string" || !["skill", "mcp"].includes(data.kind)) throw new Error("Expected name, content and kind (skill or mcp).");
-        return json(await store.addScan(scanText(data.name, data.content, data.kind)));
+        const scan = await store.addScan(scanText(data.name, data.content, data.kind));
+        try { await forwardScan(scan); } catch { /* offline */ }
+        return json(scan);
       }
       if (typeof data.id !== "string" || typeof data.reviewed !== "boolean") throw new Error("Expected event id and reviewed boolean.");
-      await store.review(data.id, data.reviewed); return json({ ok: true });
+      await store.review(data.id, data.reviewed);
+      try { await forwardReview(data.id, data.reviewed); } catch { /* offline */ }
+      return json({ ok: true });
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code) { console.error("Beam storage error:", (e as NodeJS.ErrnoException).code); return json({ error: "Local storage failed. Check collector permissions and disk space; retry the request." }, 500); }
       return json({ error: e instanceof Error ? e.message : "Invalid request." }, 400);
