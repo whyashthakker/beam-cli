@@ -84,6 +84,16 @@ async function isDetected(agent: AgentDefinition, home: string): Promise<boolean
   return false;
 }
 
+// Detection only, no writes — lets a caller (e.g. `beam setup`) show what's on the machine
+// and let the user choose before `installHook` touches anything.
+export async function detectAgents(home = homedir()): Promise<AgentDefinition[]> {
+  const found: AgentDefinition[] = [];
+  for (const agent of AGENTS) {
+    if (await isDetected(agent, home)) found.push(agent);
+  }
+  return found;
+}
+
 export type InstallAllStatus = "installed" | "already-installed" | "not-detected" | "not-supported" | "error";
 export interface InstallAllResult { agent: string; name: string; status: InstallAllStatus; path?: string; error?: string }
 
