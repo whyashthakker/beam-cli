@@ -29,9 +29,6 @@
   "dependencies": {
     "commander": "^13.0.0"
   },
-  "optionalDependencies": {
-    "beam-enterprise": "^0.1.0"
-  },
   "devDependencies": {
     "@types/jest": "^30.0.0",
     "@types/node": "^22.10.5",

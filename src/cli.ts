@@ -8,7 +8,10 @@ import { AGENTS } from "./agents.js";
 import { installAllDetectedHooks, installHook } from "./install.js";
 import { installService, serviceLogPaths, serviceStatus, startService, stopService, uninstallService } from "./service.js";
 import { getCollectorUrl, getIdentityPath } from "./config.js";
-import { enrollDevice, readIdentity } from "./enroll.js";
+import { clearIdentity, enrollDevice, readIdentity } from "./enroll.js";
+import { startConnect } from "./connect.js";
+import { installEnterprisePackage } from "./enterprise-install.js";
+import { fetchAccount, revokeDevice } from "./account.js";
 import { syncPolicy } from "./forward.js";
 import { openBrowser } from "./open-browser.js";
 import { ruleCatalog } from "./core.js";
@@ -87,7 +90,7 @@ program.command("studio")
 program.command("enroll")
   .description("Enroll this device with your Beam workspace using a code from your manager")
   .requiredOption("--code <code>", "enrollment code, e.g. BEAM-XXXX-XXXX-XXXX")
-  .option("--url <url>", "Beam API base URL (default $BEAM_API_URL or http://127.0.0.1:3200)")
+  .option("--url <url>", "Beam API base URL (default $BEAM_API_URL or http://127.0.0.1:3001)")
   .action(async (options: { code: string; url?: string }) => {
     const existing = await readIdentity();
     if (existing) console.error(`Replacing the existing enrollment (device ${existing.deviceId}).`);
@@ -109,6 +112,38 @@ program.command("whoami")
     console.log(`device: ${identity.deviceId}\norg:    ${identity.orgId}\napi:    ${identity.apiBase}\nhost:   ${identity.hostname} (${identity.os})\nsince:  ${identity.enrolledAt}`);
   });
 
+program.command("account")
+  .description("Show the signed-in user and workspace this device is connected to")
+  .action(async () => {
+    const identity = await readIdentity();
+    if (!identity) throw new Error("This device is not enrolled. Run 'beam connect' or 'beam enroll --code <code>'.");
+    const account = await fetchAccount(identity);
+    console.log(
+      `user:   ${account.user.email}${account.user.name ? ` (${account.user.name})` : ""}\n` +
+      `org:    ${account.org.name} (${account.org.slug})\n` +
+      `device: ${account.device.hostname} (${account.device.os}) · ${account.device.status.toLowerCase()}\n` +
+      `since:  ${account.device.enrolled_at}`
+    );
+  });
+
+program.command("logout")
+  .description("Disconnect this device from your Beam workspace and remove local credentials")
+  .action(async () => {
+    const identity = await readIdentity();
+    if (!identity) {
+      console.log("This device is not enrolled -- nothing to do.");
+      return;
+    }
+    try {
+      await revokeDevice(identity);
+    } catch (e) {
+      console.error(`✖ Could not reach ${identity.apiBase} to revoke this device: ${(e as Error).message}`);
+      console.error("  Clearing local credentials anyway.");
+    }
+    await clearIdentity();
+    console.log(`✔ Logged out. Removed ${getIdentityPath()}.`);
+  });
+
 program.command("sync")
   .description("Pull the latest policy from your Beam workspace into ~/.beam/data/policy.json")
   .action(async () => {
@@ -121,6 +156,33 @@ program.command("sync")
 program.command("token")
   .description("Print the Beam collector pairing token")
   .action(async () => console.log(await readToken()));
+
+program.command("connect")
+  .description("Pair this device with your Beam dashboard by signing in through the browser")
+  .action(async () => {
+    const existing = await readIdentity();
+    if (existing) console.error(`Replacing the existing enrollment (device ${existing.deviceId}).`);
+
+    const session = await startConnect();
+    console.log(`Connect Beam CLI to Agentbeam:\n${session.url}`);
+    openBrowser(session.url);
+    console.log("\nWaiting for you to finish in the browser…");
+
+    const identity = await session.poll();
+    console.log(
+      `✔ Connected device ${identity.deviceId}\n` +
+      `  org:      ${identity.orgId}\n` +
+      `  api:      ${identity.apiBase}\n` +
+      `  identity: ${getIdentityPath()} (0600)`
+    );
+
+    const enterprise = await installEnterprisePackage(identity);
+    if (enterprise.status === "installed") console.log("✔ beam-enterprise installed (OS-level monitoring enabled).");
+    else if (enterprise.status === "error") console.error(`✖ Could not install beam-enterprise: ${enterprise.message}`);
+    // "not-entitled": org isn't on the enterprise plan -- nothing to print, this is the normal case.
+
+    console.log("\nNext: beam agent install-all && beam start");
+  });
 
 program.command("import")
   .description("Send a normalized events file (JSON/NDJSON) to the collector")
