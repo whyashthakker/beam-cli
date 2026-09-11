@@ -98,7 +98,7 @@ program.command("studio")
 program.command("enroll")
   .description("Enroll this device with your Beam workspace using a code from your manager")
   .requiredOption("--code <code>", "enrollment code, e.g. BEAM-XXXX-XXXX-XXXX")
-  .option("--url <url>", "Beam API base URL (default $BEAM_API_URL or http://127.0.0.1:3001)")
+  .option("--url <url>", "Beam API base URL (default $BEAM_API_URL or https://app.agentbeam.com)")
   .action(async (options: { code: string; url?: string }) => {
     const existing = await readIdentity();
     if (existing) console.error(`Replacing the existing enrollment (device ${existing.deviceId}).`);

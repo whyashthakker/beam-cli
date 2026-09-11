@@ -18,7 +18,7 @@ export function getCollectorUrl(): URL {
 // The Beam workspace API (dashboard / control plane) this device enrolls with and
 // reports to. Not loopback-restricted — this is the remote SaaS endpoint.
 export function getApiUrl(): string {
-  return (process.env.BEAM_API_URL || "http://127.0.0.1:3001").replace(/\/+$/, "");
+  return (process.env.BEAM_API_URL || "https://app.agentbeam.com").replace(/\/+$/, "");
 }
 
 export function getIdentityPath(): string {
@@ -27,5 +27,5 @@ export function getIdentityPath(): string {
 
 // The dashboard (agentbeam) web app that `beam connect` pairs this device with.
 export function getDashboardUrl(): string {
-  return (process.env.BEAM_DASHBOARD_URL || "http://localhost:3001").replace(/\/+$/, "");
+  return (process.env.BEAM_DASHBOARD_URL || "https://app.agentbeam.com").replace(/\/+$/, "");
 }
