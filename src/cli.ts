@@ -10,6 +10,7 @@ import { installService, serviceLogPaths, serviceStatus, startService, stopServi
 import { getCollectorUrl, getIdentityPath } from "./config.js";
 import { clearIdentity, enrollDevice, readIdentity } from "./enroll.js";
 import { startConnect } from "./connect.js";
+import { runSetup } from "./setup.js";
 import { installEnterprisePackage } from "./enterprise-install.js";
 import { fetchAccount, revokeDevice } from "./account.js";
 import { syncPolicy } from "./forward.js";
@@ -17,6 +18,9 @@ import { openBrowser } from "./open-browser.js";
 import { ruleCatalog } from "./core.js";
 import { loadCustomRules } from "./custom-rules.js";
 import { sequenceRuleCatalog } from "./sequences.js";
+import { printBanner } from "./banner.js";
+
+printBanner();
 
 const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
 
@@ -24,6 +28,10 @@ const program = new Command()
   .name("beam")
   .description("Local observation and heuristic risk scanning for AI agent activity")
   .version(packageJson.version);
+
+program.command("setup")
+  .description("One-shot onboarding: wire beam's hook into every detected agent, connect this device, and optionally start the background service")
+  .action(runSetup);
 
 program.command("start")
   .description("Start the local Beam collector (binds to 127.0.0.1)")

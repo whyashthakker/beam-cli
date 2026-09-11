@@ -1,11 +1,8 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Identity } from "./enroll.js";
-
-const run = promisify(execFile);
+import { runWithSudoFallback } from "./elevate.js";
 
 export type EnterpriseInstallResult =
   | { status: "installed" }
@@ -48,8 +45,9 @@ export async function installEnterprisePackage(identity: Identity): Promise<Ente
 
     // -g so it lands in the same global node_modules as a globally-installed `beam`, where
     // os-monitor.ts's bare `import("beam-enterprise")` can resolve it. --no-save: this is a
-    // local tarball path, not something meaningful to persist in any package.json.
-    await run("npm", ["install", "-g", "--no-save", tarballPath], { timeout: 120_000 });
+    // local tarball path, not something meaningful to persist in any package.json. Falls back
+    // to sudo if the global node_modules isn't user-writable (e.g. a system Node install).
+    await runWithSudoFallback("npm", ["install", "-g", "--no-save", tarballPath], { timeout: 120_000 });
     return { status: "installed" };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
