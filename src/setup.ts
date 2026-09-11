@@ -7,6 +7,7 @@ import { installService } from "./service.js";
 import { openBrowser } from "./open-browser.js";
 import { getIdentityPath } from "./config.js";
 import { checkbox, renderTable, withSpinner } from "./prompts.js";
+import { showFirstRunWelcome } from "./owl.js";
 
 const TOTAL_STEPS = 4;
 function step(n: number, title: string): void {
@@ -36,6 +37,8 @@ export async function promptYesNo(question: string, defaultYes = true): Promise<
 // sudo via runWithSudoFallback -- service install never does, since it must write into the
 // invoking user's own home directory, not root's.
 export async function runSetup(): Promise<void> {
+  // Owl says hello, but only the first time this machine is ever set up.
+  await showFirstRunWelcome();
   console.log("Setting up Beam — 4 quick steps.");
 
   const agentRows: string[] = [];

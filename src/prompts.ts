@@ -58,7 +58,10 @@ export async function checkbox(title: string, items: CheckboxItem[]): Promise<nu
   });
 }
 
-const FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// Beam's own spinner: a watchful eye that opens and closes — the owl keeping
+// an eye on your agents. Doubled ends hold the shut/wide-open frames a beat
+// longer, so it reads as a blink-and-pulse rather than a flat cycle.
+const FRAMES = ["·", "·", "∘", "○", "◎", "◉", "◉", "◎", "○", "∘"];
 
 // Runs `fn` while animating a spinner in place on the current line, then replaces it with a
 // ✔/✖ result line. Falls back to plain "label..." on a non-TTY stdout (nothing to animate).
@@ -80,7 +83,7 @@ export async function withSpinner<T>(label: string, fn: () => Promise<T>): Promi
   const timer = setInterval(() => {
     frame = (frame + 1) % FRAMES.length;
     process.stdout.write(`\r${FRAMES[frame]} ${label}`);
-  }, 80);
+  }, 110);
 
   try {
     const result = await fn();
