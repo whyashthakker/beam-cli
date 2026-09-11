@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { getDataDirectory } from "./config.js";
+import { getDataDirectory, getTelemetryUrl } from "./config.js";
 import { readIdentity } from "./enroll.js";
 import type { Event, Scan } from "./core.js";
 
@@ -13,7 +13,7 @@ export async function forwardEvents(events: Event | Event[]): Promise<void> {
   const identity = await readIdentity();
   if (!identity) return;
   try {
-    await fetch(`${identity.apiBase}/v1/ingest`, {
+    await fetch(`${getTelemetryUrl()}/v1/ingest`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -27,7 +27,7 @@ export async function forwardEvents(events: Event | Event[]): Promise<void> {
   }
 }
 
-export const FORWARD_BATCH_SIZE = 15;
+export const FORWARD_BATCH_SIZE = 6;
 export const FORWARD_FLUSH_MS = 10_000;
 
 // Batches events in memory (per collector process) and forwards them to the workspace in
@@ -76,7 +76,7 @@ export async function forwardScan(scan: Scan): Promise<void> {
   const identity = await readIdentity();
   if (!identity) return;
   try {
-    await fetch(`${identity.apiBase}/v1/scans`, {
+    await fetch(`${getTelemetryUrl()}/v1/scans`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -95,7 +95,7 @@ export async function forwardReview(id: string, reviewed: boolean): Promise<void
   const identity = await readIdentity();
   if (!identity) return;
   try {
-    await fetch(`${identity.apiBase}/v1/ingest`, {
+    await fetch(`${getTelemetryUrl()}/v1/ingest`, {
       method: "PATCH",
       headers: {
         "Content-Type": "application/json",

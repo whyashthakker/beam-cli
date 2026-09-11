@@ -21,6 +21,11 @@ export function getApiUrl(): string {
   return (process.env.BEAM_API_URL || "https://app.agentbeam.com").replace(/\/+$/, "");
 }
 
+// Remote telemetry collector. Control-plane requests continue to use getApiUrl().
+export function getTelemetryUrl(): string {
+  return (process.env.BEAM_TELEMETRY_URL || "https://collector.agentbeam.com").replace(/\/+$/, "");
+}
+
 export function getIdentityPath(): string {
   return path.join(getDataDirectory(), "identity.json");
 }
