@@ -68,6 +68,7 @@ describe("startConnect", () => {
         if (pollCount < 3) return { ok: false, status: 202, json: async () => ({ status: "pending" }) } as Response;
         return {
           ok: true, status: 200,
+          // A server that tries to hand back a different api_base must be ignored -- see below.
           json: async () => ({ device_id: "dev_1", device_secret: "secret", org_id: "org_1", api_base: "http://127.0.0.1:3200" }),
         } as Response;
       });
@@ -78,7 +79,9 @@ describe("startConnect", () => {
 
       expect(identity.deviceId).toBe("dev_1");
       expect(identity.orgId).toBe("org_1");
-      expect(identity.apiBase).toBe("http://127.0.0.1:3200");
+      // Always the CLI's own configured base (BEAM_DASHBOARD_URL here), never the server's
+      // api_base -- a misconfigured or malicious server can't redirect future device traffic.
+      expect(identity.apiBase).toBe("http://localhost:3001");
       expect(pollCount).toBe(3);
       await expect(readIdentity()).resolves.toMatchObject({ deviceId: "dev_1" });
     });

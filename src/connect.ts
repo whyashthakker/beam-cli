@@ -78,7 +78,6 @@ export async function startConnect(): Promise<ConnectSession> {
         device_id?: string;
         device_secret?: string;
         org_id?: string;
-        api_base?: string;
       };
       if (!data.device_id || !data.device_secret || !data.org_id) {
         throw new Error("Connect response is missing device credentials.");
@@ -88,7 +87,10 @@ export async function startConnect(): Promise<ConnectSession> {
         deviceId: data.device_id,
         deviceSecret: data.device_secret,
         orgId: data.org_id,
-        apiBase: (data.api_base ?? base).replace(/\/+$/, ""),
+        // Always the CLI's own configured base (BEAM_DASHBOARD_URL or the app.agentbeam.com
+        // default) -- never whatever the server hands back, so a misconfigured deployment can't
+        // redirect a device's future traffic to the wrong host.
+        apiBase: base,
         publicKey: pub,
         privateKey: priv,
         hostname: host,
