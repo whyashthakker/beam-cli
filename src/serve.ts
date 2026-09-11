@@ -122,6 +122,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
   return {
     url: `http://${hostname}:${boundPort}`, token, directory, customRules, agentInstalls,
     policySync: Boolean(identity),
-    close: () => { if (policyTimer) clearInterval(policyTimer); osMonitor.stop(); server.close(); },
+    close: () => { if (policyTimer) clearInterval(policyTimer); osMonitor.stop(); app.forwardQueue.flush(); server.close(); },
   };
 }

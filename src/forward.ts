@@ -28,14 +28,17 @@ export async function forwardEvents(events: Event | Event[]): Promise<void> {
 }
 
 export const FORWARD_BATCH_SIZE = 15;
+export const FORWARD_FLUSH_MS = 10_000;
 
 // Batches events in memory (per collector process) and forwards them to the workspace in
 // groups of FORWARD_BATCH_SIZE, instead of one HTTP request per captured action. Lives on the
 // long-running collector (see serve.ts) since that's the only process with state that persists
-// across the many short-lived `beam hook` invocations. Leftover events below the batch size sit
-// in memory until the next one arrives and tips the count over — there is no time-based flush.
+// across the many short-lived `beam hook` invocations. A leftover partial batch (below
+// FORWARD_BATCH_SIZE) is flushed after FORWARD_FLUSH_MS of inactivity so a quiet machine still
+// reaches the dashboard instead of waiting indefinitely for a 15th event.
 export class ForwardQueue {
   private pending: Event[] = [];
+  private flushTimer: NodeJS.Timeout | undefined;
 
   push(events: Event[]): void {
     if (!events.length) return;
@@ -44,6 +47,27 @@ export class ForwardQueue {
       const batch = this.pending.splice(0, FORWARD_BATCH_SIZE);
       void forwardEvents(batch);
     }
+    this.scheduleFlush();
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    if (!this.pending.length) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = undefined;
+      if (!this.pending.length) return;
+      const batch = this.pending.splice(0, this.pending.length);
+      void forwardEvents(batch);
+    }, FORWARD_FLUSH_MS);
+    this.flushTimer.unref?.();
+  }
+
+  /** Force out whatever is pending right now (e.g. on collector shutdown). */
+  flush(): void {
+    if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = undefined; }
+    if (!this.pending.length) return;
+    const batch = this.pending.splice(0, this.pending.length);
+    void forwardEvents(batch);
   }
 }
 
