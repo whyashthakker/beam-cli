@@ -2,7 +2,7 @@ import path from "node:path";
 import os from "node:os";
 import fs from "node:fs/promises";
 import { afterEach, describe, expect, it } from "@jest/globals";
-import { installAllDetectedHooks, installHook } from "../src/install.js";
+import { installAllDetectedHooks, installHook, uninstallAllHooks, uninstallHook } from "../src/install.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -127,5 +127,101 @@ describe("installAllDetectedHooks", () => {
 
     const results = await installAllDetectedHooks(home);
     expect(results.find(r => r.agent === "copilot-cli")?.status).toBe("not-detected");
+  });
+});
+
+describe("uninstallHook", () => {
+  it("removes Claude Code's PreToolUse entry and leaves the rest of the file intact", async () => {
+    const home = await tempHome();
+    await fs.mkdir(path.join(home, ".claude"), { recursive: true });
+    await fs.writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({
+      theme: "dark",
+      hooks: {
+        PreToolUse: [
+          { matcher: "Bash", hooks: [{ type: "command", command: "echo existing" }] },
+          { matcher: "", hooks: [{ type: "command", command: "beam hook claude-code" }] },
+        ],
+      },
+    }));
+
+    const result = await uninstallHook("claude-code", home);
+    expect(result.removed).toBe(true);
+    const config = JSON.parse(await fs.readFile(path.join(home, ".claude", "settings.json"), "utf8"));
+    expect(config.theme).toBe("dark");
+    expect(config.hooks.PreToolUse).toHaveLength(1);
+    expect(config.hooks.PreToolUse[0].hooks[0].command).toBe("echo existing");
+  });
+
+  it("removes Cursor's {command, matcher} entry", async () => {
+    const home = await tempHome();
+    await installHook("cursor", home);
+    const result = await uninstallHook("cursor", home);
+    expect(result.removed).toBe(true);
+    const config = JSON.parse(await fs.readFile(result.path, "utf8"));
+    expect(config.hooks.preToolUse).toHaveLength(0);
+  });
+
+  it("removes Copilot CLI's {type, bash, timeoutSec} entry", async () => {
+    const home = await tempHome();
+    await installHook("copilot-cli", home);
+    const result = await uninstallHook("copilot-cli", home);
+    expect(result.removed).toBe(true);
+    const config = JSON.parse(await fs.readFile(result.path, "utf8"));
+    expect(config.hooks.preToolUse).toHaveLength(0);
+  });
+
+  it("is a no-op when the config file doesn't exist", async () => {
+    const home = await tempHome();
+    const result = await uninstallHook("claude-code", home);
+    expect(result.removed).toBe(false);
+  });
+
+  it("is a no-op when beam was never installed for that agent", async () => {
+    const home = await tempHome();
+    await fs.mkdir(path.join(home, ".claude"), { recursive: true });
+    await fs.writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({ theme: "dark" }));
+    const result = await uninstallHook("claude-code", home);
+    expect(result.removed).toBe(false);
+    const config = JSON.parse(await fs.readFile(path.join(home, ".claude", "settings.json"), "utf8"));
+    expect(config.theme).toBe("dark");
+  });
+
+  it("is idempotent: uninstalling twice does not error", async () => {
+    const home = await tempHome();
+    await installHook("claude-code", home);
+    await uninstallHook("claude-code", home);
+    const second = await uninstallHook("claude-code", home);
+    expect(second.removed).toBe(false);
+  });
+
+  it("rejects an unknown agent", async () => {
+    const home = await tempHome();
+    await expect(uninstallHook("not-a-real-agent", home)).rejects.toThrow("Unknown agent");
+  });
+
+  it("rejects an agent with no supported uninstall path yet", async () => {
+    const home = await tempHome();
+    await expect(uninstallHook("opencode", home)).rejects.toThrow("no supported hook install path");
+  });
+});
+
+describe("uninstallAllHooks", () => {
+  it("removes beam's hook from every agent it was installed into", async () => {
+    const home = await tempHome();
+    await installHook("claude-code", home);
+    await installHook("cursor", home);
+
+    const results = await uninstallAllHooks(home);
+    const removed = results.filter(r => r.removed).map(r => r.agent);
+    expect(removed).toEqual(expect.arrayContaining(["claude-code", "cursor"]));
+
+    const claudeConfig = JSON.parse(await fs.readFile(path.join(home, ".claude", "settings.json"), "utf8"));
+    expect(claudeConfig.hooks.PreToolUse).toHaveLength(0);
+  });
+
+  it("returns removed: false for every agent on a machine with nothing installed", async () => {
+    const home = await tempHome();
+    const results = await uninstallAllHooks(home);
+    expect(results.every(r => !r.removed)).toBe(true);
   });
 });

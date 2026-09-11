@@ -5,12 +5,12 @@ import { startServer } from "./serve.js";
 import { captureHook, extractPreview, extractSave, importEvents, readToken, reloadRemoteRules, scanFile } from "./client.js";
 import { supportsExtraction } from "./extract.js";
 import { AGENTS } from "./agents.js";
-import { installAllDetectedHooks, installHook } from "./install.js";
+import { installAllDetectedHooks, installHook, uninstallAllHooks } from "./install.js";
 import { installService, serviceLogPaths, serviceStatus, startService, stopService, uninstallService } from "./service.js";
-import { getCollectorUrl, getIdentityPath } from "./config.js";
+import { getBeamHome, getCollectorUrl, getDataDirectory, getIdentityPath } from "./config.js";
 import { clearIdentity, enrollDevice, readIdentity } from "./enroll.js";
 import { startConnect } from "./connect.js";
-import { runSetup } from "./setup.js";
+import { runSetup, promptYesNo } from "./setup.js";
 import { installEnterprisePackage } from "./enterprise-install.js";
 import { fetchAccount, revokeDevice } from "./account.js";
 import { syncPolicy } from "./forward.js";
@@ -19,6 +19,7 @@ import { ruleCatalog } from "./core.js";
 import { loadCustomRules } from "./custom-rules.js";
 import { sequenceRuleCatalog } from "./sequences.js";
 import { printBanner } from "./banner.js";
+import { runWithSudoFallback } from "./elevate.js";
 
 printBanner();
 
@@ -150,6 +151,77 @@ program.command("logout")
     }
     await clearIdentity();
     console.log(`✔ Logged out. Removed ${getIdentityPath()}.`);
+  });
+
+program.command("uninstall")
+  .description("Completely remove beam from this device: stop the service, strip its hooks from every AI agent, delete local data, revoke this device, and uninstall the beam command itself")
+  .option("--yes", "skip the confirmation prompt")
+  .option("--keep-package", "leave the globally installed beam (and beam-enterprise) npm package in place")
+  .action(async (options: { yes?: boolean; keepPackage?: boolean }) => {
+    const beamHome = getBeamHome();
+    const dataDir = getDataDirectory();
+
+    console.log(
+      "This will remove:\n" +
+      "  - the beam background service (if installed)\n" +
+      "  - beam's hooks from every AI agent config it was wired into\n" +
+      `  - ${beamHome} (identity, cached policy, event logs, custom rules)\n` +
+      "  - this device's registration with your Beam workspace" +
+      (options.keepPackage ? "" : "\n  - the globally installed beam (and beam-enterprise, if present) npm package")
+    );
+    if (!options.yes) {
+      const proceed = await promptYesNo("\nProceed?", false);
+      if (!proceed) { console.log("Cancelled."); return; }
+    }
+
+    try {
+      await uninstallService();
+      console.log("✔ Removed the background service.");
+    } catch (e) {
+      console.log(`— Skipped background service (${(e as Error).message}).`);
+    }
+
+    const hookResults = await uninstallAllHooks();
+    const removedHooks = hookResults.filter(r => r.removed);
+    if (removedHooks.length) {
+      for (const r of removedHooks) console.log(`✔ Removed beam's hook from ${r.agent}\n  → ${r.path}`);
+    } else {
+      console.log("— No installed agent hooks found.");
+    }
+
+    const identity = await readIdentity();
+    if (identity) {
+      try {
+        await revokeDevice(identity);
+        console.log("✔ Revoked this device with your Beam workspace.");
+      } catch (e) {
+        console.log(`— Could not reach ${identity.apiBase} to revoke this device: ${(e as Error).message}`);
+      }
+    }
+
+    await fs.promises.rm(dataDir, { recursive: true, force: true });
+    await fs.promises.rm(beamHome, { recursive: true, force: true });
+    console.log(`✔ Removed ${beamHome}.`);
+
+    if (!options.keepPackage) {
+      try {
+        await runWithSudoFallback("npm", ["uninstall", "-g", "beam-enterprise"]);
+        console.log("✔ Uninstalled beam-enterprise.");
+      } catch {
+        // Not installed, or already gone -- fine either way.
+      }
+      // Uninstall beam itself last -- this deletes the very script currently running. That's
+      // safe: npm just unlinks the file, and the process (already loaded into memory) keeps
+      // running to completion and prints its final message below.
+      try {
+        await runWithSudoFallback("npm", ["uninstall", "-g", "@agent-beam/beam"]);
+        console.log("✔ Uninstalled the beam npm package.");
+      } catch (e) {
+        console.log(`— Could not uninstall the beam npm package automatically: ${(e as Error).message}\n  Run manually: npm uninstall -g @agent-beam/beam`);
+      }
+    }
+
+    console.log("\n✔ Beam has been removed from this device.");
   });
 
 program.command("sync")

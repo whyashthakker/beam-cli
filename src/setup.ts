@@ -7,7 +7,7 @@ import { installService } from "./service.js";
 import { openBrowser } from "./open-browser.js";
 import { getIdentityPath } from "./config.js";
 
-async function promptYesNo(question: string, defaultYes = true): Promise<boolean> {
+export async function promptYesNo(question: string, defaultYes = true): Promise<boolean> {
   const suffix = defaultYes ? "[Y/n]" : "[y/N]";
   if (!process.stdin.isTTY) {
     console.log(`${question} ${suffix} (non-interactive shell, defaulting to ${defaultYes ? "yes" : "no"})`);
