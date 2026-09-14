@@ -28,6 +28,14 @@
       "group": "Pre-install and discovery"
     },
     {
+      "name": "training-data-security",
+      "group": "Pre-install and discovery"
+    },
+    {
+      "name": "agent-plugin-marketplace-review",
+      "group": "Pre-install and discovery"
+    },
+    {
       "name": "ai-security",
       "group": "AI trust boundaries"
     },
@@ -41,6 +49,14 @@
     },
     {
       "name": "rag-memory-security",
+      "group": "AI trust boundaries"
+    },
+    {
+      "name": "tool-schema-review",
+      "group": "AI trust boundaries"
+    },
+    {
+      "name": "multi-agent-trust-review",
       "group": "AI trust boundaries"
     },
     {
@@ -68,6 +84,18 @@
       "group": "Application and supply chain"
     },
     {
+      "name": "browser-agent-security",
+      "group": "Application and supply chain"
+    },
+    {
+      "name": "llm-output-handling",
+      "group": "Application and supply chain"
+    },
+    {
+      "name": "webhook-callback-security",
+      "group": "Application and supply chain"
+    },
+    {
       "name": "container-sandbox-security",
       "group": "Deployment and operations"
     },
@@ -81,6 +109,18 @@
     },
     {
       "name": "agent-incident-response",
+      "group": "Deployment and operations"
+    },
+    {
+      "name": "agent-cost-abuse-review",
+      "group": "Deployment and operations"
+    },
+    {
+      "name": "data-retention-privacy-review",
+      "group": "Deployment and operations"
+    },
+    {
+      "name": "agent-network-segmentation",
       "group": "Deployment and operations"
     }
   ],

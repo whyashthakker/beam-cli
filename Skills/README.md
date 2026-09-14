@@ -1,6 +1,6 @@
 # Beam security skills
 
-20 focused security workflows for AI agents and their supporting applications, dependencies, and infrastructure, plus seven specialist reviewer profiles in both Claude Code and Codex formats. Every skill is independently usable; select the ones that match the task.
+30 focused security workflows for AI agents and their supporting applications, dependencies, and infrastructure, plus seven specialist reviewer profiles in both Claude Code and Codex formats. Every skill is independently usable; select the ones that match the task.
 
 ## Choose a workflow
 
@@ -9,10 +9,10 @@ Start with `security-assessment` for an assessment spanning several surfaces. Fo
 | Area | Skills |
 | --- | --- |
 | Coordination and reporting | [security-assessment](security-assessment/SKILL.md), [security-reporting](security-reporting/SKILL.md) |
-| Pre-install and discovery | [skill-scanner](skill-scanner/SKILL.md), [mcp-scanner](mcp-scanner/SKILL.md), [ai-asset-scanner](ai-asset-scanner/SKILL.md), [model-artifact-scanner](model-artifact-scanner/SKILL.md) |
-| AI trust boundaries | [ai-security](ai-security/SKILL.md), [prompt-injection-review](prompt-injection-review/SKILL.md), [agent-permissions-review](agent-permissions-review/SKILL.md), [rag-memory-security](rag-memory-security/SKILL.md) |
-| Application and supply chain | [api-auth-security](api-auth-security/SKILL.md), [agent-web-security](agent-web-security/SKILL.md), [agent-transport-security](agent-transport-security/SKILL.md), [secrets-egress-review](secrets-egress-review/SKILL.md), [dependency-supply-chain](dependency-supply-chain/SKILL.md), [cicd-agent-security](cicd-agent-security/SKILL.md) |
-| Deployment and operations | [container-sandbox-security](container-sandbox-security/SKILL.md), [cloud-agent-security](cloud-agent-security/SKILL.md), [agent-monitoring-review](agent-monitoring-review/SKILL.md), [agent-incident-response](agent-incident-response/SKILL.md) |
+| Pre-install and discovery | [skill-scanner](skill-scanner/SKILL.md), [mcp-scanner](mcp-scanner/SKILL.md), [ai-asset-scanner](ai-asset-scanner/SKILL.md), [model-artifact-scanner](model-artifact-scanner/SKILL.md), [training-data-security](training-data-security/SKILL.md), [agent-plugin-marketplace-review](agent-plugin-marketplace-review/SKILL.md) |
+| AI trust boundaries | [ai-security](ai-security/SKILL.md), [prompt-injection-review](prompt-injection-review/SKILL.md), [agent-permissions-review](agent-permissions-review/SKILL.md), [rag-memory-security](rag-memory-security/SKILL.md), [tool-schema-review](tool-schema-review/SKILL.md), [multi-agent-trust-review](multi-agent-trust-review/SKILL.md) |
+| Application and supply chain | [api-auth-security](api-auth-security/SKILL.md), [agent-web-security](agent-web-security/SKILL.md), [agent-transport-security](agent-transport-security/SKILL.md), [secrets-egress-review](secrets-egress-review/SKILL.md), [dependency-supply-chain](dependency-supply-chain/SKILL.md), [cicd-agent-security](cicd-agent-security/SKILL.md), [browser-agent-security](browser-agent-security/SKILL.md), [llm-output-handling](llm-output-handling/SKILL.md), [webhook-callback-security](webhook-callback-security/SKILL.md) |
+| Deployment and operations | [container-sandbox-security](container-sandbox-security/SKILL.md), [cloud-agent-security](cloud-agent-security/SKILL.md), [agent-monitoring-review](agent-monitoring-review/SKILL.md), [agent-incident-response](agent-incident-response/SKILL.md), [agent-cost-abuse-review](agent-cost-abuse-review/SKILL.md), [data-retention-privacy-review](data-retention-privacy-review/SKILL.md), [agent-network-segmentation](agent-network-segmentation/SKILL.md) |
 
 These are agent workflows, not new CLI subcommands, automatic installation gates, or a generic penetration-testing catalog. They work without Beam installed. Existing `beam scan` commands add offline text heuristics; they do not provide every capability described in the review workflows.
 

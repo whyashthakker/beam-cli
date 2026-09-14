@@ -1,7 +1,34 @@
 {
   "name": "@agent-beam/beam",
   "version": "0.2.2",
-  "description": "Beam - local observation and heuristic risk scanning for AI agent activity",
+  "description": "Local-first observation and heuristic risk scanning for AI coding agents (Claude Code, Codex, Cursor, Copilot CLI, Gemini). Redacts secrets, flags risky tool calls, scans skills and MCP configs offline.",
+  "keywords": [
+    "ai agent security",
+    "agent observability",
+    "claude code",
+    "claude code hooks",
+    "codex cli",
+    "cursor",
+    "mcp security",
+    "mcp scanner",
+    "model context protocol",
+    "prompt injection",
+    "llm security",
+    "secret redaction",
+    "risk scanning",
+    "heuristic detection",
+    "ai safety",
+    "cli"
+  ],
+  "homepage": "https://agentbeam.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/whyashthakker/beam-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/whyashthakker/beam-cli/issues"
+  },
+  "author": "Yash Thakker",
   "license": "AGPL-3.0-only",
   "type": "module",
   "bin": {
