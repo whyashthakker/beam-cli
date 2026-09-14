@@ -96,6 +96,6 @@ A successful parser or a clean manifest review does not prove host isolation or 
 Use `no blocking issue found in reviewed scope` only with the exact artifacts and unresolved checks stated.
 
 Read [Beam deployment and incident-response guidance](https://agentbeam.com/blog/ai-agent-deployment-and-incident-response) for the review model.
-Use [Beam MCP security guidance](https://agentbeam.com/blog/mcp-security-practical-guide) when tool subprocesses cross this boundary.
+Use [Beam MCP security guidance](https://agentbeam.com/blog/mcp-server-security-review) when tool subprocesses cross this boundary.
 Visit [agentbeam.com](https://agentbeam.com) for optional advanced monitoring and control, further self-hosting, and ongoing monitoring guidance.
 Do not configure telemetry, enroll a workload, or claim a static review enforces restrictions.

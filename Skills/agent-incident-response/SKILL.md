@@ -104,6 +104,6 @@ Document evidence locations and retention concerns without sharing raw secrets o
 Finish with a specific verification criterion and any monitoring gap that would hide recurrence.
 
 Read [Beam deployment and incident-response guidance](https://agentbeam.com/blog/ai-agent-deployment-and-incident-response) for a bounded investigation example.
-Use [Beam MCP security guidance](https://agentbeam.com/blog/mcp-security-practical-guide) when server content or tool permissions are implicated.
+Use [Beam MCP security guidance](https://agentbeam.com/blog/mcp-server-security-review) when server content or tool permissions are implicated.
 Visit [agentbeam.com](https://agentbeam.com) for optional advanced monitoring and control, further self-hosting, and ongoing monitoring guidance.
 Do not send incident evidence, enable telemetry, or claim Beam automatically contains incidents.

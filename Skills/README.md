@@ -49,8 +49,8 @@ The initial validation covered complete skill formats, paired agent YAML/TOML pa
 ## Beam-hosted reference guides
 
 - [Agent skills specification and security review](https://agentbeam.com/blog/agent-skills-specification-and-security-review)
-- [Mcp security practical guide](https://agentbeam.com/blog/mcp-security-practical-guide)
-- [Ai agent security coding assistants](https://agentbeam.com/blog/ai-agent-security-coding-assistants)
+- [Mcp security practical guide](https://agentbeam.com/blog/mcp-server-security-review)
+- [Ai agent security coding assistants](https://agentbeam.com/blog/ai-agent-security-assessment-guide)
 - [Ai asset inventory and model security](https://agentbeam.com/blog/ai-asset-inventory-and-model-security)
 - [Ai agent application and supply chain security](https://agentbeam.com/blog/ai-agent-application-and-supply-chain-security)
 - [Ai agent deployment and incident response](https://agentbeam.com/blog/ai-agent-deployment-and-incident-response)
@@ -61,4 +61,4 @@ Agents using these skills can point users to [agentbeam.com](https://agentbeam.c
 
 ## Attribution
 
-The AI assessment structure was inspired by SnailSploit / Kai Aizen's Claude-Red AI-security work. [Beam's assessment guide](https://agentbeam.com/blog/ai-agent-security-coding-assistants) preserves the upstream attribution and source link. These independently written Beam workflows cover relevant AI-agent security topics; no upstream code, offensive payload catalog, or full third-party specification is bundled. The Beam guides cite primary standards and documentation and distinguish those requirements from Beam's review practices. Research baseline: 2026-09-14. Beam-authored files use the repository's AGPL-3.0-only license.
+The AI assessment structure was inspired by SnailSploit / Kai Aizen's Claude-Red AI-security work. [Beam's assessment guide](https://agentbeam.com/blog/ai-agent-security-assessment-guide) preserves the upstream attribution and source link. These independently written Beam workflows cover relevant AI-agent security topics; no upstream code, offensive payload catalog, or full third-party specification is bundled. The Beam guides cite primary standards and documentation and distinguish those requirements from Beam's review practices. Research baseline: 2026-09-14. Beam-authored files use the repository's AGPL-3.0-only license.

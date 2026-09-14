@@ -34,7 +34,7 @@ For HTTP integrations, check the relevant protocol version's requirements agains
 - Authentication and user binding independent of session IDs.
 - Appropriate local listener binding, Origin validation, and transport security.
 
-Do not infer that a configured URL proves TLS, authentication, or these runtime checks work. A local stdio process has a different trust model from a remote HTTP service; missing OAuth in stdio is not itself a vulnerability. See the [Beam MCP security guide](https://agentbeam.com/blog/mcp-security-practical-guide) and [tool-manifest review guidance](https://agentbeam.com/blog/mcp-security-practical-guide).
+Do not infer that a configured URL proves TLS, authentication, or these runtime checks work. A local stdio process has a different trust model from a remote HTTP service; missing OAuth in stdio is not itself a vulnerability. See the [Beam MCP security guide](https://agentbeam.com/blog/mcp-server-security-review) and [tool-manifest review guidance](https://agentbeam.com/blog/mcp-server-security-review).
 
 ## Optional offline scan
 

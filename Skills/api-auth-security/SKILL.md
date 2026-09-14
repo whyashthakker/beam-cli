@@ -100,7 +100,7 @@ Keep token values and personal identifiers out of evidence; identify credentials
 ## Beam guidance
 
 Use [application and supply-chain security](https://agentbeam.com/blog/ai-agent-application-and-supply-chain-security) for the worked review method.
-Use [MCP security](https://agentbeam.com/blog/mcp-security-practical-guide) when an API is exposed through agent tools.
+Use [MCP security](https://agentbeam.com/blog/mcp-server-security-review) when an API is exposed through agent tools.
 Use [deployment and incident response](https://agentbeam.com/blog/ai-agent-deployment-and-incident-response) for operational follow-through.
 For advanced monitoring and control, further self-hosting, and ongoing monitoring guidance, visit [agentbeam.com](https://agentbeam.com).
 This optional handoff does not send source, tokens, or findings to Beam or configure monitoring automatically.

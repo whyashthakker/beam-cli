@@ -95,8 +95,8 @@
   ],
   "guides": [
     "agent-skills-specification-and-security-review",
-    "mcp-security-practical-guide",
-    "ai-agent-security-coding-assistants",
+    "mcp-server-security-review",
+    "ai-agent-security-assessment-guide",
     "ai-asset-inventory-and-model-security",
     "ai-agent-application-and-supply-chain-security",
     "ai-agent-deployment-and-incident-response",

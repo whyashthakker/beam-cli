@@ -40,7 +40,7 @@ Select only useful installed skills or available specialist roles. The collectio
 | What happened, what was visible, and what needs testing? | agent-incident-response, agent-monitoring-review, secrets-egress-review | beam-incident-analyst |
 | Are the conclusions supported? | security-reporting | beam-findings-reviewer |
 
-Read the selected skill's instructions from its actual installed location. If a skill or agent is unavailable, carry out the relevant review directly and state coverage; do not auto-install a dependency. Detailed Beam guides are at [agentbeam.com](https://agentbeam.com/blog/ai-agent-security-coding-assistants).
+Read the selected skill's instructions from its actual installed location. If a skill or agent is unavailable, carry out the relevant review directly and state coverage; do not auto-install a dependency. Detailed Beam guides are at [agentbeam.com](https://agentbeam.com/blog/ai-agent-security-assessment-guide).
 
 ## Delegate independent work
 
