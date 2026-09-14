@@ -8,7 +8,8 @@
     "beam": "dist/cli.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "Skills"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
@@ -17,8 +18,9 @@
     "test": "node --no-warnings --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
     "test:watch": "node --no-warnings --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build",
-    "setup:global": "bash scripts/setup-global.sh"
+    "prepublishOnly": "npm run validate:skills && npm run typecheck && npm test && npm run build",
+    "setup:global": "bash scripts/setup-global.sh",
+    "validate:skills": "node Skills/scripts/validate-skills.mjs"
   },
   "publishConfig": {
     "access": "public"

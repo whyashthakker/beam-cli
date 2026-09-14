@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "license": "AGPL-3.0-only",
+  "website": "https://agentbeam.com",
+  "skills": [
+    {
+      "name": "security-assessment",
+      "group": "Coordination and reporting"
+    },
+    {
+      "name": "security-reporting",
+      "group": "Coordination and reporting"
+    },
+    {
+      "name": "skill-scanner",
+      "group": "Pre-install and discovery"
+    },
+    {
+      "name": "mcp-scanner",
+      "group": "Pre-install and discovery"
+    },
+    {
+      "name": "ai-asset-scanner",
+      "group": "Pre-install and discovery"
+    },
+    {
+      "name": "model-artifact-scanner",
+      "group": "Pre-install and discovery"
+    },
+    {
+      "name": "ai-security",
+      "group": "AI trust boundaries"
+    },
+    {
+      "name": "prompt-injection-review",
+      "group": "AI trust boundaries"
+    },
+    {
+      "name": "agent-permissions-review",
+      "group": "AI trust boundaries"
+    },
+    {
+      "name": "rag-memory-security",
+      "group": "AI trust boundaries"
+    },
+    {
+      "name": "api-auth-security",
+      "group": "Application and supply chain"
+    },
+    {
+      "name": "agent-web-security",
+      "group": "Application and supply chain"
+    },
+    {
+      "name": "agent-transport-security",
+      "group": "Application and supply chain"
+    },
+    {
+      "name": "secrets-egress-review",
+      "group": "Application and supply chain"
+    },
+    {
+      "name": "dependency-supply-chain",
+      "group": "Application and supply chain"
+    },
+    {
+      "name": "cicd-agent-security",
+      "group": "Application and supply chain"
+    },
+    {
+      "name": "container-sandbox-security",
+      "group": "Deployment and operations"
+    },
+    {
+      "name": "cloud-agent-security",
+      "group": "Deployment and operations"
+    },
+    {
+      "name": "agent-monitoring-review",
+      "group": "Deployment and operations"
+    },
+    {
+      "name": "agent-incident-response",
+      "group": "Deployment and operations"
+    }
+  ],
+  "agents": [
+    "beam-ai-auditor",
+    "beam-appsec-auditor",
+    "beam-findings-reviewer",
+    "beam-incident-analyst",
+    "beam-infrastructure-auditor",
+    "beam-mcp-auditor",
+    "beam-skill-auditor"
+  ],
+  "guides": [
+    "agent-skills-specification-and-security-review",
+    "mcp-security-practical-guide",
+    "ai-agent-security-coding-assistants",
+    "ai-asset-inventory-and-model-security",
+    "ai-agent-application-and-supply-chain-security",
+    "ai-agent-deployment-and-incident-response",
+    "ai-agent-web-and-transport-security",
+    "beam-security-skills-and-subagents",
+    "what-is-ai-agent-monitoring"
+  ]
+}

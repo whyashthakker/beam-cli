@@ -12,6 +12,12 @@ npm run setup:global
 
 This installs dependencies, builds, `npm link`s the `beam` binary globally, and starts a background watcher so the global command always reflects the current source — no manual rebuild needed after edits.
 
+## Security skills
+
+The [Skills collection](Skills/README.md) contains 20 focused security workflows for AI agents, skills, MCP servers, models, application boundaries, secrets, dependencies, deployment, monitoring, and incident response. It includes [seven specialist reviewer roles](Skills/agents/README.md) in both Claude Code and Codex formats. The collection ships in the npm package and works with or without the Beam CLI; review and install only the skills and profiles relevant to your task.
+
+[Beam's setup guide](https://agentbeam.com/blog/beam-security-skills-and-subagents) explains installation and delegation. For advanced monitoring and control, or further self-hosting and ongoing monitoring guidance, visit [agentbeam.com](https://agentbeam.com).
+
 ## Commands
 
 ```bash
