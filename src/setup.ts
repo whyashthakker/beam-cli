@@ -1,33 +1,40 @@
-import { createInterface } from "node:readline/promises";
 import { detectAgents, installHook } from "./install.js";
 import { readIdentity } from "./enroll.js";
 import { startConnect } from "./connect.js";
 import { installEnterprisePackage } from "./enterprise-install.js";
 import { installService } from "./service.js";
 import { openBrowser } from "./open-browser.js";
-import { getIdentityPath } from "./config.js";
-import { checkbox, renderTable, withSpinner } from "./prompts.js";
+import { checkbox, confirm, renderTable, withSpinner } from "./prompts.js";
 import { showFirstRunWelcome } from "./owl.js";
+import { cyan, dim, green, indigoOut, red } from "./color.js";
 
 const TOTAL_STEPS = 4;
 function step(n: number, title: string): void {
-  console.log(`\nStep ${n}/${TOTAL_STEPS}: ${title}`);
+  console.log(`\n${indigoOut(`Step ${n}/${TOTAL_STEPS}`)}  ${title}`);
 }
 
-export async function promptYesNo(question: string, defaultYes = true): Promise<boolean> {
-  const suffix = defaultYes ? "[Y/n]" : "[y/N]";
-  if (!process.stdin.isTTY) {
-    console.log(`${question} ${suffix} (non-interactive shell, defaulting to ${defaultYes ? "yes" : "no"})`);
-    return defaultYes;
-  }
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    const answer = (await rl.question(`${question} ${suffix} `)).trim().toLowerCase();
-    if (!answer) return defaultYes;
-    return answer.startsWith("y");
-  } finally {
-    rl.close();
-  }
+function ok(message: string): void {
+  console.log(`  ${green("✔")} ${message}`);
+}
+
+function skip(message: string): void {
+  console.log(`  ${dim(`— ${message}`)}`);
+}
+
+function fail(message: string): void {
+  console.log(`  ${red("✖")} ${message}`);
+}
+
+// Kept as promptYesNo (rather than renaming every call site to `confirm`) since `beam uninstall`
+// also imports it by this name for its own "Proceed?" prompt.
+export const promptYesNo = confirm;
+
+// Colors a summary-table status value by what it means, so the table communicates state at a
+// glance instead of reading as one flat block of text.
+function statusValue(value: string): string {
+  if (value.startsWith("failed")) return red(value);
+  if (value === "none" || value === "not connected" || value === "not started" || value === "skipped") return dim(value);
+  return green(value);
 }
 
 // One-shot onboarding for a machine that already has `beam` installed: wires beam's hook into
@@ -39,7 +46,7 @@ export async function promptYesNo(question: string, defaultYes = true): Promise<
 export async function runSetup(): Promise<void> {
   // Owl says hello, but only the first time this machine is ever set up.
   await showFirstRunWelcome();
-  console.log("Setting up Beam — 4 quick steps.");
+  console.log(indigoOut("Setting up Beam") + dim(" — 4 quick steps"));
 
   const agentRows: string[] = [];
   let dashboardStatus = "not connected";
@@ -52,9 +59,9 @@ export async function runSetup(): Promise<void> {
   const unsupported = detected.filter(a => !a.hookConfigPath || !a.mergeHookConfig);
 
   if (!detected.length) {
-    console.log("  No supported agents detected on this machine.");
+    skip("No supported agents detected on this machine.");
   } else {
-    for (const a of unsupported) console.log(`  — ${a.name}: hook install isn't built for it yet`);
+    for (const a of unsupported) skip(`${a.name}: hook install isn't built for it yet`);
   }
 
   if (installable.length) {
@@ -72,36 +79,37 @@ export async function runSetup(): Promise<void> {
       }
     }
     const skipped = installable.filter(a => !toInstall.includes(a));
-    for (const a of skipped) console.log(`  — Skipped ${a.name} (run 'beam agent install ${a.id}' later if you change your mind)`);
+    for (const a of skipped) skip(`Skipped ${a.name} (run 'beam agent install ${a.id}' later if you change your mind)`);
   }
 
   // --- Step 2: connect this device to the dashboard (dashboard-v1, or BEAM_DASHBOARD_URL) ---
   step(2, "Connecting to your Beam dashboard");
   let identity = await readIdentity();
+  let shouldConnect = !identity;
   if (identity) {
-    console.log(`  Already connected (device ${identity.deviceId}).`);
+    ok(`Already connected as device ${identity.deviceId}.`);
     dashboardStatus = `connected (${identity.deviceId})`;
+    shouldConnect = await promptYesNo("  Reconnect or link to a different workspace?", false);
   } else {
-    const shouldConnect = await promptYesNo("  Connect this device to your Beam dashboard now?");
-    if (shouldConnect) {
-      const session = await startConnect();
-      console.log(`  Open this to finish pairing:\n  ${session.url}`);
-      openBrowser(session.url);
-      identity = await withSpinner("Waiting for you to finish in the browser", () => session.poll());
-      console.log(
-        `    org:      ${identity.orgId}\n` +
-        `    api:      ${identity.apiBase}\n` +
-        `    identity: ${getIdentityPath()} (0600)`
-      );
-      dashboardStatus = `connected (${identity.deviceId})`;
+    shouldConnect = await promptYesNo("  Connect this device to your Beam dashboard now?");
+  }
 
-      const enterprise = await withSpinner("Checking for beam-enterprise", () => installEnterprisePackage(identity!));
-      if (enterprise.status === "installed") console.log("  beam-enterprise installed (OS-level monitoring enabled).");
-      else if (enterprise.status === "error") console.error(`  Could not install beam-enterprise: ${enterprise.message}`);
-      // "not-entitled": org isn't on the enterprise plan -- nothing to print, this is the normal case.
-    } else {
-      console.log("  Skipped. Run 'beam connect' whenever you're ready.");
-    }
+  if (shouldConnect) {
+    // Mirrors 'beam connect': always opens the browser and overwrites any existing identity,
+    // so re-running setup can also be used to re-pair or switch workspaces.
+    const session = await startConnect();
+    openBrowser(session.url);
+    console.log(`  ${dim("Didn't open? Visit:")} ${cyan(session.url)}`);
+    identity = await withSpinner("Waiting for you to finish in the browser", () => session.poll());
+    ok(`Connected device ${identity.deviceId} (org ${identity.orgId})`);
+    dashboardStatus = `connected (${identity.deviceId})`;
+
+    const enterprise = await withSpinner("Checking for beam-enterprise", () => installEnterprisePackage(identity!));
+    if (enterprise.status === "installed") ok("beam-enterprise installed (OS-level monitoring enabled).");
+    else if (enterprise.status === "error") fail(`Could not install beam-enterprise: ${enterprise.message}`);
+    // "not-entitled": org isn't on the enterprise plan -- nothing to print, this is the normal case.
+  } else if (!identity) {
+    skip("Skipped. Run 'beam connect' whenever you're ready.");
   }
 
   // --- Step 3: background collector service ---
@@ -115,20 +123,24 @@ export async function runSetup(): Promise<void> {
       serviceStatus = `failed: ${(err as Error).message}`;
     }
   } else {
-    console.log("  Skipped. Run 'beam service install' (background) or 'beam start' (foreground) whenever you want it running.");
+    skip("Skipped. Run 'beam service install' (background) or 'beam start' (foreground) whenever you want it running.");
     serviceStatus = "skipped";
   }
 
   // --- Step 4: summary ---
   step(4, "Done");
   console.log();
+  const agentSummary = agentRows.length
+    ? `${agentRows.length} installed (${agentRows.join(", ")})`
+    : "none";
+  const agentSummaryColor = agentRows.some(r => r.includes("failed")) ? red : statusValue;
   console.log(renderTable([
-    { label: "Agent hooks", value: agentRows.length ? agentRows.join(", ") : "none" },
-    { label: "Dashboard", value: dashboardStatus },
-    { label: "Service", value: serviceStatus },
+    { label: "Agent hooks", value: agentSummaryColor(agentSummary) },
+    { label: "Dashboard", value: statusValue(dashboardStatus) },
+    { label: "Service", value: statusValue(serviceStatus) },
   ]));
-  console.log("\nUseful next commands:");
-  console.log("  beam studio          open the activity dashboard");
-  console.log("  beam service status  check whether the collector is running");
-  console.log("  beam agent list      check hook status per agent");
+  console.log(`\n${dim("Useful next commands:")}`);
+  console.log(`  ${cyan("beam studio")}          open the activity dashboard`);
+  console.log(`  ${cyan("beam service status")}  check whether the collector is running`);
+  console.log(`  ${cyan("beam agent list")}      check hook status per agent`);
 }
