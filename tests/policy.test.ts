@@ -42,7 +42,63 @@ describe("evaluate", () => {
     expect(evaluate(bundle({ blockedTools: ["Bash"] }, past), ctx).action).toBe("allow");
   });
 
-  it("ignores an unparseable command pattern", () => {
-    expect(evaluate(bundle({ blockedCommandPatterns: ["("] }), ctx).action).toBe("allow");
+  it("does not let an unparseable legacy pattern disable independent risk protection", () => {
+    expect(evaluate(bundle({ blockedCommandPatterns: ["("] }), ctx).action).toBe("deny");
   });
+
+  it("lets a specific destructive command block override broad allows", () => {
+    const d = evaluate(bundle({ rules: [
+      { id: "bash-allow", tool: "Bash", action: "ALLOW" },
+      { id: "rm-allow", tool: "Bash", command: "rm", action: "ALLOW" },
+      { id: "root-delete", tool: "Bash", command: "rm", args: ["-rf", "/"], action: "BLOCK", reason: "filesystem root deletion" },
+    ] }), { ...ctx, args: ["-rf", "/"] });
+    expect(d.action).toBe("deny");
+    expect(d.rule).toBe("root-delete");
+    expect(d.reason).toContain("filesystem root");
+  });
+
+  it("matches path rules and keeps less-specific paths available", () => {
+    const policy = bundle({ rules: [
+      { id: "src-allow", path: "./src/**", action: "ALLOW" },
+      { id: "env-block", path: "**/.env*", action: "BLOCK" },
+    ] });
+    expect(evaluate(policy, { ...ctx, command: "cat", path: "./src/app.ts" }).action).toBe("allow");
+    expect(evaluate(policy, { ...ctx, command: "cat", path: "./src/.env.local" }).action).toBe("deny");
+  });
+
+  it("supports role and agent-specific rules", () => {
+    const policy = bundle({ rules: [
+      { id: "marketing-no-shell", role: "marketing", tool: "Bash", action: "BLOCK" },
+      { id: "codex-test", agent: "codex", command: "npm", args: ["test"], action: "ALLOW" },
+    ] });
+    expect(evaluate(policy, { ...ctx, role: "marketing" }).action).toBe("deny");
+    expect(evaluate(policy, { ...ctx, agent: "codex", command: "npm test", args: ["test"] }).action).toBe("allow");
+  });
+
+  it("returns all supported policy actions with explainability", () => {
+    for (const action of ["ALLOW", "ASK", "BLOCK", "REDACT", "AUDIT"] as const) {
+      const d = evaluate(bundle({ rules: [{ id: action.toLowerCase(), action }] }), ctx);
+      expect(d.rule).toBe(action.toLowerCase());
+      expect(d.riskScore).toBeGreaterThan(0);
+      expect(d.tool).toBe("Bash");
+    }
+  });
+
+  it("returns ASK for an explicit ask rule", () => {
+    const d = evaluate(bundle({ rules: [{ id: "protected-push", command: "git", args: ["push"], action: "ASK", reason: "Protected repository" }] }), { ...ctx, command: "git push", args: ["push"] });
+    expect(d.action).toBe("ask");
+    expect(d.reason).toBe("Protected repository");
+  });
+
+  it("returns REDACT for an explicit redaction rule", () => {
+    const d = evaluate(bundle({ rules: [{ id: "external-data", tool: "WebFetch", action: "REDACT" }] }), { ...ctx, tool: "WebFetch", command: "send" });
+    expect(d.action).toBe("redact");
+  });
+
+  it("carries a policy-defined single approval level", () => {
+    const d = evaluate(bundle({ rules: [{ id: "prod-change", action: "ASK", environment: "production", approval: { level: "MANAGER" } }] }), { ...ctx, environment: "production" });
+    expect(d.action).toBe("ask");
+    expect(d.approval?.level).toBe("MANAGER");
+  });
+
 });

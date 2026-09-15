@@ -4,10 +4,27 @@ import { dirname, join } from "node:path";
 import { AGENTS, findAgent, hookConfigFullPath, type AgentDefinition, type Obj } from "./agents.js";
 
 export interface InstallResult { agent: string; path: string; alreadyInstalled: boolean }
+const OPEN_CODE_PLUGIN = `import { spawnSync } from "node:child_process";
+
+export const BeamPlugin = async () => ({
+  "tool.execute.before": async (input: any, output: any) => {
+    const payload = { tool_name: input?.tool, tool_input: output?.args ?? {}, session_id: input?.sessionID, cwd: input?.directory ?? input?.worktree, source_agent: "opencode", source_type: "hook" };
+    const result = spawnSync("beam", ["hook", "opencode"], { input: JSON.stringify(payload), encoding: "utf8", timeout: 5000 });
+    let response: any = {};
+    try { response = JSON.parse(result.stdout || "{}"); } catch { /* fail closed below */ }
+    if (result.error || result.status !== 0 || response.decision === "deny") throw new Error(response.reason || "Beam denied this tool execution.");
+  },
+});
+`;
 
 export async function installHook(agentId: string, home = homedir()): Promise<InstallResult> {
   const agent = findAgent(agentId);
   if (!agent) throw new Error(`Unknown agent '${agentId}'. Run 'beam agent list' to see supported agents.`);
+  if (agent.id === "opencode" && agent.pluginPath) {
+    const path = join(home, agent.pluginPath); const existing = await readFile(path, "utf8").catch(() => "");
+    if (!existing) { await mkdir(dirname(path), { recursive: true }); await writeFile(path, OPEN_CODE_PLUGIN, { mode: 0o600 }); }
+    return { agent: agent.id, path, alreadyInstalled: Boolean(existing) };
+  }
   if (!agent.hookConfigPath || !agent.mergeHookConfig) throw new Error(`${agent.name} has no supported hook install path yet; see 'beam agent list' for its status.`);
 
   const path = hookConfigFullPath(agent, home);
@@ -43,7 +60,12 @@ export interface UninstallResult { agent: string; path: string; removed: boolean
 export async function uninstallHook(agentId: string, home = homedir()): Promise<UninstallResult> {
   const agent = findAgent(agentId);
   if (!agent) throw new Error(`Unknown agent '${agentId}'. Run 'beam agent list' to see supported agents.`);
-  if (!agent.hookConfigPath || !agent.unmergeHookConfig) throw new Error(`${agent.name} has no supported hook install path yet; see 'beam agent list' for its status.`);
+  if (agent.id === "opencode" && agent.pluginPath) {
+    const path = join(home, agent.pluginPath); const existing = await readFile(path, "utf8").catch(() => "");
+    if (existing === OPEN_CODE_PLUGIN) { const { rm } = await import("node:fs/promises"); await rm(path, { force: true }); return { agent: agent.id, path, removed: true }; }
+    return { agent: agent.id, path, removed: false };
+  }
+  if (!agent.hookConfigPath || !agent.unmergeHookConfig) throw new Error(`${agent.name} has no supported hook path yet; see 'beam agent list' for its status.`);
 
   const path = hookConfigFullPath(agent, home);
   const command = `beam hook ${agent.id}`;
@@ -71,7 +93,7 @@ export async function uninstallHook(agentId: string, home = homedir()): Promise<
 export async function uninstallAllHooks(home = homedir()): Promise<UninstallResult[]> {
   const results: UninstallResult[] = [];
   for (const agent of AGENTS) {
-    if (!agent.hookConfigPath || !agent.unmergeHookConfig) continue;
+    if (agent.id !== "opencode" && (!agent.hookConfigPath || !agent.unmergeHookConfig)) continue;
     results.push(await uninstallHook(agent.id, home));
   }
   return results;
@@ -104,7 +126,7 @@ export async function installAllDetectedHooks(home = homedir()): Promise<Install
   const results: InstallAllResult[] = [];
   for (const agent of AGENTS) {
     if (!(await isDetected(agent, home))) { results.push({ agent: agent.id, name: agent.name, status: "not-detected" }); continue; }
-    if (!agent.hookConfigPath || !agent.mergeHookConfig) { results.push({ agent: agent.id, name: agent.name, status: "not-supported" }); continue; }
+    if (agent.id !== "opencode" && (!agent.hookConfigPath || !agent.mergeHookConfig)) { results.push({ agent: agent.id, name: agent.name, status: "not-supported" }); continue; }
     try {
       const result = await installHook(agent.id, home);
       results.push({ agent: agent.id, name: agent.name, status: result.alreadyInstalled ? "already-installed" : "installed", path: result.path });

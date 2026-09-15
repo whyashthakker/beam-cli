@@ -47,6 +47,13 @@ describe("hook payload adapters", () => {
     expect(adapted.tool_name).toBe("curl");
     expect(adapted.session_id).toBe("s2");
   });
+
+  it("adapts Gemini's documented nested tool_call payload", () => {
+    const adapted = adaptHookPayload("gemini", { environment_id: "env-1", tool_call: { name: "code_execution", args: { code: "echo hi" } } });
+    expect(adapted.tool_name).toBe("code_execution");
+    expect(adapted.tool_input).toEqual({ code: "echo hi" });
+    expect(adapted.hook_event_name).toBe("pre_tool_execution");
+  });
 });
 
 describe("agent registry", () => {

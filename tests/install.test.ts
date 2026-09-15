@@ -67,9 +67,11 @@ describe("installHook", () => {
     await expect(installHook("not-a-real-agent", home)).rejects.toThrow("Unknown agent");
   });
 
-  it("rejects an agent with no supported install path yet", async () => {
+  it("installs the native OpenCode plugin", async () => {
     const home = await tempHome();
-    await expect(installHook("opencode", home)).rejects.toThrow("no supported hook install path");
+    const result = await installHook("opencode", home);
+    expect(result.path).toContain(".opencode/plugins/beam.ts");
+    expect(await fs.readFile(result.path, "utf8")).toContain("tool.execute.before");
   });
 
   it("fails clearly on invalid existing JSON instead of overwriting it", async () => {
@@ -199,9 +201,11 @@ describe("uninstallHook", () => {
     await expect(uninstallHook("not-a-real-agent", home)).rejects.toThrow("Unknown agent");
   });
 
-  it("rejects an agent with no supported uninstall path yet", async () => {
+  it("uninstalls the native OpenCode plugin", async () => {
     const home = await tempHome();
-    await expect(uninstallHook("opencode", home)).rejects.toThrow("no supported hook install path");
+    await installHook("opencode", home);
+    const result = await uninstallHook("opencode", home);
+    expect(result.removed).toBe(true);
   });
 });
 

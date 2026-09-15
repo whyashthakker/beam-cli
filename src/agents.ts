@@ -11,6 +11,7 @@ export interface AgentDefinition {
   artifacts: string[];
   /** Path (relative to home) beam writes the hook configuration into. */
   hookConfigPath: string | null;
+  pluginPath?: string | null;
   /** Event name this agent's hook contract uses for a pre-action gate (documented casing). */
   hookEventName: string | null;
   /**
@@ -25,7 +26,7 @@ export interface AgentDefinition {
    */
   unmergeHookConfig: ((existing: Obj, command: string) => Obj) | null;
   /** Payload adapter id used by src/hook-adapters.ts to normalize this agent's stdin JSON. */
-  adapter: "passthrough" | "copilot-camel" | "generic";
+  adapter: "passthrough" | "copilot-camel" | "generic" | "gemini";
   /** Whether the adapter above was verified against vendor documentation (vs. best-effort). */
   verifiedPayload: boolean;
   notes: string;
@@ -99,6 +100,17 @@ function unmergeCopilotHooks(event: string) {
   };
 }
 
+function mergeGeminiHooks(existing: Obj, command: string): Obj {
+  const hooks = obj(existing.hooks); const gate = obj(hooks["beam-security"]); const list = arr(gate.pre_tool_execution).map(obj);
+  if (!list.some(entry => arr(entry.hooks).map(obj).some(h => h.command === command))) list.push({ matcher: ".*", hooks: [{ type: "command", command, timeout: 10 }] });
+  return { ...existing, hooks: { ...hooks, "beam-security": { ...gate, pre_tool_execution: list } } };
+}
+function unmergeGeminiHooks(existing: Obj, command: string): Obj {
+  const hooks = obj(existing.hooks); const gate = obj(hooks["beam-security"]); if (!gate.pre_tool_execution) return existing;
+  const list = arr(gate.pre_tool_execution).map(obj).map(entry => ({ ...entry, hooks: arr(entry.hooks).map(obj).filter(h => h.command !== command) })).filter(entry => arr(entry.hooks).length > 0);
+  return { ...existing, hooks: { ...hooks, "beam-security": { ...gate, pre_tool_execution: list } } };
+}
+
 export const AGENTS: AgentDefinition[] = [
   {
     id: "claude-code", name: "Claude Code",
@@ -142,18 +154,18 @@ export const AGENTS: AgentDefinition[] = [
     // settings.json only exists once hooks/other settings are configured; the bare ".gemini"
     // directory (created by any use of the Gemini CLI, e.g. mcp_config.json, projects/) is the
     // reliable presence signal.
-    configs: [".gemini", ".gemini/settings.json"], artifacts: [".gemini/tmp"],
-    hookConfigPath: ".gemini/settings.json", hookEventName: "BeforeTool",
-    mergeHookConfig: mergeClaudeStyleHooks("BeforeTool"), unmergeHookConfig: unmergeClaudeStyleHooks("BeforeTool"),
-    adapter: "generic", verifiedPayload: false,
-    notes: "Config wiring only. Gemini CLI's BeforeTool stdin schema is not published; capture uses a best-effort generic field adapter and may miss fields."
+    configs: [".agents", ".agents/hooks.json", ".gemini"], artifacts: [".gemini/tmp"],
+    hookConfigPath: ".agents/hooks.json", hookEventName: "pre_tool_execution",
+    mergeHookConfig: mergeGeminiHooks, unmergeHookConfig: unmergeGeminiHooks,
+    adapter: "gemini", verifiedPayload: true,
+    notes: "Uses the documented .agents/hooks.json pre_tool_execution contract."
   },
   {
     id: "opencode", name: "OpenCode",
     configs: [".config/opencode/opencode.json", ".config/opencode/opencode.jsonc"], artifacts: [".local/share/opencode"],
-    hookConfigPath: null, hookEventName: null,
-    mergeHookConfig: null, unmergeHookConfig: null, adapter: "generic", verifiedPayload: false,
-    notes: "OpenCode uses a generated TypeScript plugin, not a JSON hook file; beam does not generate plugin code yet. Discovery only."
+    hookConfigPath: null, pluginPath: ".opencode/plugins/beam.ts", hookEventName: "tool.execute.before",
+    mergeHookConfig: null, unmergeHookConfig: null, adapter: "passthrough", verifiedPayload: true,
+    notes: "Uses OpenCode's native tool.execute.before plugin hook."
   },
 ];
 

@@ -174,6 +174,22 @@ describe("captureHook", () => {
     expect(errorSpy).toHaveBeenCalled();
     errorSpy.mockRestore();
   });
+
+  it.each([
+    ["cursor", '"permission":"deny"'],
+    ["copilot-cli", '"permissionDecision":"deny"'],
+    ["gemini", '"decision":"deny"'],
+  ])("emits a blocking decision for %s", async (agent, expected) => {
+    process.env.BEAM_TOKEN = "t";
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: ["Bash"], blockedCommandPatterns: [], disabledAgents: [] } }));
+    withStdin(JSON.stringify({ tool_name: "Bash", tool_input: { command: "echo blocked" }, session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation((chunk) => { if (typeof chunk === "string") expect(chunk).toContain(expected); return true; });
+    await captureHook(agent);
+    expect(output).toHaveBeenCalled();
+    output.mockRestore();
+  });
 });
 
 async function writeJsonl(filePath: string, rows: unknown[]): Promise<void> {

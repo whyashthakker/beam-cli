@@ -1,6 +1,7 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { getDataDirectory, getTelemetryUrl } from "./config.js";
+import { lastGoodPolicyPath } from "./policy.js";
 import { readIdentity } from "./enroll.js";
 import type { Event, Scan } from "./core.js";
 
@@ -135,6 +136,10 @@ export async function syncPolicy(): Promise<PolicySyncResult> {
   const bundle = await response.json();
   const path = policyPath();
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  await writeFile(path, `${JSON.stringify(bundle, null, 2)}\n`, { mode: 0o600 });
+  const contents = `${JSON.stringify(bundle, null, 2)}\n`;
+  const temp = `${path}.tmp`;
+  await writeFile(temp, contents, { mode: 0o600 });
+  await rename(temp, path);
+  await writeFile(lastGoodPolicyPath(), contents, { mode: 0o600 });
   return { status: "updated", version: bundle.version, path };
 }

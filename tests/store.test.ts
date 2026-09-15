@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import { afterEach, describe, expect, it } from "@jest/globals";
 import { Store } from "../src/store.js";
 import type { Event, Finding } from "../src/core.js";
+import { applyApproval, createApprovalRequest } from "../src/approvals.js";
 
 const dirs: string[] = [];
 afterEach(async () => { await Promise.all(dirs.splice(0).map(d => fs.rm(d, { recursive: true, force: true }))); });
@@ -70,5 +71,18 @@ describe("Store cross-event sequence detection", () => {
     await store.addEvents([read, send]); // pure retry, both already stored
     const afterFindings = store.events.find(e => e.id === send.id)!.findings.length;
     expect(afterFindings).toBe(beforeFindings);
+  });
+});
+
+describe("Store approval persistence", () => {
+  it("persists approval requests, lifecycle changes, and audit records", async () => {
+    const store = await tempStore();
+    const request = createApprovalRequest({ user: "Rahul", role: "Developer", approver: ["Lead"], level: "MANAGER", mode: "SINGLE", agent: "claude-code", tool: "Bash", command: "git push", policy_version: 1, risk_score: 50, risk_level: "MEDIUM", risk_factors: [] });
+    await store.addApproval(request);
+    const approved = await store.resolveApproval(request.request_id, "APPROVE_ONCE", "Lead", applyApproval);
+    expect(approved.status).toBe("APPROVED");
+    const reloaded = new Store(store.directory); await reloaded.init();
+    expect(reloaded.approvals[0].status).toBe("APPROVED");
+    expect(reloaded.approvalAudit.map(a => a.event)).toContain("approval_approved");
   });
 });
