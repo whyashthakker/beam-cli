@@ -7,6 +7,9 @@ function wrap(code: string, stream: NodeJS.WriteStream) {
 }
 
 export const indigo = wrap("38;5;99", process.stderr);
+// Same indigo, but bound to stdout's own TTY-ness -- for structured stdout output (step
+// headers, summary tables) that shouldn't inherit stderr's color decision.
+export const indigoOut = wrap("38;5;99", process.stdout);
 export const green = wrap("32", process.stdout);
 export const red = wrap("31", process.stdout);
 export const dim = wrap("2", process.stdout);

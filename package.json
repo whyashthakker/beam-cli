@@ -46,6 +46,7 @@
     "test:watch": "node --no-warnings --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prepublishOnly": "npm run validate:skills && npm run typecheck && npm test && npm run build",
+    "setup": "npm run build && node dist/cli.js setup",
     "setup:global": "bash scripts/setup-global.sh",
     "validate:skills": "node Skills/scripts/validate-skills.mjs"
   },
