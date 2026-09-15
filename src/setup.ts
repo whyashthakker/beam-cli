@@ -8,8 +8,9 @@ import { openBrowser } from "./open-browser.js";
 import { getIdentityPath } from "./config.js";
 import { checkbox, renderTable, withSpinner } from "./prompts.js";
 import { showFirstRunWelcome } from "./owl.js";
+import { syncPolicy } from "./forward.js";
 
-const TOTAL_STEPS = 4;
+const TOTAL_STEPS = 5;
 function step(n: number, title: string): void {
   console.log(`\nStep ${n}/${TOTAL_STEPS}: ${title}`);
 }
@@ -44,6 +45,7 @@ export async function runSetup(): Promise<void> {
   const agentRows: string[] = [];
   let dashboardStatus = "not connected";
   let serviceStatus = "not started";
+  let policyStatus = "not enrolled";
 
   // --- Step 1: detect agents, then let the user choose which ones get the hook ---
   step(1, "Detecting AI agents on this machine");
@@ -104,8 +106,22 @@ export async function runSetup(): Promise<void> {
     }
   }
 
-  // --- Step 3: background collector service ---
-  step(3, "Starting the background collector");
+  // --- Step 3: fetch this device's effective policy (org + any user-level override), if enrolled ---
+  // A device can be enrolled from a previous `beam setup`/`beam enroll` run without this run ever
+  // reaching Step 2's connect branch above -- so this always runs off whatever `identity` ended up
+  // being, not just the freshly-connected path.
+  step(3, "Fetching your org's policy");
+  if (identity) {
+    const result = await withSpinner("Syncing policy", () => syncPolicy());
+    if (result.status === "updated") { console.log(`  ✔ Policy v${result.version} synced (org + any user override, merged).`); policyStatus = `synced (v${result.version})`; }
+    else if (result.status === "unchanged") { console.log("  ✔ Already up to date."); policyStatus = "up to date"; }
+    else if (result.status === "unreachable") { console.error("  ✖ Could not reach the Beam workspace — will retry automatically once the service is running."); policyStatus = "unreachable (will retry)"; }
+  } else {
+    console.log("  Skipped — device isn't connected to a dashboard yet.");
+  }
+
+  // --- Step 4: background collector service ---
+  step(4, "Starting the background collector");
   const shouldStart = await promptYesNo("  Start the beam background service now (survives reboot/logout)?");
   if (shouldStart) {
     try {
@@ -119,12 +135,13 @@ export async function runSetup(): Promise<void> {
     serviceStatus = "skipped";
   }
 
-  // --- Step 4: summary ---
-  step(4, "Done");
+  // --- Step 5: summary ---
+  step(5, "Done");
   console.log();
   console.log(renderTable([
     { label: "Agent hooks", value: agentRows.length ? agentRows.join(", ") : "none" },
     { label: "Dashboard", value: dashboardStatus },
+    { label: "Policy", value: policyStatus },
     { label: "Service", value: serviceStatus },
   ]));
   console.log("\nUseful next commands:");

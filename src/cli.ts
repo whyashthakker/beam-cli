@@ -23,6 +23,7 @@ import { printBanner } from "./banner.js";
 import { runWithSudoFallback } from "./elevate.js";
 import { renderColumns, withSpinner } from "./prompts.js";
 import { cyan, green } from "./color.js";
+import { runAgent } from "./run.js";
 
 // Lets 'BEAM_API_URL=... beam connect' style overrides live in a .env file instead of the
 // shell profile. Checked in cwd first (handy when developing from the repo), then in
@@ -41,6 +42,15 @@ for (const envPath of [path.join(process.cwd(), ".env"), path.join(getBeamHome()
 const argv = process.argv.slice(2);
 const wantsBanner = argv.length === 0 || argv[0] === "help" || argv[0] === "setup" || argv.includes("--help") || argv.includes("-h");
 if (wantsBanner) printBanner();
+
+// Handled before Commander ever sees argv: the wrapped agent (claude, codex, etc.) has its own
+// flags (e.g. `--dangerously-skip-permissions`), which Commander's own option parser would try
+// to interpret as beam's own options if `run` were a normal Commander subcommand. Everything
+// after `run` is passed through untouched.
+if (process.argv[2] === "run") {
+  const [command, ...rest] = process.argv.slice(3);
+  await runAgent(command, rest);
+}
 
 const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
 
