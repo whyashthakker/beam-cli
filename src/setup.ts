@@ -9,6 +9,7 @@ import { getIdentityPath } from "./config.js";
 import { checkbox, renderTable, withSpinner } from "./prompts.js";
 import { showFirstRunWelcome } from "./owl.js";
 import { syncPolicy } from "./forward.js";
+import { AGENT_BINARIES } from "./shims.js";
 
 const TOTAL_STEPS = 5;
 function step(n: number, title: string): void {
@@ -75,6 +76,15 @@ export async function runSetup(): Promise<void> {
     }
     const skipped = installable.filter(a => !toInstall.includes(a));
     for (const a of skipped) console.log(`  — Skipped ${a.name} (run 'beam agent install ${a.id}' later if you change your mind)`);
+  }
+
+  // Shims are never installed automatically -- writing into PATH resolution is a bigger footprint
+  // than a hook install, and this session has no way to also edit the user's shell rc for them.
+  // Just point at the exact command for whichever detected agents shims actually support.
+  const shimmable = detected.filter(a => AGENT_BINARIES[a.id]);
+  if (shimmable.length) {
+    console.log(`\n  Tip: to sandbox ${shimmable.map(a => a.name).join(", ")} automatically (no need to type 'beam run'), run:`);
+    console.log(`    beam shims install ${shimmable.map(a => a.id).join(" ")}`);
   }
 
   // --- Step 2: connect this device to the dashboard (dashboard-v1, or BEAM_DASHBOARD_URL) ---
@@ -148,4 +158,5 @@ export async function runSetup(): Promise<void> {
   console.log("  beam studio          open the activity dashboard");
   console.log("  beam service status  check whether the collector is running");
   console.log("  beam agent list      check hook status per agent");
+  if (shimmable.length) console.log(`  beam shims install ${shimmable.map(a => a.id).join(" ")}   sandbox ${shimmable.map(a => a.name).join(", ")} automatically`);
 }
