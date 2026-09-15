@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import path from "node:path";
 import { Command } from "commander";
 import { startServer } from "./serve.js";
 import { captureHook, extractPreview, extractSave, importEvents, readToken, reloadRemoteRules, scanFile } from "./client.js";
@@ -20,8 +21,26 @@ import { loadCustomRules } from "./custom-rules.js";
 import { sequenceRuleCatalog } from "./sequences.js";
 import { printBanner } from "./banner.js";
 import { runWithSudoFallback } from "./elevate.js";
+import { renderColumns, withSpinner } from "./prompts.js";
+import { cyan, green } from "./color.js";
 
-printBanner();
+// Lets 'BEAM_API_URL=... beam connect' style overrides live in a .env file instead of the
+// shell profile. Checked in cwd first (handy when developing from the repo), then in
+// ~/.beam so overrides still apply when 'beam' is run globally from any directory.
+for (const envPath of [path.join(process.cwd(), ".env"), path.join(getBeamHome(), ".env")]) {
+  try {
+    process.loadEnvFile(envPath);
+  } catch {
+    // no .env file at this location -- fine, env vars set another way still apply
+  }
+}
+
+// The banner is a nice hello for a bare 'beam', 'beam --help', or 'beam setup', but printing the
+// full ASCII art before every single subcommand (agent list, service status, ...) is just noise
+// -- especially once several 'beam' calls run back-to-back from a script.
+const argv = process.argv.slice(2);
+const wantsBanner = argv.length === 0 || argv[0] === "help" || argv[0] === "setup" || argv.includes("--help") || argv.includes("-h");
+if (wantsBanner) printBanner();
 
 const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
 
@@ -105,11 +124,11 @@ program.command("enroll")
     if (existing) console.error(`Replacing the existing enrollment (device ${existing.deviceId}).`);
     const identity = await enrollDevice(options);
     console.log(
-      `✔ Enrolled device ${identity.deviceId}\n` +
+      `${green("✔")} Enrolled device ${identity.deviceId}\n` +
       `  org:      ${identity.orgId}\n` +
       `  api:      ${identity.apiBase}\n` +
       `  identity: ${getIdentityPath()} (0600)\n\n` +
-      `Next: beam agent install-all && beam start`
+      cyan(`Next: beam agent install-all && beam start`)
     );
   });
 
@@ -244,24 +263,23 @@ program.command("connect")
     if (existing) console.error(`Replacing the existing enrollment (device ${existing.deviceId}).`);
 
     const session = await startConnect();
-    console.log(`Connect Beam CLI to Agentbeam:\n${session.url}`);
+    console.log(`Connect Beam CLI to Agentbeam:\n${cyan(session.url)}\n`);
     openBrowser(session.url);
-    console.log("\nWaiting for you to finish in the browser…");
 
-    const identity = await session.poll();
+    const identity = await withSpinner("Waiting for you to finish in the browser", () => session.poll());
     console.log(
-      `✔ Connected device ${identity.deviceId}\n` +
+      `${green("✔")} Connected device ${identity.deviceId}\n` +
       `  org:      ${identity.orgId}\n` +
       `  api:      ${identity.apiBase}\n` +
       `  identity: ${getIdentityPath()} (0600)`
     );
 
-    const enterprise = await installEnterprisePackage(identity);
-    if (enterprise.status === "installed") console.log("✔ beam-enterprise installed (OS-level monitoring enabled).");
+    const enterprise = await withSpinner("Checking for beam-enterprise", () => installEnterprisePackage(identity));
+    if (enterprise.status === "installed") console.log(`${green("✔")} beam-enterprise installed (OS-level monitoring enabled).`);
     else if (enterprise.status === "error") console.error(`✖ Could not install beam-enterprise: ${enterprise.message}`);
     // "not-entitled": org isn't on the enterprise plan -- nothing to print, this is the normal case.
 
-    console.log("\nNext: beam agent install-all && beam start");
+    console.log(cyan("\nNext: beam agent install-all && beam start"));
   });
 
 program.command("import")
@@ -287,11 +305,13 @@ agent.command("list")
   .alias("ls")
   .description("List supported agents and their hook payload verification status")
   .action(() => {
-    for (const a of AGENTS) {
-      const install = a.hookConfigPath ? "installable" : "config wiring not built yet";
-      const payload = a.verifiedPayload ? "payload verified" : "payload best-effort";
-      console.log(`${a.id}\t${a.name}\t${install}\t${payload}`);
-    }
+    const rows = AGENTS.map(a => [
+      a.id,
+      a.name,
+      a.hookConfigPath ? "installable" : "config wiring not built yet",
+      a.verifiedPayload ? "payload verified" : "payload best-effort",
+    ]);
+    console.log(renderColumns(["id", "name", "status", "payload"], rows));
   });
 
 agent.command("install")
@@ -332,6 +352,7 @@ agent.command("install-all")
     }
     const acted = results.filter(r => r.status === "installed" || r.status === "already-installed");
     if (!acted.length) console.log("No supported agents detected on this machine. Run 'beam agent list' to see what's supported.");
+    if (acted.length && !(await readIdentity())) console.log(cyan("\nTip: run 'beam connect' to link this device to your dashboard and see this activity."));
   });
 
 const rule = program.command("rule").description("Inspect the active detection rule catalog");

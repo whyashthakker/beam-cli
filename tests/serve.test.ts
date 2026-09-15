@@ -1,8 +1,17 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "@jest/globals";
 import { startServer } from "../src/serve.js";
+
+// installHook embeds the absolute path to the running node binary and cli.js instead of a bare
+// "beam hook <agent>" (see src/install.ts), so it works even when the shell invoking an agent's
+// hooks doesn't have beam's global bin on PATH.
+const cliPath = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+function expectedCommand(agentId: string): string {
+  return `"${process.execPath}" "${cliPath}" hook ${agentId}`;
+}
 
 const dirs: string[] = [];
 const servers: { close: () => void }[] = [];
@@ -47,6 +56,6 @@ describe("startServer", () => {
     const codex = result.agentInstalls.find(r => r.agent === "codex");
     expect(codex?.status).toBe("installed");
     const hooks = JSON.parse(await readFile(join(agentHome, ".codex", "hooks.json"), "utf8"));
-    expect(hooks.hooks.PreToolUse[0].hooks[0].command).toBe("beam hook codex");
+    expect(hooks.hooks.PreToolUse[0].hooks[0].command).toBe(expectedCommand("codex"));
   });
 });

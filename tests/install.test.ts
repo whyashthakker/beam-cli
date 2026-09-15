@@ -1,8 +1,17 @@
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "@jest/globals";
 import { installAllDetectedHooks, installHook, uninstallAllHooks, uninstallHook } from "../src/install.js";
+
+// installHook now embeds the absolute path to the running node binary and cli.js (see
+// src/install.ts) instead of a bare "beam hook <agent>", so it works even when the shell
+// invoking an agent's hooks doesn't have beam's global bin on PATH.
+const cliPath = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+function expectedCommand(agentId: string): string {
+  return `"${process.execPath}" "${cliPath}" hook ${agentId}`;
+}
 
 const temporaryDirectories: string[] = [];
 
@@ -22,7 +31,7 @@ describe("installHook", () => {
     const result = await installHook("claude-code", home);
     expect(result.alreadyInstalled).toBe(false);
     const config = JSON.parse(await fs.readFile(path.join(home, ".claude", "settings.json"), "utf8"));
-    expect(config.hooks.PreToolUse[0].hooks[0].command).toBe("beam hook claude-code");
+    expect(config.hooks.PreToolUse[0].hooks[0].command).toBe(expectedCommand("claude-code"));
   });
 
   it("is idempotent: installing twice does not duplicate the entry", async () => {
@@ -52,14 +61,14 @@ describe("installHook", () => {
     const home = await tempHome();
     const result = await installHook("cursor", home);
     const config = JSON.parse(await fs.readFile(result.path, "utf8"));
-    expect(config.hooks.preToolUse[0]).toEqual({ command: "beam hook cursor", matcher: ".*" });
+    expect(config.hooks.preToolUse[0]).toEqual({ command: expectedCommand("cursor"), matcher: ".*" });
   });
 
   it("uses Copilot CLI's {type, bash, timeoutSec} shape", async () => {
     const home = await tempHome();
     const result = await installHook("copilot-cli", home);
     const config = JSON.parse(await fs.readFile(result.path, "utf8"));
-    expect(config.hooks.preToolUse[0]).toEqual({ type: "command", bash: "beam hook copilot-cli", timeoutSec: 30 });
+    expect(config.hooks.preToolUse[0]).toEqual({ type: "command", bash: expectedCommand("copilot-cli"), timeoutSec: 30 });
   });
 
   it("rejects an unknown agent", async () => {
@@ -72,6 +81,18 @@ describe("installHook", () => {
     const result = await installHook("opencode", home);
     expect(result.path).toContain(".opencode/plugins/beam.ts");
     expect(await fs.readFile(result.path, "utf8")).toContain("tool.execute.before");
+  });
+
+  it("migrates a pre-fix bare 'beam hook <agent>' entry to the absolute-path form instead of duplicating it", async () => {
+    const home = await tempHome();
+    await fs.mkdir(path.join(home, ".claude"), { recursive: true });
+    await fs.writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({
+      hooks: { PreToolUse: [{ matcher: "", hooks: [{ type: "command", command: "beam hook claude-code" }] }] },
+    }));
+    await installHook("claude-code", home);
+    const config = JSON.parse(await fs.readFile(path.join(home, ".claude", "settings.json"), "utf8"));
+    expect(config.hooks.PreToolUse).toHaveLength(1);
+    expect(config.hooks.PreToolUse[0].hooks[0].command).toBe(expectedCommand("claude-code"));
   });
 
   it("fails clearly on invalid existing JSON instead of overwriting it", async () => {
@@ -100,7 +121,7 @@ describe("installAllDetectedHooks", () => {
     expect(byAgent["gemini"]).toBe("not-detected");
 
     const claudeConfig = JSON.parse(await fs.readFile(path.join(home, ".claude", "settings.json"), "utf8"));
-    expect(claudeConfig.hooks.PreToolUse[0].hooks[0].command).toBe("beam hook claude-code");
+    expect(claudeConfig.hooks.PreToolUse[0].hooks[0].command).toBe(expectedCommand("claude-code"));
   });
 
   it("is idempotent across repeated runs (e.g. re-running setup)", async () => {
@@ -141,7 +162,7 @@ describe("uninstallHook", () => {
       hooks: {
         PreToolUse: [
           { matcher: "Bash", hooks: [{ type: "command", command: "echo existing" }] },
-          { matcher: "", hooks: [{ type: "command", command: "beam hook claude-code" }] },
+          { matcher: "", hooks: [{ type: "command", command: expectedCommand("claude-code") }] },
         ],
       },
     }));
@@ -152,6 +173,18 @@ describe("uninstallHook", () => {
     expect(config.theme).toBe("dark");
     expect(config.hooks.PreToolUse).toHaveLength(1);
     expect(config.hooks.PreToolUse[0].hooks[0].command).toBe("echo existing");
+  });
+
+  it("removes a pre-fix bare 'beam hook <agent>' entry too", async () => {
+    const home = await tempHome();
+    await fs.mkdir(path.join(home, ".claude"), { recursive: true });
+    await fs.writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({
+      hooks: { PreToolUse: [{ matcher: "", hooks: [{ type: "command", command: "beam hook claude-code" }] }] },
+    }));
+    const result = await uninstallHook("claude-code", home);
+    expect(result.removed).toBe(true);
+    const config = JSON.parse(await fs.readFile(path.join(home, ".claude", "settings.json"), "utf8"));
+    expect(config.hooks.PreToolUse).toHaveLength(0);
   });
 
   it("removes Cursor's {command, matcher} entry", async () => {

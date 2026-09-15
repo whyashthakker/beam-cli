@@ -1,4 +1,5 @@
 import { emitKeypressEvents } from "node:readline";
+import { cyan, green, red } from "./color.js";
 
 export interface CheckboxItem { label: string; checked?: boolean }
 
@@ -79,20 +80,20 @@ export async function withSpinner<T>(label: string, fn: () => Promise<T>): Promi
   }
 
   let frame = 0;
-  process.stdout.write(`${FRAMES[0]} ${label}`);
+  process.stdout.write(`\x1b[?25l${cyan(FRAMES[0])} ${label}`);
   const timer = setInterval(() => {
     frame = (frame + 1) % FRAMES.length;
-    process.stdout.write(`\r${FRAMES[frame]} ${label}`);
+    process.stdout.write(`\r\x1b[K${cyan(FRAMES[frame])} ${label}`);
   }, 110);
 
   try {
     const result = await fn();
     clearInterval(timer);
-    process.stdout.write(`\r✔ ${label}\n`);
+    process.stdout.write(`\r\x1b[K${green("✔")} ${label}\x1b[?25h\n`);
     return result;
   } catch (e) {
     clearInterval(timer);
-    process.stdout.write(`\r✖ ${label}\n`);
+    process.stdout.write(`\r\x1b[K${red("✖")} ${label}\x1b[?25h\n`);
     throw e;
   }
 }
@@ -108,6 +109,18 @@ export function renderTable(rows: TableRow[]): string {
   for (const row of rows) {
     out.push(`│ ${row.label.padEnd(labelWidth)} │ ${row.value.padEnd(valueWidth)} │`);
   }
+  out.push(line("└", "┴", "┘"));
+  return out.join("\n");
+}
+
+// Same box-drawing style as renderTable, but for arbitrary-width listings (e.g. 'beam agent
+// list') instead of a fixed label/value pair.
+export function renderColumns(headers: string[], rows: string[][]): string {
+  const widths = headers.map((h, i) => Math.max(h.length, ...rows.map(r => (r[i] ?? "").length)));
+  const line = (l: string, m: string, r: string) => `${l}${widths.map(w => "─".repeat(w + 2)).join(m)}${r}`;
+  const fmt = (cells: string[]) => `│ ${cells.map((c, i) => (c ?? "").padEnd(widths[i])).join(" │ ")} │`;
+  const out = [line("┌", "┬", "┐"), fmt(headers), line("├", "┼", "┤")];
+  for (const row of rows) out.push(fmt(row));
   out.push(line("└", "┴", "┘"));
   return out.join("\n");
 }

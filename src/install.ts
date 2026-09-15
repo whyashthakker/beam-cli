@@ -1,6 +1,7 @@
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { AGENTS, findAgent, hookConfigFullPath, type AgentDefinition, type Obj } from "./agents.js";
 
 export interface InstallResult { agent: string; path: string; alreadyInstalled: boolean }
@@ -17,6 +18,28 @@ export const BeamPlugin = async () => ({
 });
 `;
 
+// A bare "beam" command relies on beam's global bin symlink being resolvable on PATH -- but the
+// shell that runs an agent's hooks (e.g. Claude Code's own PreToolUse child process) doesn't
+// always source the same profile a user's interactive shell does, so "beam" can 404 silently
+// there even though it works fine when the user types it themselves. Embedding the absolute path
+// to this running install (both the node binary and dist/cli.js, resolved via import.meta.url
+// rather than argv[1] so it's correct however beam itself was invoked) sidesteps PATH entirely.
+function resolveHookCommand(agentId: string): string {
+  const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
+  return `${quoteForShell(process.execPath)} ${quoteForShell(cliPath)} hook ${agentId}`;
+}
+
+function quoteForShell(value: string): string {
+  return `"${value.replace(/(["\\$`])/g, "\\$1")}"`;
+}
+
+// Pre-fix installs wrote a bare "beam hook <agent>" command that depends on PATH; recognizing it
+// here lets installHook migrate an existing entry to the absolute-path form instead of leaving a
+// dead duplicate behind, and lets uninstallHook still find and remove it.
+function legacyHookCommand(agentId: string): string {
+  return `beam hook ${agentId}`;
+}
+
 export async function installHook(agentId: string, home = homedir()): Promise<InstallResult> {
   const agent = findAgent(agentId);
   if (!agent) throw new Error(`Unknown agent '${agentId}'. Run 'beam agent list' to see supported agents.`);
@@ -25,10 +48,10 @@ export async function installHook(agentId: string, home = homedir()): Promise<In
     if (!existing) { await mkdir(dirname(path), { recursive: true }); await writeFile(path, OPEN_CODE_PLUGIN, { mode: 0o600 }); }
     return { agent: agent.id, path, alreadyInstalled: Boolean(existing) };
   }
-  if (!agent.hookConfigPath || !agent.mergeHookConfig) throw new Error(`${agent.name} has no supported hook install path yet; see 'beam agent list' for its status.`);
+  if (!agent.hookConfigPath || !agent.mergeHookConfig || !agent.unmergeHookConfig) throw new Error(`${agent.name} has no supported hook install path yet; see 'beam agent list' for its status.`);
 
   const path = hookConfigFullPath(agent, home);
-  const command = `beam hook ${agent.id}`;
+  const command = resolveHookCommand(agent.id);
 
   let existing: Obj = {};
   let raw = "";
@@ -40,7 +63,9 @@ export async function installHook(agentId: string, home = homedir()): Promise<In
     }
   }
 
-  const merged = agent.mergeHookConfig(existing, command);
+  // Strip any pre-fix legacy entry first so re-installing migrates it rather than duplicating.
+  const base = agent.unmergeHookConfig(existing, legacyHookCommand(agent.id));
+  const merged = agent.mergeHookConfig(base, command);
   const alreadyInstalled = JSON.stringify(merged) === JSON.stringify(existing) && raw.trim() !== "";
 
   if (!alreadyInstalled) {
@@ -68,7 +93,6 @@ export async function uninstallHook(agentId: string, home = homedir()): Promise<
   if (!agent.hookConfigPath || !agent.unmergeHookConfig) throw new Error(`${agent.name} has no supported hook path yet; see 'beam agent list' for its status.`);
 
   const path = hookConfigFullPath(agent, home);
-  const command = `beam hook ${agent.id}`;
 
   let existing: Obj = {};
   let raw = "";
@@ -79,7 +103,10 @@ export async function uninstallHook(agentId: string, home = homedir()): Promise<
     throw e;
   }
 
-  const updated = agent.unmergeHookConfig(existing, command);
+  // Remove both the current absolute-path command and any pre-fix legacy "beam hook <agent>"
+  // entry, so uninstall cleans up a machine regardless of which form was installed.
+  const withoutCurrent = agent.unmergeHookConfig(existing, resolveHookCommand(agent.id));
+  const updated = agent.unmergeHookConfig(withoutCurrent, legacyHookCommand(agent.id));
   const removed = JSON.stringify(updated) !== JSON.stringify(existing);
   if (removed) await writeFile(path, `${JSON.stringify(updated, null, 2)}\n`);
 
