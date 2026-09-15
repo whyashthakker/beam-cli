@@ -23,6 +23,8 @@ import { printBanner } from "./banner.js";
 import { runWithSudoFallback } from "./elevate.js";
 import { renderColumns, withSpinner } from "./prompts.js";
 import { cyan, green } from "./color.js";
+import { runAgent } from "./run.js";
+import { AGENT_BINARIES, installShims, listShims, pathExportLine, shimDir, uninstallShims } from "./shims.js";
 
 // Lets 'BEAM_API_URL=... beam connect' style overrides live in a .env file instead of the
 // shell profile. Checked in cwd first (handy when developing from the repo), then in
@@ -41,6 +43,15 @@ for (const envPath of [path.join(process.cwd(), ".env"), path.join(getBeamHome()
 const argv = process.argv.slice(2);
 const wantsBanner = argv.length === 0 || argv[0] === "help" || argv[0] === "setup" || argv.includes("--help") || argv.includes("-h");
 if (wantsBanner) printBanner();
+
+// Handled before Commander ever sees argv: the wrapped agent (claude, codex, etc.) has its own
+// flags (e.g. `--dangerously-skip-permissions`), which Commander's own option parser would try
+// to interpret as beam's own options if `run` were a normal Commander subcommand. Everything
+// after `run` is passed through untouched.
+if (process.argv[2] === "run") {
+  const [command, ...rest] = process.argv.slice(3);
+  await runAgent(command, rest);
+}
 
 const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
 
@@ -251,6 +262,33 @@ program.command("sync")
     if (result.status === "unreachable") throw new Error("Could not reach the Beam workspace. Check the network or 'beam whoami'.");
     console.log(result.status === "updated" ? `✔ Policy v${result.version} synced → ${result.path}` : "✔ Policy already up to date.");
   });
+
+const shims = program.command("shims").description("Make agent CLIs (claude, codex, ...) sandboxed automatically, without typing 'beam run'");
+
+shims.command("install")
+  .description("Install PATH shims for the given agents (default: all known agents found on this machine)")
+  .argument("[agents...]", `Agent ids: ${Object.keys(AGENT_BINARIES).join(", ")}`)
+  .action((agents: string[]) => {
+    const results = installShims(agents.length ? agents : undefined);
+    for (const r of results) {
+      console.log(r.status === "installed" ? `✔ ${r.binary} (${r.agentId}) — shimmed` : `— ${r.binary} (${r.agentId}) — not found on PATH, skipped`);
+    }
+    if (results.some(r => r.status === "installed")) {
+      console.log(`\nAdd this to your shell rc (~/.zshrc), then restart your shell:\n  ${pathExportLine()}`);
+      console.log(`\nOnce that's in your PATH, typing e.g. 'claude' or 'codex' runs it through beam's sandbox automatically.`);
+    }
+  });
+
+shims.command("list")
+  .description("Show which shims are currently installed")
+  .action(() => {
+    const installed = listShims();
+    console.log(installed.length ? installed.join("\n") : `No shims installed. Run 'beam shims install' first.\nShim directory: ${shimDir()}`);
+  });
+
+shims.command("uninstall")
+  .description("Remove all installed shims")
+  .action(() => { uninstallShims(); console.log("✔ Removed all shims. (Remove the PATH line from your shell rc manually if you added it.)"); });
 
 program.command("token")
   .description("Print the Beam collector pairing token")

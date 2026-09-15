@@ -7,8 +7,10 @@ import { openBrowser } from "./open-browser.js";
 import { checkbox, confirm, renderTable, withSpinner } from "./prompts.js";
 import { showFirstRunWelcome } from "./owl.js";
 import { cyan, dim, green, indigoOut, red } from "./color.js";
+import { syncPolicy } from "./forward.js";
+import { AGENT_BINARIES } from "./shims.js";
 
-const TOTAL_STEPS = 4;
+const TOTAL_STEPS = 5;
 function step(n: number, title: string): void {
   console.log(`\n${indigoOut(`Step ${n}/${TOTAL_STEPS}`)}  ${title}`);
 }
@@ -51,6 +53,7 @@ export async function runSetup(): Promise<void> {
   const agentRows: string[] = [];
   let dashboardStatus = "not connected";
   let serviceStatus = "not started";
+  let policyStatus = "not enrolled";
 
   // --- Step 1: detect agents, then let the user choose which ones get the hook ---
   step(1, "Detecting AI agents on this machine");
@@ -80,6 +83,15 @@ export async function runSetup(): Promise<void> {
     }
     const skipped = installable.filter(a => !toInstall.includes(a));
     for (const a of skipped) skip(`Skipped ${a.name} (run 'beam agent install ${a.id}' later if you change your mind)`);
+  }
+
+  // Shims are never installed automatically -- writing into PATH resolution is a bigger footprint
+  // than a hook install, and this session has no way to also edit the user's shell rc for them.
+  // Just point at the exact command for whichever detected agents shims actually support.
+  const shimmable = detected.filter(a => AGENT_BINARIES[a.id]);
+  if (shimmable.length) {
+    console.log(`\n  Tip: to sandbox ${shimmable.map(a => a.name).join(", ")} automatically (no need to type 'beam run'), run:`);
+    console.log(`    beam shims install ${shimmable.map(a => a.id).join(" ")}`);
   }
 
   // --- Step 2: connect this device to the dashboard (dashboard-v1, or BEAM_DASHBOARD_URL) ---
@@ -112,8 +124,22 @@ export async function runSetup(): Promise<void> {
     skip("Skipped. Run 'beam connect' whenever you're ready.");
   }
 
-  // --- Step 3: background collector service ---
-  step(3, "Starting the background collector");
+  // --- Step 3: fetch this device's effective policy (org + any user-level override), if enrolled ---
+  // A device can be enrolled from a previous `beam setup`/`beam enroll` run without this run ever
+  // reaching Step 2's connect branch above -- so this always runs off whatever `identity` ended up
+  // being, not just the freshly-connected path.
+  step(3, "Fetching your org's policy");
+  if (identity) {
+    const result = await withSpinner("Syncing policy", () => syncPolicy());
+    if (result.status === "updated") { console.log(`  ✔ Policy v${result.version} synced (org + any user override, merged).`); policyStatus = `synced (v${result.version})`; }
+    else if (result.status === "unchanged") { console.log("  ✔ Already up to date."); policyStatus = "up to date"; }
+    else if (result.status === "unreachable") { console.error("  ✖ Could not reach the Beam workspace — will retry automatically once the service is running."); policyStatus = "unreachable (will retry)"; }
+  } else {
+    console.log("  Skipped — device isn't connected to a dashboard yet.");
+  }
+
+  // --- Step 4: background collector service ---
+  step(4, "Starting the background collector");
   const shouldStart = await promptYesNo("  Start the beam background service now (survives reboot/logout)?");
   if (shouldStart) {
     try {
@@ -127,8 +153,8 @@ export async function runSetup(): Promise<void> {
     serviceStatus = "skipped";
   }
 
-  // --- Step 4: summary ---
-  step(4, "Done");
+  // --- Step 5: summary ---
+  step(5, "Done");
   console.log();
   const agentSummary = agentRows.length
     ? `${agentRows.length} installed (${agentRows.join(", ")})`
@@ -137,10 +163,12 @@ export async function runSetup(): Promise<void> {
   console.log(renderTable([
     { label: "Agent hooks", value: agentSummaryColor(agentSummary) },
     { label: "Dashboard", value: statusValue(dashboardStatus) },
+    { label: "Policy", value: statusValue(policyStatus) },
     { label: "Service", value: statusValue(serviceStatus) },
   ]));
   console.log(`\n${dim("Useful next commands:")}`);
   console.log(`  ${cyan("beam studio")}          open the activity dashboard`);
   console.log(`  ${cyan("beam service status")}  check whether the collector is running`);
   console.log(`  ${cyan("beam agent list")}      check hook status per agent`);
+  if (shimmable.length) console.log(`  ${cyan(`beam shims install ${shimmable.map(a => a.id).join(" ")}`)}   sandbox ${shimmable.map(a => a.name).join(", ")} automatically`);
 }
