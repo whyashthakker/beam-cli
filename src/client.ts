@@ -1,4 +1,4 @@
-import { readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { getBeamHome, getCollectorUrl, getDataDirectory } from "./config.js";
@@ -89,6 +89,82 @@ export async function extractSave(agentId: string, home = homedir()): Promise<Ex
   return { found: records.length, ...totals };
 }
 
+// PreToolUse fires with no model field of its own, but Claude Code has already appended the
+// assistant turn that proposed this tool call to its own session transcript by the time the hook
+// runs. Walk back a bounded number of lines from the tail of that session's file (named
+// <session_id>.jsonl under some ~/.claude/projects/<encoded-cwd>/ subdirectory -- the encoding
+// isn't ours to reproduce, so we search rather than construct the path) to recover it.
+const MODEL_LOOKUP_TAIL_LINES = 200;
+
+async function findClaudeCodeModel(home: string, sessionId: string): Promise<string> {
+  if (!sessionId) return "";
+  const projectsDir = join(home, ".claude", "projects");
+  let dirs: string[];
+  try { dirs = await readdir(projectsDir); } catch { return ""; }
+  for (const dir of dirs) {
+    let content: string;
+    try { content = await readFile(join(projectsDir, dir, `${sessionId}.jsonl`), "utf8"); }
+    catch { continue; }
+    const lines = content.split("\n");
+    for (let i = lines.length - 1; i >= 0 && i >= lines.length - MODEL_LOOKUP_TAIL_LINES; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      try {
+        const row = JSON.parse(line) as Record<string, unknown>;
+        const message = row.message && typeof row.message === "object" ? row.message as Record<string, unknown> : {};
+        if (row.type === "assistant" && typeof message.model === "string" && message.model) return message.model;
+      } catch { /* skip a malformed line */ }
+    }
+    return "";
+  }
+  return "";
+}
+
+async function walkJsonlFiles(dir: string, out: string[]): Promise<void> {
+  let entries;
+  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) await walkJsonlFiles(full, out);
+    else if (entry.isFile() && entry.name.endsWith(".jsonl")) out.push(full);
+  }
+}
+
+// Codex's PreToolUse payload has no model field (same verified shape as Claude Code's), and
+// unlike Claude Code's session file, a rollout file isn't named after the session id -- it's
+// keyed by a "session_meta" record inside it. Best-effort only: the "turn_context" record's
+// model field isn't part of Codex's schema this codebase has verified (extract.ts only reads
+// session_meta/response_item) -- if that assumption is wrong this silently yields "" rather than
+// forwarding a bogus value.
+const CODEX_MODEL_LOOKUP_MAX_FILES = 10;
+
+async function findCodexModel(home: string, sessionId: string): Promise<string> {
+  if (!sessionId) return "";
+  const files: { path: string; mtimeMs: number }[] = [];
+  for (const root of [join(home, ".codex", "sessions"), join(home, ".codex", "archived_sessions")]) {
+    const found: string[] = [];
+    await walkJsonlFiles(root, found);
+    for (const path of found) { try { files.push({ path, mtimeMs: (await stat(path)).mtimeMs }); } catch { /* skip */ } }
+  }
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const { path } of files.slice(0, CODEX_MODEL_LOOKUP_MAX_FILES)) {
+    let content: string;
+    try { content = await readFile(path, "utf8"); } catch { continue; }
+    let matchesSession = false; let model = "";
+    for (const line of content.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let row: Record<string, unknown>;
+      try { row = JSON.parse(trimmed) as Record<string, unknown>; } catch { continue; }
+      const payload = row.payload && typeof row.payload === "object" ? row.payload as Record<string, unknown> : {};
+      if (row.type === "session_meta" && (payload.session_id === sessionId || payload.id === sessionId)) matchesSession = true;
+      if (row.type === "turn_context" && typeof payload.model === "string" && payload.model) model = payload.model;
+    }
+    if (matchesSession && model) return model;
+  }
+  return "";
+}
+
 async function readStdin(limitBytes: number): Promise<string> {
   let input = "";
   for await (const chunk of process.stdin) {
@@ -99,7 +175,7 @@ async function readStdin(limitBytes: number): Promise<string> {
 }
 
 // Never throws: a Claude Code hook must not block or fail the agent if capture fails.
-export async function captureHook(sourceAgent = "claude-code"): Promise<void> {
+export async function captureHook(sourceAgent = "claude-code", home = homedir()): Promise<void> {
   try {
     const input = await readStdin(100_000);
     const raw = JSON.parse(input) as Record<string, unknown>;
@@ -110,6 +186,13 @@ export async function captureHook(sourceAgent = "claude-code"): Promise<void> {
       data.event_type = data.event_type ?? "prompt.submit";
       data.tool_name = data.tool_name ?? "UserPromptSubmit";
       data.command = data.command ?? data.prompt;
+    }
+    if (!data.model) {
+      try {
+        const sessionId = String(data.session_id ?? "");
+        if (sourceAgent === "claude-code") data.model = await findClaudeCodeModel(home, sessionId);
+        else if (sourceAgent === "codex") data.model = await findCodexModel(home, sessionId);
+      } catch { /* best-effort enrichment only -- never block the hook on this */ }
     }
 
     // 1. Enforcement first — a local file read, so it works even if the collector is down.

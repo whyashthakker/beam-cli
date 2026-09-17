@@ -335,7 +335,7 @@ program.command("scan")
 program.command("hook")
   .description("Forward a hook payload from stdin for the given agent (observation only, never blocks the agent). Payload field names are adapted per agent; see 'beam agent list'.")
   .argument("[source-agent]", "reporting agent id, e.g. claude-code, codex, cursor, copilot-cli", "claude-code")
-  .action(captureHook);
+  .action(async (sourceAgent: string) => captureHook(sourceAgent));
 
 const agent = program.command("agent").description("Discover and configure supported AI agents");
 

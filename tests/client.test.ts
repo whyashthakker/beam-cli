@@ -167,6 +167,73 @@ describe("captureHook", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("backfills model from the session transcript for claude-code", async () => {
+    process.env.BEAM_TOKEN = "t";
+    const home = await tempDir("beam-hook-home-");
+    await writeJsonl(path.join(home, ".claude", "projects", "p", "s1.jsonl"), [
+      { type: "assistant", session_id: "s1", message: { model: "claude-sonnet-5", content: [] } },
+    ]);
+    withStdin(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, session_id: "s1" }));
+    let captured: Record<string, unknown> | undefined;
+    const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
+      captured = JSON.parse(String(init.body));
+      return new Response("{}", { status: 200 });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    await captureHook("claude-code", home);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(captured?.model).toBe("claude-sonnet-5");
+  });
+
+  it("leaves model empty when no matching session transcript is found", async () => {
+    process.env.BEAM_TOKEN = "t";
+    const home = await tempDir("beam-hook-nohome-");
+    withStdin(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, session_id: "unknown" }));
+    let captured: Record<string, unknown> | undefined;
+    const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
+      captured = JSON.parse(String(init.body));
+      return new Response("{}", { status: 200 });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    await captureHook("claude-code", home);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(captured?.model).toBe("");
+  });
+
+  it("backfills model from the rollout file for codex", async () => {
+    process.env.BEAM_TOKEN = "t";
+    const home = await tempDir("beam-hook-codex-home-");
+    await writeJsonl(path.join(home, ".codex", "sessions", "rollout-1.jsonl"), [
+      { type: "session_meta", payload: { session_id: "thr_1", cwd: "/workspace" } },
+      { type: "turn_context", payload: { model: "gpt-5-codex" } },
+    ]);
+    withStdin(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, session_id: "thr_1" }));
+    let captured: Record<string, unknown> | undefined;
+    const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
+      captured = JSON.parse(String(init.body));
+      return new Response("{}", { status: 200 });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    await captureHook("codex", home);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(captured?.model).toBe("gpt-5-codex");
+  });
+
+  it("does not overwrite a model the agent's own hook payload already provided", async () => {
+    process.env.BEAM_TOKEN = "t";
+    const home = await tempDir("beam-hook-cursor-home-");
+    withStdin(JSON.stringify({ hook_event_name: "preToolUse", tool_name: "Shell", tool_input: { command: "ls" }, model: "claude-opus" }));
+    let captured: Record<string, unknown> | undefined;
+    const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
+      captured = JSON.parse(String(init.body));
+      return new Response("{}", { status: 200 });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    await captureHook("cursor", home);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(captured?.model).toBe("claude-opus");
+  });
+
   it("logs and resolves instead of throwing when the collector is unreachable", async () => {
     withStdin(JSON.stringify({ hook_event_name: "PreToolUse" }));
     const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
