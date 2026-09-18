@@ -1,181 +1,65 @@
-# Beam
+# AgentBeam
 
-Local observation and heuristic risk scanning for AI agent activity. Beam runs entirely on your machine: a loopback-only HTTP collector stores normalized events and scan reports in NDJSON files under `~/.beam`, and the `beam` CLI talks to it (or scans files completely offline).
+AgentBeam is a local security layer for AI agents. `beam` is the AgentBeam CLI. It installs hooks for the agents detected on your machine, captures agent and MCP activity, applies your AgentBeam policy locally, and sends approved telemetry to the AgentBeam dashboard.
 
-Beam does not execute, block, or approve anything an agent does. It observes, redacts secrets before persisting, and flags risky patterns for human review.
-
-## Install
+## Install and setup
 
 ```bash
-npm run setup:global
+npm i @agent-beam/beam -g
+beam setup
 ```
 
-This installs dependencies, builds, `npm link`s the `beam` binary globally, and starts a background watcher so the global command always reflects the current source — no manual rebuild needed after edits.
+`beam setup` is the main command. It detects supported agents, installs their native AgentBeam hooks, inventories configured MCP servers, connects the device to the dashboard, downloads organization and user policy, and starts the persistent background service.
 
-## Security skills
+After setup, selected agents are protected automatically. You do not need to run `beam run` or manually start a collector.
 
-The [Skills collection](Skills/README.md) contains 30 focused security workflows for AI agents, skills, MCP servers, models, application boundaries, secrets, dependencies, deployment, monitoring, and incident response. It includes [seven specialist reviewer roles](Skills/agents/README.md) in both Claude Code and Codex formats. The collection ships in the npm package and works with or without the Beam CLI; review and install only the skills and profiles relevant to your task.
-
-[Beam's setup guide](https://agentbeam.com/blog/beam-security-skills-and-subagents) explains installation and delegation. For advanced monitoring and control, or further self-hosting and ongoing monitoring guidance, visit [agentbeam.com](https://agentbeam.com).
-
-## Commands
+## Useful commands
 
 ```bash
-beam start                          # start the local collector (binds 127.0.0.1:4319)
-beam start --port 4400              # use a different port
-
-beam studio                         # open the activity dashboard in your browser
-
-beam token                          # print the collector's pairing token
-
-beam import events.ndjson           # send normalized events to /ingest
-beam scan SKILL.md                  # scan offline for risky instructions
-beam scan mcp.json --mcp            # scan an MCP config (checks version pinning)
-beam scan SKILL.md --save           # also persist the report to the collector
-
-beam hook claude-code < payload.json # forward a hook payload for the given agent (stdin)
-
-beam agent list                     # supported agents and payload verification status
-beam agent install cursor           # wire beam's hook into that agent's own config, non-destructively
-beam agent install-all              # detect every agent actually installed on this machine and wire them all
-
-beam rule list                      # the active rule catalog (built-in + custom + sequence), grouped by category
-beam rule reload                    # apply edits to ~/.beam/rules.json into the running collector, no restart
-
-beam service install                # run the collector as a background service (starts on login)
-beam service status                 # is it installed / running
-beam service stop                   # stop it
-beam service start                  # start it again
-beam service uninstall              # remove it
-beam service logs                   # where its log files are (or the command to follow them)
+beam setup                 # install or repair AgentBeam and agent protection
+beam service status        # check the background service
+beam agent list            # see supported agents and hook status
+beam studio                # open the local activity dashboard
+beam sync                  # fetch the latest organization policy
 ```
 
-`scan` runs entirely offline unless `--save` is passed — no collector required. `hook` never throws or blocks the calling agent; capture failures are logged to stderr only. This mirrors Beam's core rule: **observation must never become enforcement.**
+Run `beam setup` again when adding an agent or repairing an installation. It preserves existing agent configuration.
 
-## Studio (activity dashboard)
+## What AgentBeam protects
 
-`beam start` or `beam service install` also serves a dashboard at `GET /` and `GET /studio` on the collector itself — no separate app, no build step, no dependency added to the package (plain HTML/CSS/JS, no fonts or CDNs). `beam studio` opens it in your default browser for you.
+Depending on organization policy, AgentBeam can ask for approval, block, redact, or log:
 
-- **Activity** — every captured event, searchable and filterable by agent/risk, with a detail drawer per action.
-- **Findings** — the subset with heuristic matches, with a per-event "mark reviewed" (a record of your assessment, never an approval or block).
-- **Skill & MCP scan** — paste or check a file's content and see findings live, same engine as `beam scan`.
+- Environment variables and `.env` files
+- API keys, tokens, passwords, private keys, and cloud credentials
+- Files outside the current workspace
+- Destructive commands and production changes
+- MCP write or side-effect tools
+- Attempts to modify AgentBeam policy/data, stop the AgentBeam service, or uninstall AgentBeam
 
-The page itself carries no secret and needs no auth to load — only the API calls it makes do. `beam studio` reads the pairing token from disk and passes it once via a URL that's immediately scrubbed from the address bar (`history.replaceState`) after the page reads it. From there it's saved in that browser's `localStorage` (scoped to the collector's own origin, `127.0.0.1:4319` — no other site or app can read it), so reloading the tab or closing and reopening the browser stays connected without re-pairing. If the collector ever rejects the stored token (e.g. `beam service uninstall && beam service install` generates a new one), the page detects that and clears it automatically rather than looping silently. Use the **Disconnect** button to clear it yourself.
+MCP responses can be filtered locally before sensitive content reaches an agent. MCP inventory and activity are reported to the dashboard so administrators can review or block a server for one user or the entire organization.
 
-Sessions and Usage views from the original Sentinel console aren't ported yet — Activity/Findings/Scan cover the core loop first.
+## Multi-agent support
 
-## Multi-agent coverage
+AgentBeam is not Claude-specific. Setup discovers the agents actually installed on the machine and installs the appropriate native hook for each selected agent.
 
-Different agents send different JSON shapes to their hooks. `beam hook <agent>` picks the right adapter for the agent id you pass, and `beam agent install <agent>` writes beam's hook into that agent's real config file in its own native format, merging with (never overwriting) whatever hooks are already there.
+| Agent | Hook support |
+|---|---|
+| Claude Code | Pre-tool protection and activity capture |
+| Codex | Pre-tool protection and activity capture |
+| Gemini CLI | Before-tool protection and activity capture |
+| GitHub Copilot CLI | Pre-tool protection and activity capture |
+| Cursor | Pre-tool protection and activity capture |
+| OpenCode | Shim-based protection where supported |
 
-`npm run setup:global` runs `beam agent install-all` automatically at the end, so every agent it can detect on your machine gets wired without you having to know which ones you have installed. Detection uses each agent's own real, pre-existing files (e.g. `~/.codex/config.toml`, `~/.copilot/config.json`) — never a file beam itself writes — so an agent that was never actually installed won't get a hook, and one that's already wired won't get a duplicate entry on a second run.
+Agent configuration is updated non-destructively, without replacing existing hooks.
 
-| Agent id | Config file `agent install` writes | Payload |
-|---|---|---|
-| `claude-code` | `~/.claude/settings.json` (`hooks.PreToolUse`) | Verified against Claude Code's docs |
-| `codex` | `~/.codex/hooks.json` (`hooks.PreToolUse`) | Same shape as Claude Code; verified |
-| `cursor` | `~/.cursor/hooks.json` (`hooks.preToolUse`) | Verified against Cursor's docs |
-| `copilot-cli` | `~/.copilot/hooks/beam.json` (`hooks.preToolUse`) | Verified (camelCase — translated internally) |
-| `gemini` | `~/.gemini/settings.json` (`hooks.BeforeTool`) | **Not verified** — Gemini CLI's stdin schema isn't published; capture uses a generic best-effort field adapter |
-| `opencode` | not built yet | discovery (config/artifact presence) only — OpenCode uses a generated TS plugin, not a JSON hook file |
+## Dashboard
 
-Run `beam agent list` for the current status of each. Adding a new agent means one entry in `src/agents.ts` (config path + how to merge the hook block) and, if its stdin payload uses different field names than `tool_name`/`tool_input`/`session_id`/`cwd`/`hook_event_name`, one adapter function in `src/hook-adapters.ts`.
+After enrollment, the AgentBeam dashboard shows agent activity, policy decisions, MCP inventory, users, installations, model usage, token counts, violations, blocked actions, and sensitive-data findings. Administrators can block MCP usage for an entire organization or an individual user.
 
-This is an intentionally small first slice of what a full multi-agent observer could cover. Wider agent coverage, enforcement/blocking, and portable case bundles aren't built yet — tracked as future slices, not silently unsupported.
+## Privacy and local operation
 
-## Forensic extraction (no hook required)
-
-`beam agent extract <agent>` reads an agent's own existing session/transcript files directly — no hook needed, and it works for history from *before* Beam was ever installed:
-
-```bash
-beam agent extract claude-code              # preview: normalizes locally, prints JSON, nothing sent anywhere
-beam agent extract claude-code --limit 20   # cap how many events the preview prints (default 200)
-beam agent extract claude-code --save       # import into the running collector (dedupes by event_id)
-beam agent extract codex --save
-```
-
-Supported today: **`claude-code`** (`~/.claude/projects/**/*.jsonl` — reads `tool_use` blocks out of assistant turns) and **`codex`** (`~/.codex/{sessions,archived_sessions}/**/*.jsonl` — reads `function_call` and `custom_tool_call` response items). Every extracted event gets `source: "extract"` and `phase: "observed"` so it's visibly distinct from a live hook capture (which is `"proposed"`/`"completed hook"`). Preview mode normalizes (and therefore redacts) locally without ever contacting the collector; `--save` sends the raw records through the same `/ingest` pipeline a live hook uses, batched under the collector's 2,000-record-per-request cap. Bounded like everything else in Beam: 50 MB max per transcript file, 20,000 parsed lines per file, 2,000 files walked per run.
-
-Other agents aren't wired yet — `beam agent extract <agent>` fails clearly rather than silently returning nothing for one that isn't supported.
-
-## Rule engine
-
-Detection has three layers now, all active in both `beam scan` (offline) and the running collector:
-
-- **Categorized built-in rules** — every rule has a `category` (`exec`, `exfil`, `impact`, `integrity`, `persistence`, `privilege`, `recon`, `secrets`, `source_control`), not just a flat id. `beam rule list` shows the full catalog grouped by category.
-- **Custom rules from `~/.beam/rules.json`** — extend detection without touching Beam's source. A JSON array of `{ id, pattern, severity, title?, explanation?, category? }`; `pattern` is a regex (case-insensitive). Loaded once at collector startup; a malformed entry is skipped and reported (`beam rule list` / `beam start`'s output shows why), never crashes the rest of detection.
-
-  ```json
-  [
-    { "id": "internal_host", "pattern": "wiki\\.internal\\.corp", "severity": "high", "category": "exfil", "title": "Internal wiki referenced" }
-  ]
-  ```
-
-  `beam rule reload` applies edits to the running collector immediately, no restart needed.
-- **Cross-event sequence rules** — some risk only shows up as a *pattern of actions*, not one action in isolation: a credential read followed by network activity later in the same session, or a network scan followed by remote code execution, even across separate, unrelated-looking tool calls that a single-event regex could never connect. Beam re-evaluates a session's recent events (last 50) whenever new events land, and attaches one composite finding to the event that completes the pattern — idempotently, so re-ingesting the same history never duplicates it.
-
-All three feed the same `Finding[]` shape everywhere — Studio, `/export`, `/state` — so there's nothing separate to look at.
-
-## Running as a background service
-
-`beam start` in a terminal works, but closing that terminal stops the collector. `beam service install` instead registers it as a real background service:
-
-- **macOS**: a `launchd` user agent at `~/Library/LaunchAgents/ai.beam.collector.plist` (`RunAtLoad` + `KeepAlive`, so it starts on login and restarts if it crashes).
-- **Linux**: a `systemd --user` unit at `~/.config/systemd/user/beam.service` (`enable --now`, `Restart=always`).
-
-Both embed the resolved `BEAM_DATA_DIR` directly into the service definition (launchd/systemd don't inherit your shell's environment), so `BEAM_DATA_DIR=/custom/path beam service install` keeps using that path even after a reboot. Logs go to `$BEAM_DATA_DIR/logs/`.
-
-This is a userspace HTTP server, same as running `beam start` yourself — not kernel-level capture. Beam has nothing to observe at the kernel level: the actual signal comes from agents calling `beam hook <agent>` at the moment they're about to act, the same way whether run in a terminal or as a background service.
-
-Windows isn't supported yet (`beam service *` will say so and tell you to run `beam start` directly).
-
-## Configuration
-
-- `BEAM_HOME` — root config directory (default `~/.beam`).
-- `BEAM_DATA_DIR` — where events/scans/token are stored (default `$BEAM_HOME/data`).
-- `BEAM_TOKEN` — pairing token (skips reading the token file).
-- `BEAM_COLLECTOR_URL` — collector origin the CLI talks to (default `http://127.0.0.1:4319`); must stay on HTTP loopback.
-- `BEAM_PORT` — port `beam start` binds to (default `4319`).
-- `BEAM_ALLOWED_ORIGINS` — comma-separated browser origins allowed to call the collector (for a future local UI).
-
-## Connect a Claude Code hook
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [{
-      "matcher": "",
-      "hooks": [{
-        "type": "command",
-        "command": "beam hook claude-code"
-      }]
-    }]
-  }
-}
-```
-
-Choose `PreToolUse` to observe proposed actions before they run. `beam` must be on the agent's PATH (or use its absolute path).
-
-## API
-
-All routes require `Authorization: Bearer <token>` and are bound to loopback only.
-
-- `GET /health` — collector version and retention.
-- `GET /state` — retained events, scans, reviews, rule catalog.
-- `GET /agents` — existence checks on common agent config/artifact locations, hook-install/payload-verification status; no contents are read.
-- `POST /ingest` — one normalized JSON object, JSON array, or NDJSON (up to 2 MB / 2,000 records; 100 KB per record).
-- `POST /v1/logs` — OTLP/HTTP **JSON** (not protobuf).
-- `POST /scan` — `{ "name": "SKILL.md", "kind": "skill", "content": "..." }` (or `kind: "mcp"`; max 500 KB).
-- `POST /review` — `{ "id": "...", "reviewed": true }`.
-- `POST /rules/reload` — reload `~/.beam/rules.json` into this running process; returns `{ path, loaded, errors }`.
-- `GET /export` — redacted event NDJSON.
-
-## Limits and guarantees
-
-- Retention: latest 10,000 events and 500 scan reports. Each accepted batch atomically replaces the bounded event file.
-- Known credential formats, assignments, auth headers, URL query strings, and private keys are redacted before persistence. Other sensitive text may remain; inspect exports before sharing.
-- Data directory mode `0700`, files `0600`. Token is generated once per data directory and reused across restarts.
-- The heuristic scanner is pattern matching, not semantic malware analysis or a safety guarantee. Findings require human review.
+AgentBeam's hook and policy decision run locally, so actions can be blocked even when the collector or dashboard is unavailable. Telemetry is redacted before storage or forwarding. The local service binds to loopback, and AgentBeam files are protected from modification or removal by agent hooks.
 
 ## Development
 
@@ -184,10 +68,6 @@ npm test
 npm run typecheck
 npm run build
 ```
-
-## Related
-
-- [beam-mcp](https://github.com/whyashthakker/beam-mcp) — an MCP server exposing this CLI's scanning to MCP-compatible hosts. Open source.
 
 ## License
 
