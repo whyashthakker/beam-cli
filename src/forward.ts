@@ -29,16 +29,18 @@ export async function forwardEvents(events: Event | Event[]): Promise<void> {
   }
 }
 
-export async function forwardMcpInventory(servers: McpInventory[]): Promise<void> {
-  if (!servers.length) return;
+export async function forwardMcpInventory(servers: McpInventory[]): Promise<boolean> {
+  if (!servers.length) return true;
   const identity = await readIdentity();
-  if (!identity) return;
+  if (!identity) return false;
   try {
     await fetch(`${getTelemetryUrl()}/v1/mcp/inventory`, {
       method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${identity.deviceSecret}` },
       body: JSON.stringify({ servers }), signal: AbortSignal.timeout(5000),
     });
+    return true;
   } catch { /* offline / older workspace API — local protection remains active */ }
+  return false;
 }
 
 export const FORWARD_BATCH_SIZE = 6;

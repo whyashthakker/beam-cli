@@ -97,7 +97,7 @@ export async function runSetup(): Promise<void> {
   }
 
   const mcpResults = await installMcpProxies();
-  void forwardMcpInventory(mcpResults.flatMap(result => result.servers));
+  const mcpInventory = mcpResults.flatMap(result => result.servers);
   const mcpWrapped = mcpResults.reduce((total, result) => total + result.wrapped, 0);
   const mcpErrors = mcpResults.filter(result => result.error);
   if (mcpWrapped) ok(`Protected ${mcpWrapped} MCP server${mcpWrapped === 1 ? "" : "s"} with the local response proxy.`);
@@ -132,7 +132,6 @@ export async function runSetup(): Promise<void> {
   } else if (!identity) {
     skip("Skipped. Run 'beam connect' whenever you're ready.");
   }
-
   // --- Step 3: fetch this device's effective policy (org + any user-level override), if enrolled ---
   // A device can be enrolled from a previous `beam setup`/`beam enroll` run without this run ever
   // reaching Step 2's connect branch above -- so this always runs off whatever `identity` ended up
@@ -145,6 +144,11 @@ export async function runSetup(): Promise<void> {
     else if (result.status === "unreachable") { console.error("  ✖ Could not reach the Beam workspace — will retry automatically once the service is running."); policyStatus = "unreachable (will retry)"; }
   } else {
     console.log("  Skipped — device isn't connected to a dashboard yet.");
+  }
+  if (identity && mcpInventory.length) {
+    const sent = await withSpinner("Sending MCP inventory", () => forwardMcpInventory(mcpInventory));
+    if (sent) ok(`Sent ${mcpInventory.length} MCP server${mcpInventory.length === 1 ? "" : "s"} to the dashboard.`);
+    else fail("Could not send MCP inventory; local MCP protection remains active and it will be retried on the next setup.");
   }
 
   // --- Step 4: background collector service ---
