@@ -305,7 +305,8 @@ function isEnvironmentAccess(tool: string, command: string, path: string, input:
   if (/(^|[\\/\s"'])\.aws[\\/]credentials(?:$|[\\/\s"'])|(^|[\\/\s"'])\.config[\\/]gcloud(?:$|[\\/\s"'])/i.test(text)) return true;
   // Shell/process environment reads: env, printenv, set, export -p, $FOO,
   // process.env, os.environ and equivalent tool arguments.
-  return /\b(?:printenv|env|export\s+-p|process\.env|os\.environ|System\.getenv)\b|\$\{?[A-Z][A-Z0-9_]*\}?/i.test(text);
+  return /\b(?:printenv|env|export\s+-p|process\.env|os\.environ|System\.getenv)\b/i.test(text)
+    || /\$\{?(?:[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH|PRIVATE|API)[A-Z0-9_]*)\}?/.test(text);
 }
 
 function isOutsideWorkspace(cwd: string, target: string, command: string): boolean {
