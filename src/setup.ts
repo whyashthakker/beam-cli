@@ -101,6 +101,7 @@ export async function runSetup(): Promise<void> {
   const mcpWrapped = mcpResults.reduce((total, result) => total + result.wrapped, 0);
   const mcpErrors = mcpResults.filter(result => result.error);
   if (mcpWrapped) ok(`Protected ${mcpWrapped} MCP server${mcpWrapped === 1 ? "" : "s"} with the local response proxy.`);
+  if (mcpInventory.length) ok(`Detected MCP servers: ${mcpInventory.map(server => server.name).join(", ")}`);
   for (const result of mcpErrors) fail(`Could not update MCP config ${result.path}: ${result.error}`);
 
   // --- Step 2: connect this device to the dashboard (dashboard-v1, or BEAM_DASHBOARD_URL) ---

@@ -142,6 +142,10 @@ export function normalize(raw: Obj): Event {
   if (!Number.isFinite(Date.parse(timestamp))) throw new Error("Invalid event timestamp.");
   const clean = (s: string) => redact(s).slice(0, 500);
   const stableId = str(raw.event_id ?? raw.finding_id ?? raw.id);
+  const usage = obj(raw.usage ?? raw.token_usage ?? raw.tokenUsage);
+  const inputTokens = number(raw.input_tokens ?? raw.inputTokens ?? usage.input_tokens ?? usage.inputTokens ?? usage.prompt_tokens ?? usage.promptTokens);
+  const outputTokens = number(raw.output_tokens ?? raw.outputTokens ?? usage.output_tokens ?? usage.outputTokens ?? usage.completion_tokens ?? usage.completionTokens);
+  const costUsd = number(raw.cost_usd ?? raw.costUsd ?? usage.cost_usd ?? usage.costUsd);
   const mcpRaw = obj(raw.mcp ?? raw.mcp_request ?? raw.mcpRequest);
   const explicitMcpServer = str(raw.mcp_server ?? raw.mcpServer ?? mcpRaw.server ?? mcpRaw.server_name ?? mcpRaw.serverName);
   const explicitMcpTool = str(raw.mcp_tool ?? raw.mcpTool ?? mcpRaw.tool ?? mcpRaw.tool_name ?? mcpRaw.toolName);
@@ -162,6 +166,6 @@ export function normalize(raw: Obj): Event {
       tags: Array.isArray(raw.tags) ? raw.tags.filter((v): v is string => typeof v === "string").slice(0, 100).map(clean) : [],
       evidence: redact(JSON.stringify(raw.evidence_refs ?? raw.evidence ?? {})).slice(0, 8000) },
     ...(mcpServer || explicitMcpTool || explicitMcpResource ? { mcp: { server: clean(mcpServer || "unknown"), ...(mcpTool ? { tool: clean(mcpTool) } : {}), ...(explicitMcpResource ? { resource: clean(explicitMcpResource) } : {}), requestType: mcpRequestType } } : {}),
-    findings, inputTokens: number(raw.input_tokens), outputTokens: number(raw.output_tokens), costUsd: number(raw.cost_usd),
+    findings, inputTokens, outputTokens, costUsd,
   };
 }

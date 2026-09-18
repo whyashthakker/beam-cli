@@ -34,11 +34,11 @@ export async function forwardMcpInventory(servers: McpInventory[]): Promise<bool
   const identity = await readIdentity();
   if (!identity) return false;
   try {
-    await fetch(`${getTelemetryUrl()}/v1/mcp/inventory`, {
+    const response = await fetch(`${getTelemetryUrl()}/v1/mcp/inventory`, {
       method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${identity.deviceSecret}` },
       body: JSON.stringify({ servers }), signal: AbortSignal.timeout(5000),
     });
-    return true;
+    return response.ok;
   } catch { /* offline / older workspace API — local protection remains active */ }
   return false;
 }
@@ -92,7 +92,7 @@ export async function forwardScan(scan: Scan): Promise<void> {
   const identity = await readIdentity();
   if (!identity) return;
   try {
-    await fetch(`${getTelemetryUrl()}/v1/scans`, {
+    await fetch(`${identity.apiBase}/v1/scans`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -111,7 +111,7 @@ export async function forwardReview(id: string, reviewed: boolean): Promise<void
   const identity = await readIdentity();
   if (!identity) return;
   try {
-    await fetch(`${getTelemetryUrl()}/v1/ingest`, {
+    await fetch(`${identity.apiBase}/v1/ingest`, {
       method: "PATCH",
       headers: {
         "Content-Type": "application/json",

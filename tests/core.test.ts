@@ -67,6 +67,18 @@ describe("normalization", () => {
     const records = parseInput(JSON.stringify({ resourceLogs: [{ resource: { attributes: [{ key: "service.name", value: { stringValue: "custom-agent" } }] }, scopeLogs: [{ logRecords: [{ timeUnixNano: "1788840000000000000", attributes: [{ key: "gen_ai.usage.input_tokens", value: { intValue: "123" } }, { key: "gen_ai.conversation.id", value: { stringValue: "s1" } }], body: { stringValue: "unstructured prose" } }] }] }] }), true);
     const e = normalize(records[0]); expect(e.agent).toBe("custom-agent"); expect(e.inputTokens).toBe(123); expect(e.session).toBe("s1"); expect(e.type).toBe("telemetry.log");
   });
+  it("normalizes nested and camelCase token usage per model event", () => {
+    const event = normalize({
+      source_agent: "codex",
+      model: "gpt-5-codex",
+      tool_name: "mcp:github:search",
+      usage: { inputTokens: 1200, output_tokens: 340, costUsd: 0.012 },
+    });
+    expect(event.model).toBe("gpt-5-codex");
+    expect(event.inputTokens).toBe(1200);
+    expect(event.outputTokens).toBe(340);
+    expect(event.costUsd).toBe(0.012);
+  });
 });
 
 describe("rule categories and custom rules", () => {
