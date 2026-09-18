@@ -167,6 +167,10 @@ async function findCodexModel(home: string, sessionId: string): Promise<string> 
 
 async function readStdin(limitBytes: number): Promise<string> {
   let input = "";
+  // A hook is launched with piped stdin. Explicitly resume the stream so the
+  // async iterator keeps the short-lived CLI process alive until the payload
+  // has been consumed and a policy decision is emitted.
+  process.stdin.resume();
   for await (const chunk of process.stdin) {
     input += typeof chunk === "string" ? chunk : chunk.toString("utf8");
     if (input.length > limitBytes) throw new Error(`Hook exceeds ${Math.floor(limitBytes / 1000)} KB.`);

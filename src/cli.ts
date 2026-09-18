@@ -433,7 +433,9 @@ rule.command("reload")
     for (const e of result.errors) console.log(`✖ ${e}`);
   });
 
-program.parseAsync().catch((error: unknown) => {
+try {
+  await program.parseAsync();
+} catch (error: unknown) {
   console.error(`\n✖ ${error instanceof Error ? error.message : String(error)}`);
   process.exitCode = 1;
-});
+}

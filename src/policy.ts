@@ -53,7 +53,10 @@ function glob(pattern: string, value: string): boolean { const e = pattern.repla
 function same(a: string | undefined, b: string | undefined): boolean { return !a || (b ?? "").toLowerCase() === a.toLowerCase(); }
 function riskInfo(c: ActionContext): { score: number; level: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"; factors: string[] } { const s = `${c.command} ${c.path ?? ""} ${c.url ?? ""}`; const factors: string[] = []; let n = 0; if (/\brm\s+.*-rf\s+\//i.test(s)) { n += 98; factors.push("destructive operation"); } else if (/\brm\b/i.test(s)) { n += 45; factors.push("filesystem operation"); } if (/\bsudo\b/i.test(s)) { n += 35; factors.push("privileged operation"); } if (/\b(curl|wget)\b|https?:\/\//i.test(s)) { n += 25; factors.push("external destination"); } if (/\.env|\.ssh|\.aws|private.?key|api.?key|token|secret/i.test(s)) { n += 35; factors.push("sensitive data or file"); } const score = Math.min(100, n); return { score, level: score >= 90 ? "CRITICAL" : score >= 70 ? "HIGH" : score >= 30 ? "MEDIUM" : "LOW", factors }; }
 function matches(r: PolicyRule, c: ActionContext & { riskScore: number }): boolean {
-  if (!same(r.tool, c.tool) || !same(r.role, c.role) || !same(r.user, c.user) || !same(r.agent, c.agent) || !same(r.repository, c.repository) || !same(r.branch, c.branch) || !same(r.environment, c.environment)) return false;
+  // r.tool supports glob wildcards (e.g. "mcp__posthog__*") so a dashboard rule can target one
+  // MCP server's tools without matching every MCP call; other identity fields stay exact-match.
+  if (r.tool && !glob(r.tool, c.tool)) return false;
+  if (!same(r.role, c.role) || !same(r.user, c.user) || !same(r.agent, c.agent) || !same(r.repository, c.repository) || !same(r.branch, c.branch) || !same(r.environment, c.environment)) return false;
   if (r.cwd && !glob(r.cwd, c.cwd ?? "")) return false;
   if (r.command && !glob(r.command, c.command.split(/\s+/)[0] ?? "")) return false;
   if (r.path && !glob(r.path, c.path ?? "")) return false;

@@ -28,6 +28,39 @@ describe("evaluate", () => {
     expect(evaluate(bundle({ mode: "advisory", blockedTools: ["Bash"] }), ctx).action).toBe("ask");
   });
 
+  it("denies an MCP tool matched by a wildcard rule (Claude-style tool name)", () => {
+    const d = evaluate(
+      bundle({ rules: [{ id: "mcp.block.posthog.claude", tool: "mcp__posthog__*", action: "BLOCK", reason: "posthog MCP is blocked" }] }),
+      { ...ctx, tool: "mcp__posthog__exec", command: "" },
+    );
+    expect(d.action).toBe("deny");
+    expect(d.reason).toMatch(/posthog/);
+  });
+
+  it("denies an MCP tool matched by a wildcard rule (colon-style tool name)", () => {
+    const d = evaluate(
+      bundle({ rules: [{ id: "mcp.block.posthog", tool: "mcp:posthog:*", action: "BLOCK", reason: "posthog MCP is blocked" }] }),
+      { ...ctx, tool: "mcp:posthog:exec", command: "" },
+    );
+    expect(d.action).toBe("deny");
+  });
+
+  it("does not block an unrelated MCP server's tools", () => {
+    const d = evaluate(
+      bundle({ rules: [{ id: "mcp.block.posthog.claude", tool: "mcp__posthog__*", action: "BLOCK", reason: "posthog MCP is blocked" }] }),
+      { ...ctx, tool: "mcp__sanity__query_documents", command: "" },
+    );
+    expect(d.action).toBe("allow");
+  });
+
+  it("does not block plain agent tool-calling when only an MCP rule is set", () => {
+    const d = evaluate(
+      bundle({ rules: [{ id: "mcp.block.posthog.claude", tool: "mcp__posthog__*", action: "BLOCK", reason: "posthog MCP is blocked" }] }),
+      { ...ctx, command: "ls" },
+    );
+    expect(d.action).toBe("allow");
+  });
+
   it("denies a blocked command pattern", () => {
     const d = evaluate(bundle({ blockedCommandPatterns: ["\\brm\\b.*-[a-z]*f"] }), ctx);
     expect(d.action).toBe("deny");
