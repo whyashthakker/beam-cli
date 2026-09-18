@@ -189,7 +189,7 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     }
     if (!data.model) {
       try {
-        const sessionId = String(data.session_id ?? "");
+        const sessionId = String(data.session_id ?? data.sessionId ?? "");
         if (sourceAgent === "claude-code") data.model = await findClaudeCodeModel(home, sessionId);
         else if (sourceAgent === "codex") data.model = await findCodexModel(home, sessionId);
       } catch { /* best-effort enrichment only -- never block the hook on this */ }

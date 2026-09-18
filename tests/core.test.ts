@@ -79,6 +79,9 @@ describe("normalization", () => {
     expect(event.outputTokens).toBe(340);
     expect(event.costUsd).toBe(0.012);
   });
+  it("normalizes Claude's camelCase session id for model lookup and grouping", () => {
+    expect(normalize({ sessionId: "claude-session-1", tool_name: "Bash" }).session).toBe("claude-session-1");
+  });
 });
 
 describe("rule categories and custom rules", () => {

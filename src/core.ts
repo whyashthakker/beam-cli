@@ -157,7 +157,7 @@ export function normalize(raw: Obj): Event {
   return {
     id: createHash("sha256").update(stableId ? `${str(raw.source_agent)}:${str(obj(raw.endpoint).hostname)}:${stableId}` : JSON.stringify(raw)).digest("hex"),
     timestamp: new Date(timestamp).toISOString(), receivedAt: new Date().toISOString(), agent: clean(str(raw.source_agent ?? raw.agent, "custom")),
-    session: clean(str(raw.session_id ?? raw.session, "unassigned")), type: clean(type), tool: clean(tool), summary: redact(detail).slice(0, 4000),
+    session: clean(str(raw.session_id ?? raw.sessionId ?? raw.session, "unassigned")), type: clean(type), tool: clean(tool), summary: redact(detail).slice(0, 4000),
     project: clean(str(raw.project_path ?? raw.cwd)), source: clean(str(raw.source_type, raw.hook_event_name ? "hook" : "import")),
     endpoint: clean(str(obj(raw.endpoint).hostname ?? raw.hostname, "local")), model: clean(str(raw.model)),
     phase: (() => { const event = str(raw.hook_event_name).toLowerCase(); return event === "pretooluse" ? "proposed" : event === "posttooluse" ? "completed hook" : "observed"; })(),
