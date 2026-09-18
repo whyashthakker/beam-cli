@@ -25,6 +25,7 @@ import { renderColumns, withSpinner } from "./prompts.js";
 import { cyan, green } from "./color.js";
 import { runAgent } from "./run.js";
 import { AGENT_BINARIES, installShims, listShims, pathExportLine, shimDir, uninstallShims } from "./shims.js";
+import { runMcpProxy } from "./mcp-proxy.js";
 
 // Lets 'BEAM_API_URL=... beam connect' style overrides live in a .env file instead of the
 // shell profile. Checked in cwd first (handy when developing from the repo), then in
@@ -331,6 +332,13 @@ program.command("scan")
   .option("--mcp", "treat the file as an MCP configuration instead of a skill")
   .option("--save", "also save the report to the running collector")
   .action(async (file: string, options: { mcp?: boolean; save?: boolean }) => console.log(JSON.stringify(await scanFile(file, options), null, 2)));
+
+const mcp = program.command("mcp").description("Run and protect local MCP integrations");
+mcp.command("proxy")
+  .description("Run an MCP server through Beam response filtering")
+  .argument("<command>", "MCP server command, for example npx")
+  .argument("[args...]", "arguments passed to the MCP server")
+  .action(async (command: string, args: string[]) => { process.exitCode = await runMcpProxy(command, args ?? []); });
 
 program.command("hook")
   .description("Forward a hook payload from stdin for the given agent (observation only, never blocks the agent). Payload field names are adapted per agent; see 'beam agent list'.")

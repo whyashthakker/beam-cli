@@ -272,7 +272,8 @@ tr.row:hover { background:#0e1013; cursor:pointer; }
         var reviewCell = (e.findings && e.findings.length)
           ? '<button class="btn secondary" data-review="' + e.id + '" style="padding:4px 10px;font-size:12px">' + (state.reviews[e.id] ? "✓ Reviewed" : "Mark reviewed") + "</button>"
           : '<span class="muted">—</span>';
-        return '<tr class="row" data-id="' + e.id + '"><td class="mono">' + timeOf(e.timestamp) + "</td><td><strong>" + escapeHtml(e.summary).slice(0, 140) + '</strong><br><small class="muted">' + escapeHtml(e.type) + " · " + escapeHtml(e.session) + "</small></td><td>" + escapeHtml(e.agent) + '</td><td><span class="badge ' + r + '">' + (r === "info" ? "no flags" : r) + "</span></td><td>" + reviewCell + "</td></tr>";
+        var context = e.mcp ? "MCP: " + e.mcp.server + (e.mcp.tool ? " · " + e.mcp.tool : e.mcp.resource ? " · " + e.mcp.resource : "") : escapeHtml(e.type) + " · " + escapeHtml(e.session);
+        return '<tr class="row" data-id="' + e.id + '"><td class="mono">' + timeOf(e.timestamp) + "</td><td><strong>" + escapeHtml(e.summary).slice(0, 140) + '</strong><br><small class="muted">' + escapeHtml(context) + "</small></td><td>" + escapeHtml(e.agent) + '</td><td><span class="badge ' + r + '">' + (r === "info" ? "no flags" : r) + "</span></td><td>" + reviewCell + "</td></tr>";
       }).join("");
       var bodyId = activeTab === "findings" ? "findingRows" : "eventRows";
       var emptyId = activeTab === "findings" ? "findingsEmpty" : "eventsEmpty";
@@ -302,7 +303,8 @@ tr.row:hover { background:#0e1013; cursor:pointer; }
       return '<div class="finding"><span class="badge ' + f.severity + '">' + f.severity + "</span><h3>" + escapeHtml(f.title) + '</h3><p class="muted">' + escapeHtml(f.explanation) + "</p><pre>" + escapeHtml(f.evidence) + "</pre></div>";
     }).join("") || '<p class="muted">No configured rule matched. This does not establish that an action is safe.</p>';
     root.innerHTML = '<div class="drawer-backdrop"><section class="drawer"><button class="close">×</button><h2>Action detail</h2><span class="badge ' + risk(event) + '">' + risk(event) + '</span><pre style="white-space:pre-wrap;background:#0e1013;padding:10px;border-radius:6px;margin-top:10px">' + escapeHtml(event.summary) + '</pre><dl>' +
-      [["Agent", event.agent], ["Session", event.session], ["Time", new Date(event.timestamp).toLocaleString()], ["Source", event.source], ["Status", event.phase], ["Project", event.project || "Not supplied"], ["Endpoint", event.endpoint], ["Model", event.model || "Not supplied"]]
+      [["Agent", event.agent], ["MCP server", event.mcp && event.mcp.server], ["MCP tool", event.mcp && event.mcp.tool], ["MCP resource", event.mcp && event.mcp.resource], ["Session", event.session], ["Time", new Date(event.timestamp).toLocaleString()], ["Source", event.source], ["Status", event.phase], ["Project", event.project || "Not supplied"], ["Endpoint", event.endpoint], ["Model", event.model || "Not supplied"]]
+        .filter(function (kv) { return kv[1]; })
         .map(function (kv) { return "<dt>" + kv[0] + "</dt><dd>" + escapeHtml(kv[1]) + "</dd>"; }).join("") +
       "</dl>" + findings + "</section></div>";
     root.querySelector(".close").addEventListener("click", function () { root.innerHTML = ""; });

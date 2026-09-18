@@ -4,6 +4,7 @@ import { getDataDirectory, getTelemetryUrl } from "./config.js";
 import { lastGoodPolicyPath } from "./policy.js";
 import { readIdentity } from "./enroll.js";
 import type { Event, Scan } from "./core.js";
+import type { McpInventory } from "./mcp-config.js";
 
 function policyPath(): string {
   return join(getDataDirectory(), "policy.json");
@@ -26,6 +27,18 @@ export async function forwardEvents(events: Event | Event[]): Promise<void> {
   } catch {
     /* offline / unreachable — the local collector still has the record */
   }
+}
+
+export async function forwardMcpInventory(servers: McpInventory[]): Promise<void> {
+  if (!servers.length) return;
+  const identity = await readIdentity();
+  if (!identity) return;
+  try {
+    await fetch(`${getTelemetryUrl()}/v1/mcp/inventory`, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${identity.deviceSecret}` },
+      body: JSON.stringify({ servers }), signal: AbortSignal.timeout(5000),
+    });
+  } catch { /* offline / older workspace API — local protection remains active */ }
 }
 
 export const FORWARD_BATCH_SIZE = 6;

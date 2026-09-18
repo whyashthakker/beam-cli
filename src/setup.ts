@@ -9,6 +9,8 @@ import { showFirstRunWelcome } from "./owl.js";
 import { cyan, dim, green, indigoOut, red } from "./color.js";
 import { syncPolicy } from "./forward.js";
 import { AGENT_BINARIES } from "./shims.js";
+import { installMcpProxies } from "./mcp-config.js";
+import { forwardMcpInventory } from "./forward.js";
 
 const TOTAL_STEPS = 5;
 function step(n: number, title: string): void {
@@ -93,6 +95,13 @@ export async function runSetup(): Promise<void> {
     console.log(`\n  Tip: to sandbox ${shimmable.map(a => a.name).join(", ")} automatically (no need to type 'beam run'), run:`);
     console.log(`    beam shims install ${shimmable.map(a => a.id).join(" ")}`);
   }
+
+  const mcpResults = await installMcpProxies();
+  void forwardMcpInventory(mcpResults.flatMap(result => result.servers));
+  const mcpWrapped = mcpResults.reduce((total, result) => total + result.wrapped, 0);
+  const mcpErrors = mcpResults.filter(result => result.error);
+  if (mcpWrapped) ok(`Protected ${mcpWrapped} MCP server${mcpWrapped === 1 ? "" : "s"} with the local response proxy.`);
+  for (const result of mcpErrors) fail(`Could not update MCP config ${result.path}: ${result.error}`);
 
   // --- Step 2: connect this device to the dashboard (dashboard-v1, or BEAM_DASHBOARD_URL) ---
   step(2, "Connecting to your Beam dashboard");

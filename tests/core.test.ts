@@ -39,6 +39,15 @@ describe("normalization", () => {
   it("unknown tool with path remains a tool call", () => {
     expect(normalize({ tool_name: "unknown", tool_input: { path: "/tmp/file" } }).type).toBe("tool.call");
   });
+  it("preserves the agent to MCP server to tool relationship", () => {
+    const event = normalize({ source_agent: "claude-code", tool_name: "mcp:github:search", session_id: "s1" });
+    expect(event.mcp).toEqual({ server: "github", tool: "search", requestType: "tool" });
+    expect(event.agent).toBe("claude-code");
+  });
+  it("accepts explicit MCP resource metadata", () => {
+    expect(normalize({ tool_name: "read_resource", mcp: { serverName: "docs", resourceUri: "file:///README.md" } }).mcp)
+      .toEqual({ server: "docs", resource: "file:///README.md", requestType: "resource" });
+  });
   it("output prose is not interpreted as an executed command", () => {
     expect(normalize({ event_type: "command.result", content_preview: "rm -rf /" }).findings).toEqual([]);
   });

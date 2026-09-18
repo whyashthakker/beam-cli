@@ -6,6 +6,7 @@ export type Event = {
   id: string; timestamp: string; receivedAt: string; agent: string; session: string;
   type: string; tool: string; summary: string; project: string; source: string;
   endpoint: string; model: string; phase: string; findings: Finding[];
+  mcp?: { server: string; tool?: string; resource?: string; requestType?: "tool" | "resource" | "prompt" | "unknown" };
   provenance?: { recordId: string; schemaVersion: string; citedEventIds: string[]; tags: string[]; evidence: string };
   inputTokens?: number; outputTokens?: number; costUsd?: number;
 };
@@ -141,6 +142,14 @@ export function normalize(raw: Obj): Event {
   if (!Number.isFinite(Date.parse(timestamp))) throw new Error("Invalid event timestamp.");
   const clean = (s: string) => redact(s).slice(0, 500);
   const stableId = str(raw.event_id ?? raw.finding_id ?? raw.id);
+  const mcpRaw = obj(raw.mcp ?? raw.mcp_request ?? raw.mcpRequest);
+  const explicitMcpServer = str(raw.mcp_server ?? raw.mcpServer ?? mcpRaw.server ?? mcpRaw.server_name ?? mcpRaw.serverName);
+  const explicitMcpTool = str(raw.mcp_tool ?? raw.mcpTool ?? mcpRaw.tool ?? mcpRaw.tool_name ?? mcpRaw.toolName);
+  const explicitMcpResource = str(raw.mcp_resource ?? raw.mcpResource ?? mcpRaw.resource ?? mcpRaw.resource_uri ?? mcpRaw.resourceUri);
+  const toolParts = tool.match(/^mcp[.:/]([^.:/]+)[.:/]([^.:/]+)$/i);
+  const mcpServer = explicitMcpServer || (toolParts ? toolParts[1] : "");
+  const mcpTool = explicitMcpTool || (toolParts ? toolParts[2] : "");
+  const mcpRequestType = explicitMcpResource ? "resource" : mcpTool ? "tool" : "unknown";
   return {
     id: createHash("sha256").update(stableId ? `${str(raw.source_agent)}:${str(obj(raw.endpoint).hostname)}:${stableId}` : JSON.stringify(raw)).digest("hex"),
     timestamp: new Date(timestamp).toISOString(), receivedAt: new Date().toISOString(), agent: clean(str(raw.source_agent ?? raw.agent, "custom")),
@@ -152,6 +161,7 @@ export function normalize(raw: Obj): Event {
       citedEventIds: Array.isArray(raw.cited_event_ids) ? raw.cited_event_ids.filter((v): v is string => typeof v === "string").slice(0, 100).map(clean) : [],
       tags: Array.isArray(raw.tags) ? raw.tags.filter((v): v is string => typeof v === "string").slice(0, 100).map(clean) : [],
       evidence: redact(JSON.stringify(raw.evidence_refs ?? raw.evidence ?? {})).slice(0, 8000) },
+    ...(mcpServer || explicitMcpTool || explicitMcpResource ? { mcp: { server: clean(mcpServer || "unknown"), ...(mcpTool ? { tool: clean(mcpTool) } : {}), ...(explicitMcpResource ? { resource: clean(explicitMcpResource) } : {}), requestType: mcpRequestType } } : {}),
     findings, inputTokens: number(raw.input_tokens), outputTokens: number(raw.output_tokens), costUsd: number(raw.cost_usd),
   };
 }
