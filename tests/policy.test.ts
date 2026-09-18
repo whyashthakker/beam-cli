@@ -24,8 +24,8 @@ describe("evaluate", () => {
     expect(d.reason).toMatch(/Bash/);
   });
 
-  it("warns (not denies) a blocked tool in advisory mode", () => {
-    expect(evaluate(bundle({ mode: "advisory", blockedTools: ["Bash"] }), ctx).action).toBe("warn");
+  it("asks for approval for a blocked tool in advisory mode", () => {
+    expect(evaluate(bundle({ mode: "advisory", blockedTools: ["Bash"] }), ctx).action).toBe("ask");
   });
 
   it("denies a blocked command pattern", () => {

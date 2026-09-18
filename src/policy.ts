@@ -79,6 +79,11 @@ export function evaluate(bundle: PolicyBundle | null, ctx: ActionContext): Decis
   const thresholds = bundle.rules.risk ?? { askAt: 30, blockAt: 70 }; let action: PolicyAction = selected?.action ?? "ALLOW";
   if (!selected && score >= (thresholds.blockAt ?? 70)) action = "BLOCK"; else if (!selected && score >= (thresholds.askAt ?? 30)) action = "ASK";
   const reason = selected?.reason ?? (action === "BLOCK" ? `Risk score ${score} exceeds the block threshold.` : action === "ASK" ? `Risk score ${score} requires approval.` : action === "REDACT" ? "Sensitive data must be transformed before this action." : undefined);
-  const mapped: DecisionAction = action === "BLOCK" ? (bundle.rules.mode === "enforce" ? "deny" : "warn") : action === "ASK" && bundle.rules.mode === "advisory" ? "warn" : action.toLowerCase() as DecisionAction;
+  // An explicit ASK rule is an approval gate in every non-observe policy mode. Advisory
+  // changes the default posture for unmatched/risk-threshold actions, but must not downgrade
+  // a manager's explicit request for approval into a stderr-only warning.
+  const mapped: DecisionAction = action === "BLOCK"
+    ? (bundle.rules.mode === "enforce" ? "deny" : bundle.rules.mode === "advisory" ? "ask" : "warn")
+    : action.toLowerCase() as DecisionAction;
   return { ...base, action: mapped, reason, policy: "local policy", rule: selected?.id, approval: selected?.approval };
 }
