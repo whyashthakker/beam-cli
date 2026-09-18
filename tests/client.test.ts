@@ -20,6 +20,10 @@ beforeEach(() => {
 afterEach(async () => {
   global.fetch = originalFetch;
   process.env = { ...originalEnv };
+  // captureHook sets process.exitCode = 2 on a real deny (the documented fail-closed signal for
+  // a real short-lived `beam hook` process) -- reset it so a deny exercised in one test doesn't
+  // leak into this shared Jest process's own exit code and fail an otherwise-green run.
+  process.exitCode = 0;
   await Promise.all(temporaryDirectories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true })));
 });
 
@@ -254,6 +258,42 @@ describe("captureHook", () => {
     global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
     const output = jest.spyOn(process.stdout, "write").mockImplementation((chunk) => { if (typeof chunk === "string") expect(chunk).toContain(expected); return true; });
     await captureHook(agent);
+    expect(output).toHaveBeenCalled();
+    output.mockRestore();
+  });
+
+  it.each([
+    ["claude-code", "UserPromptSubmit", '"hookEventName":"UserPromptSubmit"'],
+    ["codex", "UserPromptSubmit", '"hookEventName":"UserPromptSubmit"'],
+  ])("blocks a disabled %s agent at its prompt-submit hook, not just at tool-call time", async (agent, hookEventName, expected) => {
+    process.env.BEAM_TOKEN = "t";
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: [], blockedCommandPatterns: [], disabledAgents: [agent] } }));
+    withStdin(JSON.stringify({ hook_event_name: hookEventName, prompt: "do something", session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      if (typeof chunk === "string") { expect(chunk).toContain('"permissionDecision":"deny"'); expect(chunk).toContain(expected); }
+      return true;
+    });
+    await captureHook(agent);
+    expect(output).toHaveBeenCalled();
+    output.mockRestore();
+  });
+
+  it("blocks a disabled cursor agent at beforeSubmitPrompt using the continue/user_message contract", async () => {
+    process.env.BEAM_TOKEN = "t";
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: [], blockedCommandPatterns: [], disabledAgents: ["cursor"] } }));
+    withStdin(JSON.stringify({ hook_event_name: "beforeSubmitPrompt", prompt: "do something", session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      if (typeof chunk === "string") {
+        expect(chunk).toContain('"continue":false');
+        expect(chunk).not.toContain('"permission"');
+      }
+      return true;
+    });
+    await captureHook("cursor");
     expect(output).toHaveBeenCalled();
     output.mockRestore();
   });

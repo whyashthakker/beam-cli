@@ -71,6 +71,58 @@ describe("installHook", () => {
     expect(config.hooks.preToolUse[0]).toEqual({ type: "command", bash: expectedCommand("copilot-cli"), timeoutSec: 30 });
   });
 
+  // A disabled agent (policy.disabledAgents) must be stopped before the prompt is even
+  // processed, not only at its first tool call -- so install also wires the agent's own
+  // prompt-submit hook event alongside its tool-call gate.
+  it.each([
+    ["claude-code", ".claude/settings.json"],
+    ["codex", ".codex/hooks.json"],
+  ])("also installs %s's UserPromptSubmit hook alongside PreToolUse", async (agentId, relativeConfigPath) => {
+    const home = await tempHome();
+    await installHook(agentId, home);
+    const config = JSON.parse(await fs.readFile(path.join(home, relativeConfigPath), "utf8"));
+    expect(config.hooks.UserPromptSubmit[0].hooks[0].command).toBe(expectedCommand(agentId));
+    expect(config.hooks.PreToolUse[0].hooks[0].command).toBe(expectedCommand(agentId));
+  });
+
+  // UserPromptSubmit has no matcher concept (code.claude.com/docs/en/hooks's own example omits
+  // the field entirely for it) -- sending an empty-string matcher there is untested by that doc
+  // and shouldn't be relied on to be tolerated.
+  it.each([
+    ["claude-code", ".claude/settings.json"],
+    ["codex", ".codex/hooks.json"],
+  ])("omits matcher on %s's UserPromptSubmit entry but keeps it on PreToolUse", async (agentId, relativeConfigPath) => {
+    const home = await tempHome();
+    await installHook(agentId, home);
+    const config = JSON.parse(await fs.readFile(path.join(home, relativeConfigPath), "utf8"));
+    expect(config.hooks.UserPromptSubmit[0]).not.toHaveProperty("matcher");
+    expect(config.hooks.PreToolUse[0].matcher).toBe("");
+  });
+
+  it("also installs Cursor's beforeSubmitPrompt hook alongside preToolUse", async () => {
+    const home = await tempHome();
+    const result = await installHook("cursor", home);
+    const config = JSON.parse(await fs.readFile(result.path, "utf8"));
+    expect(config.hooks.beforeSubmitPrompt[0]).toEqual({ command: expectedCommand("cursor"), matcher: ".*" });
+    expect(config.hooks.preToolUse[0]).toEqual({ command: expectedCommand("cursor"), matcher: ".*" });
+  });
+
+  it("also installs Copilot CLI's userPromptSubmitted hook alongside preToolUse", async () => {
+    const home = await tempHome();
+    const result = await installHook("copilot-cli", home);
+    const config = JSON.parse(await fs.readFile(result.path, "utf8"));
+    expect(config.hooks.userPromptSubmitted[0]).toEqual({ type: "command", bash: expectedCommand("copilot-cli"), timeoutSec: 30 });
+    expect(config.hooks.preToolUse[0]).toEqual({ type: "command", bash: expectedCommand("copilot-cli"), timeoutSec: 30 });
+  });
+
+  it("installing twice does not duplicate the prompt-submit entry either", async () => {
+    const home = await tempHome();
+    await installHook("claude-code", home);
+    await installHook("claude-code", home);
+    const config = JSON.parse(await fs.readFile(path.join(home, ".claude", "settings.json"), "utf8"));
+    expect(config.hooks.UserPromptSubmit).toHaveLength(1);
+  });
+
   it("rejects an unknown agent", async () => {
     const home = await tempHome();
     await expect(installHook("not-a-real-agent", home)).rejects.toThrow("Unknown agent");
@@ -173,6 +225,16 @@ describe("uninstallHook", () => {
     expect(config.theme).toBe("dark");
     expect(config.hooks.PreToolUse).toHaveLength(1);
     expect(config.hooks.PreToolUse[0].hooks[0].command).toBe("echo existing");
+  });
+
+  it("uninstall clears both PreToolUse and UserPromptSubmit after a real install", async () => {
+    const home = await tempHome();
+    await installHook("claude-code", home);
+    const result = await uninstallHook("claude-code", home);
+    expect(result.removed).toBe(true);
+    const config = JSON.parse(await fs.readFile(path.join(home, ".claude", "settings.json"), "utf8"));
+    expect(config.hooks.PreToolUse).toHaveLength(0);
+    expect(config.hooks.UserPromptSubmit).toHaveLength(0);
   });
 
   it("removes a pre-fix bare 'beam hook <agent>' entry too", async () => {

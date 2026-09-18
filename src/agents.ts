@@ -37,12 +37,18 @@ function arr(v: unknown): unknown[] { return Array.isArray(v) ? v : []; }
 
 // Claude Code, Codex, and Cursor all install into a `hooks.<Event>` array of
 // `{ matcher, hooks: [{ type: "command", command }] }` entries (Claude Code's own shape).
+// A handful of events -- UserPromptSubmit among them -- have no matcher concept at all (they
+// always fire); code.claude.com/docs/en/hooks's own example omits the field there entirely
+// rather than sending an empty string, so this does the same to avoid relying on an "ignored"
+// field being tolerated rather than rejected.
+const CLAUDE_STYLE_EVENTS_WITHOUT_MATCHER = new Set(["UserPromptSubmit"]);
 function mergeClaudeStyleHooks(event: string) {
+  const supportsMatcher = !CLAUDE_STYLE_EVENTS_WITHOUT_MATCHER.has(event);
   return (existing: Obj, command: string): Obj => {
     const hooks = obj(existing.hooks);
     const list = arr(hooks[event]).map(obj);
     const alreadyInstalled = list.some(entry => arr(entry.hooks).map(obj).some(h => h.command === command));
-    if (!alreadyInstalled) list.push({ matcher: "", hooks: [{ type: "command", command }] });
+    if (!alreadyInstalled) list.push({ ...(supportsMatcher ? { matcher: "" } : {}), hooks: [{ type: "command", command }] });
     return { ...existing, hooks: { ...hooks, [event]: list } };
   };
 }
@@ -111,22 +117,37 @@ function unmergeGeminiHooks(existing: Obj, command: string): Obj {
   return { ...existing, hooks: { ...hooks, "beam-security": { ...gate, pre_tool_execution: list } } };
 }
 
+// Installs beam into more than one hook event (e.g. the tool-call gate *and* the prompt-submit
+// gate) by folding each single-event merger over the config in turn. A disabled agent only ever
+// reliably stops at the pre-action gate if that agent never calls a tool in a turn (pure chat) --
+// registering the prompt-submit event too means a disabled agent's policy.disabledAgents block
+// (see policy.ts's evaluate()) fires before the prompt is even processed, not just before a tool
+// call that may never come.
+function mergeAll(mergers: Array<(existing: Obj, command: string) => Obj>) {
+  return (existing: Obj, command: string): Obj => mergers.reduce((acc, merge) => merge(acc, command), existing);
+}
+function unmergeAll(unmergers: Array<(existing: Obj, command: string) => Obj>) {
+  return (existing: Obj, command: string): Obj => unmergers.reduce((acc, unmerge) => unmerge(acc, command), existing);
+}
+
 export const AGENTS: AgentDefinition[] = [
   {
     id: "claude-code", name: "Claude Code",
     configs: [".claude/settings.json"], artifacts: [".claude/projects"],
     hookConfigPath: ".claude/settings.json", hookEventName: "PreToolUse",
-    mergeHookConfig: mergeClaudeStyleHooks("PreToolUse"), unmergeHookConfig: unmergeClaudeStyleHooks("PreToolUse"),
+    mergeHookConfig: mergeAll([mergeClaudeStyleHooks("PreToolUse"), mergeClaudeStyleHooks("UserPromptSubmit")]),
+    unmergeHookConfig: unmergeAll([unmergeClaudeStyleHooks("PreToolUse"), unmergeClaudeStyleHooks("UserPromptSubmit")]),
     adapter: "passthrough", verifiedPayload: true,
-    notes: "Payload verified against code.claude.com/docs/en/hooks."
+    notes: "Payload verified against code.claude.com/docs/en/hooks. Also installs UserPromptSubmit (same hookSpecificOutput.permissionDecision contract, just hookEventName: \"UserPromptSubmit\") so a disabled agent is stopped before the prompt is processed, not only at its first tool call."
   },
   {
     id: "codex", name: "Codex",
     configs: [".codex/config.toml"], artifacts: [".codex/sessions", ".codex/archived_sessions"],
     hookConfigPath: ".codex/hooks.json", hookEventName: "PreToolUse",
-    mergeHookConfig: mergeClaudeStyleHooks("PreToolUse"), unmergeHookConfig: unmergeClaudeStyleHooks("PreToolUse"),
+    mergeHookConfig: mergeAll([mergeClaudeStyleHooks("PreToolUse"), mergeClaudeStyleHooks("UserPromptSubmit")]),
+    unmergeHookConfig: unmergeAll([unmergeClaudeStyleHooks("PreToolUse"), unmergeClaudeStyleHooks("UserPromptSubmit")]),
     adapter: "passthrough", verifiedPayload: true,
-    notes: "Same hooks.json shape and stdin payload fields as Claude Code (session_id, cwd, hook_event_name, tool_name, tool_input, tool_use_id)."
+    notes: "Same hooks.json shape and stdin payload fields as Claude Code (session_id, cwd, hook_event_name, tool_name, tool_input, tool_use_id). Also installs UserPromptSubmit for the same disabled-agent-at-prompt-time reason."
   },
   {
     id: "cursor", name: "Cursor",
@@ -135,9 +156,10 @@ export const AGENTS: AgentDefinition[] = [
     // Cursor itself creates just from being used, so it's a real presence signal.
     configs: [".cursor"], artifacts: [".cursor/projects"],
     hookConfigPath: ".cursor/hooks.json", hookEventName: "preToolUse",
-    mergeHookConfig: mergeCursorHooks("preToolUse"), unmergeHookConfig: unmergeCursorHooks("preToolUse"),
+    mergeHookConfig: mergeAll([mergeCursorHooks("preToolUse"), mergeCursorHooks("beforeSubmitPrompt")]),
+    unmergeHookConfig: unmergeAll([unmergeCursorHooks("preToolUse"), unmergeCursorHooks("beforeSubmitPrompt")]),
     adapter: "passthrough", verifiedPayload: true,
-    notes: "Payload verified against cursor.com/docs/hooks; extra fields (model, conversation_id, ...) are ignored, not misread."
+    notes: "Payload verified against cursor.com/docs/hooks; extra fields (model, conversation_id, ...) are ignored, not misread. Also installs beforeSubmitPrompt -- unlike preToolUse's permission field, that event's block contract is {continue: false, user_message} (see client.ts emitDeny)."
   },
   {
     id: "copilot-cli", name: "GitHub Copilot CLI",
@@ -145,9 +167,10 @@ export const AGENTS: AgentDefinition[] = [
     // ".copilot/config.json" is what the real Copilot CLI writes on its own first run.
     configs: [".copilot/config.json"], artifacts: [".copilot/session-state"],
     hookConfigPath: ".copilot/hooks/beam.json", hookEventName: "preToolUse",
-    mergeHookConfig: mergeCopilotHooks("preToolUse"), unmergeHookConfig: unmergeCopilotHooks("preToolUse"),
+    mergeHookConfig: mergeAll([mergeCopilotHooks("preToolUse"), mergeCopilotHooks("userPromptSubmitted")]),
+    unmergeHookConfig: unmergeAll([unmergeCopilotHooks("preToolUse"), unmergeCopilotHooks("userPromptSubmitted")]),
     adapter: "copilot-camel", verifiedPayload: true,
-    notes: "Payload verified against docs.github.com Copilot hooks reference (camelCase: sessionId, cwd, toolName, toolArgs)."
+    notes: "Payload verified against docs.github.com Copilot hooks reference (camelCase: sessionId, cwd, toolName, toolArgs). userPromptSubmitted is also installed for observation/audit only -- GitHub's docs state its stdout is ignored (no blocking contract), so a disabled agent is only actually stopped at its first preToolUse call."
   },
   {
     id: "gemini", name: "Gemini CLI",

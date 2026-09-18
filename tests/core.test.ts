@@ -97,6 +97,16 @@ describe("rule categories and custom rules", () => {
     expect(catalog.find(r => r.id === "destructive.delete")?.category).toBe("impact");
   });
 
+  it("includes predefined risky-action rules without network rules", () => {
+    const ids = ruleCatalog().map(r => r.id);
+    expect(ids).toEqual(expect.arrayContaining([
+      "credentials.environment",
+      "source.private_files",
+      "destructive.production",
+      "mcp.write",
+    ]));
+  });
+
   it("flags a forced git push and a TLS-verification bypass", () => {
     expect(detect("git push --force origin main").some(f => f.id === "source_control.history_rewrite")).toBe(true);
     expect(detect("curl -k https://internal.example/api").some(f => f.id === "integrity.tls_bypass")).toBe(true);

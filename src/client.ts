@@ -1,6 +1,6 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getBeamHome, getCollectorUrl, getDataDirectory } from "./config.js";
 import { normalize, scanText, type Event, type Scan } from "./core.js";
 import { adaptHookPayload } from "./hook-adapters.js";
@@ -205,7 +205,7 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     const toolInput = data.tool_input && typeof data.tool_input === "object"
       ? (data.tool_input as Record<string, unknown>) : {};
     const command = String(data.command ?? toolInput.command ?? "");
-    const decision = evaluate(await readPolicy().catch(() => null), {
+    let decision = evaluate(await readPolicy().catch(() => null), {
       agent: sourceAgent,
       tool: String(data.tool_name ?? ""),
       command,
@@ -220,20 +220,37 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
       environment: typeof data.environment === "string" ? data.environment : undefined,
       time: typeof data.timestamp === "string" ? data.timestamp : undefined,
     });
+    if (decision.action === "allow" && isEnvironmentAccess(String(data.tool_name ?? ""), command, String(toolInput.file_path ?? toolInput.path ?? data.file_path ?? ""), toolInput)) {
+      decision = {
+        ...decision,
+        action: "ask",
+        reason: "Reading environment variables or .env files requires approval.",
+      };
+    }
+    const workspace = String(data.cwd ?? "");
+    const targetPath = String(toolInput.file_path ?? toolInput.path ?? data.file_path ?? "");
+    if (decision.action === "allow" && workspace && isOutsideWorkspace(workspace, targetPath, command)) {
+      decision = {
+        ...decision,
+        action: "ask",
+        reason: "This action accesses a path outside the current workspace.",
+      };
+    }
 
     data.policy_decision = { action: decision.action, rule: decision.rule, reason: decision.reason, risk_score: decision.riskScore, risk_level: decision.riskLevel, risk_factors: decision.riskFactors };
+    const hookEvent = String(data.hook_event_name ?? "PreToolUse");
     let event = safeNormalize(data);
     if (decision.action === "deny") {
       if (event) event = { ...event, findings: [...event.findings, blockedFinding(decision.reason)] };
-      emitDeny(sourceAgent, decision.reason ?? "Blocked by workspace policy.");
+      emitDeny(sourceAgent, decision.reason ?? "Blocked by workspace policy.", hookEvent);
     } else if (decision.action === "ask") {
-      emitAsk(sourceAgent, decision.reason ?? "This action requires approval.");
+      emitAsk(sourceAgent, decision.reason ?? "This action requires approval.", hookEvent);
     } else if (decision.action === "redact") {
       const transformed = redactPayload(data, decision);
       if (!transformed.changed) {
-        emitAllow(sourceAgent, decision.reason);
+        emitAllow(sourceAgent, decision.reason, hookEvent);
       } else {
-        emitRedacted(sourceAgent, transformed.data, decision.reason);
+        emitRedacted(sourceAgent, transformed.data, decision.reason, hookEvent);
         data = transformed.data;
       }
     } else if (decision.action === "warn") {
@@ -261,14 +278,41 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     // strongest available boundary is the denial JSON itself.
     const policy = await readPolicy().catch(() => null);
     if (policy && (policy.rules.mode === "enforce" || policy.errors?.length)) {
+      // emitDeny already sets exit code 2 for the agents where that's the documented fail-closed
+      // signal (see EXIT_2_FAILS_CLOSED above).
       emitDeny(sourceAgent, "Beam security policy could not complete safely; execution is denied.");
-      if (["claude-code", "codex", "cursor", "copilot-cli", "opencode"].includes(sourceAgent)) process.exitCode = 2;
     }
   }
 }
 
 function safeNormalize(data: Record<string, unknown>): Event | null {
   try { return normalize(data); } catch { return null; }
+}
+
+function isEnvironmentAccess(tool: string, command: string, path: string, input: Record<string, unknown>): boolean {
+  const text = `${tool} ${command} ${path} ${Object.values(input).filter(value => typeof value === "string").join(" ")}`;
+  // File reads: .env, .env.local, .env.prod, etc. Also catch common env/config
+  // locations that contain exported credentials.
+  if (/(^|[\\/\s"'])\.env(?:\.[\w.-]+)?(?:$|[\\/\s"'])/i.test(text)) return true;
+  if (/(^|[\\/\s"'])\.aws[\\/]credentials(?:$|[\\/\s"'])|(^|[\\/\s"'])\.config[\\/]gcloud(?:$|[\\/\s"'])/i.test(text)) return true;
+  // Shell/process environment reads: env, printenv, set, export -p, $FOO,
+  // process.env, os.environ and equivalent tool arguments.
+  return /\b(?:printenv|env|export\s+-p|process\.env|os\.environ|System\.getenv)\b|\$\{?[A-Z][A-Z0-9_]*\}?/i.test(text);
+}
+
+function isOutsideWorkspace(cwd: string, target: string, command: string): boolean {
+  if (!cwd) return false;
+  const text = `${target} ${command}`;
+  const candidates = [
+    ...(isAbsolute(target) ? [target] : []),
+    ...[...text.matchAll(/(?:^|\s)(\/[^\s"';&|]+)/g)].map(match => match[1]),
+  ];
+  const root = resolve(cwd);
+  return candidates.some(candidate => {
+    const path = resolve(root, candidate);
+    const escaped = relative(root, path);
+    return escaped === ".." || escaped.startsWith(`..${sep}`) || isAbsolute(escaped);
+  });
 }
 
 function blockedFinding(reason = "Blocked by workspace policy."): Event["findings"][number] {
@@ -286,49 +330,73 @@ function redactPayload(data: Record<string, unknown>, decision: { customDetector
   return { data: redactValue(copy) as Record<string, unknown>, changed };
 }
 
-function emitAsk(agent: string, reason: string): void {
+// Claude Code and Codex use the same hookSpecificOutput.permissionDecision contract for every
+// hook event -- only the echoed hookEventName differs per event (verified against
+// code.claude.com/docs/en/hooks for both PreToolUse and UserPromptSubmit).
+function claudeStyleHookEventName(event: string): string {
+  return event === "UserPromptSubmit" ? "UserPromptSubmit" : "PreToolUse";
+}
+
+function emitAsk(agent: string, reason: string, event = "PreToolUse"): void {
   if (agent === "claude-code" || agent === "codex") {
-    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: `Beam: ${reason}` } }));
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: claudeStyleHookEventName(event), permissionDecision: "ask", permissionDecisionReason: `Beam: ${reason}` } }));
   } else if (agent === "cursor" || agent === "copilot-cli") {
     // These hook contracts do not provide a reliable interactive approval channel in Beam's
     // command-hook path. Fail closed rather than silently allowing an ASK decision.
-    emitDeny(agent, `${reason} Interactive approval is unavailable for this agent hook.`);
+    emitDeny(agent, `${reason} Interactive approval is unavailable for this agent hook.`, event);
   } else if (agent === "gemini") {
-    emitDeny(agent, `${reason} Interactive approval is unavailable for Gemini pre_tool_execution.`);
+    emitDeny(agent, `${reason} Interactive approval is unavailable for Gemini pre_tool_execution.`, event);
   } else {
-    emitDeny(agent, reason);
+    emitDeny(agent, reason, event);
   }
 }
 
-function emitRedacted(agent: string, data: Record<string, unknown>, reason?: string): void {
+function emitRedacted(agent: string, data: Record<string, unknown>, reason?: string, event = "PreToolUse"): void {
   const input = data.tool_input;
-  if (agent === "claude-code" || agent === "codex") process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: `Beam: ${reason ?? "Sensitive data redacted."}`, updatedInput: input } }));
+  if (agent === "claude-code" || agent === "codex") process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: claudeStyleHookEventName(event), permissionDecision: "allow", permissionDecisionReason: `Beam: ${reason ?? "Sensitive data redacted."}`, updatedInput: input } }));
   else if (agent === "cursor") process.stdout.write(JSON.stringify({ permission: "allow", updated_input: input }));
   else if (agent === "copilot-cli") process.stdout.write(JSON.stringify({ permissionDecision: "allow", updatedInput: input }));
-  else emitDeny(agent, "Beam cannot safely return transformed input through this hook contract.");
+  else emitDeny(agent, "Beam cannot safely return transformed input through this hook contract.", event);
 }
 
-function emitAllow(agent: string, reason?: string): void {
-  if (agent === "claude-code" || agent === "codex") process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: reason } }));
+function emitAllow(agent: string, reason?: string, event = "PreToolUse"): void {
+  if (agent === "claude-code" || agent === "codex") process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: claudeStyleHookEventName(event), permissionDecision: "allow", permissionDecisionReason: reason } }));
+  else if (agent === "cursor" && event === "beforeSubmitPrompt") process.stdout.write(JSON.stringify({ continue: true }));
   else if (agent === "cursor") process.stdout.write(JSON.stringify({ permission: "allow" }));
   else if (agent === "copilot-cli") process.stdout.write(JSON.stringify({ permissionDecision: "allow", permissionDecisionReason: reason }));
   else if (agent === "gemini") process.stdout.write(JSON.stringify({ decision: "allow" }));
 }
 
-// Claude Code / Codex PreToolUse contract: a JSON decision on stdout denies the tool call.
-// Other agents get a stderr note only (their block contracts differ and aren't verified).
-function emitDeny(agent: string, reason: string): void {
+// Agents whose hook runner treats a non-zero exit code as an unconditional block, documented as
+// stronger/more reliable than the JSON-only decision for at least one event type on each (e.g.
+// Claude Code's own docs list exit code 2 as blocking UserPromptSubmit "regardless of JSON
+// content", separately from the exit-0 hookSpecificOutput.permissionDecision path). Setting this
+// alongside the JSON is belt-and-suspenders, not a replacement -- the JSON still carries the
+// clean reason text; exit 2 just guarantees the block itself isn't silently skipped.
+const EXIT_2_FAILS_CLOSED = new Set(["claude-code", "codex", "cursor", "copilot-cli", "opencode"]);
+
+// Claude Code / Codex hook contract: a JSON decision on stdout denies the tool call or prompt.
+// Other agents get a stderr note only (their block contracts differ and aren't verified), except
+// where noted below.
+function emitDeny(agent: string, reason: string, event = "PreToolUse"): void {
   if (agent === "claude-code" || agent === "codex") {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
-        hookEventName: "PreToolUse",
+        hookEventName: claudeStyleHookEventName(event),
         permissionDecision: "deny",
         permissionDecisionReason: `Beam: ${reason}`,
       },
     }));
+  } else if (agent === "cursor" && event === "beforeSubmitPrompt") {
+    // beforeSubmitPrompt's block contract is {continue: false, user_message} -- unlike
+    // preToolUse/beforeShellExecution's {permission: "deny", ...} (verified against
+    // cursor.com/docs/agent/hooks).
+    process.stdout.write(JSON.stringify({ continue: false, user_message: `Beam: ${reason}` }));
   } else if (agent === "cursor") {
     process.stdout.write(JSON.stringify({ permission: "deny", user_message: `Beam: ${reason}`, agent_message: `Beam: ${reason}` }));
   } else if (agent === "copilot-cli") {
+    // GitHub's docs state userPromptSubmitted's stdout is ignored entirely (no blocking
+    // contract) -- this JSON only has an effect for preToolUse, where it's already verified.
     process.stdout.write(JSON.stringify({ permissionDecision: "deny", permissionDecisionReason: `Beam: ${reason}` }));
   } else if (agent === "gemini") {
     process.stdout.write(JSON.stringify({ decision: "deny", reason: `Beam: ${reason}` }));
@@ -337,5 +405,9 @@ function emitDeny(agent: string, reason: string): void {
   } else {
     // OpenCode has no installed hook/plugin path in this repository. A message cannot block it.
     process.stderr.write(`\n✖ Beam cannot block this agent (${agent}): no verified enforcement adapter is installed.\n`);
+  }
+  if (EXIT_2_FAILS_CLOSED.has(agent)) {
+    process.stderr.write(`Beam: ${reason}\n`);
+    process.exitCode = 2;
   }
 }
