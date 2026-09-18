@@ -88,7 +88,7 @@ export async function enrollDevice(options: { code: string; url?: string }): Pro
     deviceId: data.device_id,
     deviceSecret: data.device_secret,
     orgId: data.org_id,
-    // Always the CLI's own configured base (BEAM_API_URL or the app.agentbeam.com default) --
+    // Always the CLI's own configured base (BEAM_API_URL or the collector.agentbeam.com default) --
     // never whatever the server hands back, so a misconfigured deployment can't redirect a
     // device's future traffic to the wrong host.
     apiBase: base,

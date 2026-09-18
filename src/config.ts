@@ -16,9 +16,9 @@ export function getCollectorUrl(): URL {
 }
 
 // The Beam workspace API (dashboard / control plane) this device enrolls with and
-// reports to. Not loopback-restricted — this is the remote SaaS endpoint.
+// reports to. Not loopback-restricted — this is the remote collector/control-plane endpoint.
 export function getApiUrl(): string {
-  return (process.env.BEAM_API_URL || "https://app.agentbeam.com").replace(/\/+$/, "");
+  return (process.env.BEAM_API_URL || "https://collector.agentbeam.com").replace(/\/+$/, "");
 }
 
 // Remote telemetry collector. Control-plane requests continue to use getApiUrl().
