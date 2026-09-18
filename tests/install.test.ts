@@ -71,6 +71,16 @@ describe("installHook", () => {
     expect(config.hooks.preToolUse[0]).toEqual({ type: "command", bash: expectedCommand("copilot-cli"), timeoutSec: 30 });
   });
 
+  it("installs Gemini CLI's hook into .gemini/settings.json using Claude Code's own {matcher, hooks} shape, on both BeforeTool and BeforeAgent", async () => {
+    const home = await tempHome();
+    const result = await installHook("gemini", home);
+    expect(result.path).toBe(path.join(home, ".gemini", "settings.json"));
+    const config = JSON.parse(await fs.readFile(result.path, "utf8"));
+    expect(config.hooks.BeforeTool[0]).toEqual({ matcher: "", hooks: [{ type: "command", command: expectedCommand("gemini") }] });
+    expect(config.hooks.BeforeAgent[0]).toEqual({ hooks: [{ type: "command", command: expectedCommand("gemini") }] });
+    expect(config.hooks.BeforeAgent[0]).not.toHaveProperty("matcher");
+  });
+
   // A disabled agent (policy.disabledAgents) must be stopped before the prompt is even
   // processed, not only at its first tool call -- so install also wires the agent's own
   // prompt-submit hook event alongside its tool-call gate.

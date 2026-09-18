@@ -297,6 +297,22 @@ describe("captureHook", () => {
     expect(output).toHaveBeenCalled();
     output.mockRestore();
   });
+
+  it("blocks a disabled gemini agent at BeforeAgent with {decision:deny} and exit code 2", async () => {
+    process.env.BEAM_TOKEN = "t";
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: [], blockedCommandPatterns: [], disabledAgents: ["gemini"] } }));
+    withStdin(JSON.stringify({ hook_event_name: "BeforeAgent", prompt: "do something", session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+      if (typeof chunk === "string") expect(chunk).toContain('"decision":"deny"');
+      return true;
+    });
+    await captureHook("gemini");
+    expect(output).toHaveBeenCalled();
+    expect(process.exitCode).toBe(2);
+    output.mockRestore();
+  });
 });
 
 async function writeJsonl(filePath: string, rows: unknown[]): Promise<void> {

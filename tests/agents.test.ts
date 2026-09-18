@@ -48,11 +48,22 @@ describe("hook payload adapters", () => {
     expect(adapted.session_id).toBe("s2");
   });
 
-  it("adapts Gemini's documented nested tool_call payload", () => {
+  it("adapts Gemini CLI's real flat hook payload (geminicli.com/docs/hooks/reference)", () => {
+    const raw = { hook_event_name: "BeforeTool", tool_name: "run_shell_command", tool_input: { command: "ls" }, session_id: "s1", cwd: "/repo" };
+    const adapted = adaptHookPayload("gemini", raw);
+    expect(adapted.tool_name).toBe("run_shell_command");
+    expect(adapted.tool_input).toEqual({ command: "ls" });
+    expect(adapted.hook_event_name).toBe("BeforeTool");
+  });
+
+  // The nested tool_call.{name,args} shape and environment_id field belong to the unrelated
+  // Gemini API "Managed Agents" sandbox hook contract, not Gemini CLI's own -- kept only as a
+  // defensive fallback (see src/hook-adapters.ts's gemini() comment), never the primary path.
+  it("still tolerates the unrelated Gemini API Managed Agents nested tool_call shape as a fallback", () => {
     const adapted = adaptHookPayload("gemini", { environment_id: "env-1", tool_call: { name: "code_execution", args: { code: "echo hi" } } });
     expect(adapted.tool_name).toBe("code_execution");
     expect(adapted.tool_input).toEqual({ code: "echo hi" });
-    expect(adapted.hook_event_name).toBe("pre_tool_execution");
+    expect(adapted.hook_event_name).toBe("BeforeTool");
   });
 });
 

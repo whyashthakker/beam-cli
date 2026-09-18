@@ -32,6 +32,12 @@ function generic(raw: Obj): Obj {
 }
 
 // Gemini's documented pre_tool_execution contract nests the call under tool_call.
+// Gemini CLI's own documented hook payload (geminicli.com/docs/hooks/reference) is already flat
+// -- session_id, cwd, hook_event_name, tool_name, tool_input, prompt -- the same shape as Claude
+// Code/Codex/Cursor. The tool_call.{name,args} nesting and environment_id field below are kept
+// only as a defensive fallback for the unrelated Gemini API "Managed Agents" sandbox hook format
+// (ai.google.dev/gemini-api/docs/agent-hooks), which beam's config previously (incorrectly)
+// targeted for the "Gemini CLI" agent entry -- harmless to keep matching, never the primary path.
 function gemini(raw: Obj): Obj {
   const call = raw.tool_call && typeof raw.tool_call === "object" ? raw.tool_call as Obj : {};
   return {
@@ -39,7 +45,7 @@ function gemini(raw: Obj): Obj {
     session_id: raw.session_id ?? raw.sessionId ?? raw.environment_id,
     tool_name: raw.tool_name ?? raw.toolName ?? call.name,
     tool_input: raw.tool_input ?? raw.toolArgs ?? call.args,
-    hook_event_name: raw.hook_event_name ?? "pre_tool_execution",
+    hook_event_name: raw.hook_event_name ?? "BeforeTool",
   };
 }
 

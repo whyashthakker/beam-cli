@@ -35,13 +35,14 @@ export interface AgentDefinition {
 function obj(v: unknown): Obj { return v && typeof v === "object" && !Array.isArray(v) ? v as Obj : {}; }
 function arr(v: unknown): unknown[] { return Array.isArray(v) ? v : []; }
 
-// Claude Code, Codex, and Cursor all install into a `hooks.<Event>` array of
-// `{ matcher, hooks: [{ type: "command", command }] }` entries (Claude Code's own shape).
-// A handful of events -- UserPromptSubmit among them -- have no matcher concept at all (they
-// always fire); code.claude.com/docs/en/hooks's own example omits the field there entirely
-// rather than sending an empty string, so this does the same to avoid relying on an "ignored"
-// field being tolerated rather than rejected.
-const CLAUDE_STYLE_EVENTS_WITHOUT_MATCHER = new Set(["UserPromptSubmit"]);
+// Claude Code, Codex, Cursor, and Gemini CLI all install into a `hooks.<Event>` array of
+// `{ matcher, hooks: [{ type: "command", command }] }` entries (Claude Code's own shape, which
+// Gemini CLI's settings.json also uses verbatim per geminicli.com/docs/hooks/reference).
+// A handful of events -- UserPromptSubmit (Claude/Codex) and BeforeAgent (Gemini) among them --
+// have no matcher concept at all (they always fire); the docs' own examples omit the field there
+// entirely rather than sending an empty string, so this does the same to avoid relying on an
+// "ignored" field being tolerated rather than rejected.
+const CLAUDE_STYLE_EVENTS_WITHOUT_MATCHER = new Set(["UserPromptSubmit", "BeforeAgent"]);
 function mergeClaudeStyleHooks(event: string) {
   const supportsMatcher = !CLAUDE_STYLE_EVENTS_WITHOUT_MATCHER.has(event);
   return (existing: Obj, command: string): Obj => {
@@ -106,17 +107,6 @@ function unmergeCopilotHooks(event: string) {
   };
 }
 
-function mergeGeminiHooks(existing: Obj, command: string): Obj {
-  const hooks = obj(existing.hooks); const gate = obj(hooks["beam-security"]); const list = arr(gate.pre_tool_execution).map(obj);
-  if (!list.some(entry => arr(entry.hooks).map(obj).some(h => h.command === command))) list.push({ matcher: ".*", hooks: [{ type: "command", command, timeout: 10 }] });
-  return { ...existing, hooks: { ...hooks, "beam-security": { ...gate, pre_tool_execution: list } } };
-}
-function unmergeGeminiHooks(existing: Obj, command: string): Obj {
-  const hooks = obj(existing.hooks); const gate = obj(hooks["beam-security"]); if (!gate.pre_tool_execution) return existing;
-  const list = arr(gate.pre_tool_execution).map(obj).map(entry => ({ ...entry, hooks: arr(entry.hooks).map(obj).filter(h => h.command !== command) })).filter(entry => arr(entry.hooks).length > 0);
-  return { ...existing, hooks: { ...hooks, "beam-security": { ...gate, pre_tool_execution: list } } };
-}
-
 // Installs beam into more than one hook event (e.g. the tool-call gate *and* the prompt-submit
 // gate) by folding each single-event merger over the config in turn. A disabled agent only ever
 // reliably stops at the pre-action gate if that agent never calls a tool in a turn (pure chat) --
@@ -174,14 +164,20 @@ export const AGENTS: AgentDefinition[] = [
   },
   {
     id: "gemini", name: "Gemini CLI",
-    // settings.json only exists once hooks/other settings are configured; the bare ".gemini"
-    // directory (created by any use of the Gemini CLI, e.g. mcp_config.json, projects/) is the
-    // reliable presence signal.
-    configs: [".agents", ".agents/hooks.json", ".gemini"], artifacts: [".gemini/tmp"],
-    hookConfigPath: ".agents/hooks.json", hookEventName: "pre_tool_execution",
-    mergeHookConfig: mergeGeminiHooks, unmergeHookConfig: unmergeGeminiHooks,
+    // ".gemini/settings.json" is our own write target (circular, like Cursor/Copilot above); the
+    // bare ".gemini" directory (created by any use of the Gemini CLI, e.g. mcp_config.json,
+    // projects/) is the reliable presence signal instead.
+    configs: [".gemini"], artifacts: [".gemini/tmp"],
+    hookConfigPath: ".gemini/settings.json", hookEventName: "BeforeTool",
+    // BeforeTool/BeforeAgent use the exact same {matcher, hooks: [{type, command}]} array shape
+    // as Claude Code's PreToolUse/UserPromptSubmit (geminicli.com/docs/hooks/reference) --
+    // beam previously targeted ".agents/hooks.json" with a "pre_tool_execution" event and a
+    // "beam-security" wrapper, which is actually the unrelated Gemini API "Managed Agents"
+    // sandbox hook contract (ai.google.dev/gemini-api/docs/agent-hooks), not Gemini CLI's own.
+    mergeHookConfig: mergeAll([mergeClaudeStyleHooks("BeforeTool"), mergeClaudeStyleHooks("BeforeAgent")]),
+    unmergeHookConfig: unmergeAll([unmergeClaudeStyleHooks("BeforeTool"), unmergeClaudeStyleHooks("BeforeAgent")]),
     adapter: "gemini", verifiedPayload: true,
-    notes: "Uses the documented .agents/hooks.json pre_tool_execution contract."
+    notes: "Payload verified against geminicli.com/docs/hooks/reference: stdin is flat (session_id, cwd, hook_event_name, tool_name, tool_input, prompt), not the nested tool_call shape the \"gemini\" adapter also tolerates as a defensive fallback. Also installs BeforeAgent so a disabled agent is stopped before the prompt reaches the model, not only at its first tool call; both events accept {decision: \"deny\", reason} and both also honor exit code 2 (see client.ts's EXIT_2_FAILS_CLOSED)."
   },
   {
     id: "opencode", name: "OpenCode",

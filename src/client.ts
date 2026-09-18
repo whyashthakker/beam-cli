@@ -229,6 +229,14 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     }
     const workspace = String(data.cwd ?? "");
     const targetPath = String(toolInput.file_path ?? toolInput.path ?? data.file_path ?? "");
+    if (isBeamSelfProtectionTarget(String(data.tool_name ?? ""), command, targetPath)) {
+      decision = {
+        ...decision,
+        action: "deny",
+        rule: "beam.self-protection",
+        reason: "Beam protection cannot be disabled, removed, or modified by an agent.",
+      };
+    }
     if (decision.action === "allow" && workspace && isOutsideWorkspace(workspace, targetPath, command)) {
       decision = {
         ...decision,
@@ -273,9 +281,9 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     console.error(error instanceof Error ? error.message : String(error));
     // If a security policy exists, a hook-side failure must not become an implicit allow. The
     // vendor-specific response is still emitted where possible; exit 2 is the documented
-    // fail-closed signal for Claude/Cursor/Copilot and is also treated as failure by OpenCode's
-    // native plugin wrapper. Gemini's runtime is documented fail-open for hook failures, so its
-    // strongest available boundary is the denial JSON itself.
+    // fail-closed signal for Claude/Codex/Cursor/Copilot/Gemini (geminicli.com/docs/hooks/reference
+    // confirms exit 2 blocks both BeforeTool and BeforeAgent, same as decision: "deny") and is
+    // also treated as failure by OpenCode's native plugin wrapper.
     const policy = await readPolicy().catch(() => null);
     if (policy && (policy.rules.mode === "enforce" || policy.errors?.length)) {
       // emitDeny already sets exit code 2 for the agents where that's the documented fail-closed
@@ -313,6 +321,16 @@ function isOutsideWorkspace(cwd: string, target: string, command: string): boole
     const escaped = relative(root, path);
     return escaped === ".." || escaped.startsWith(`..${sep}`) || isAbsolute(escaped);
   });
+}
+
+function isBeamSelfProtectionTarget(tool: string, command: string, target: string): boolean {
+  const beamHome = resolve(getBeamHome());
+  const beamData = resolve(getDataDirectory());
+  const text = `${tool} ${command} ${target}`;
+  const targetPath = target ? resolve(target) : "";
+  const touchesBeamFiles = Boolean(targetPath && (targetPath === beamHome || targetPath.startsWith(`${beamHome}${sep}`) || targetPath === beamData || targetPath.startsWith(`${beamData}${sep}`))) || /(?:^|[\s"'\/])\.beam(?:[\/\s"']|$)|beam[\\/]data[\\/]policy\.json/i.test(text);
+  const stopsBeam = /\b(?:beam\s+(?:service\s+(?:stop|uninstall)|uninstall)|(?:launchctl|systemctl|pkill|killall)\b[^\n]*\bbeam\b|npm\s+(?:uninstall|remove)\b[^\n]*@?agent-beam|rm\b[^\n]*(?:\.beam|beam-cli|@agent-beam))/i.test(text);
+  return touchesBeamFiles || stopsBeam;
 }
 
 function blockedFinding(reason = "Blocked by workspace policy."): Event["findings"][number] {
@@ -373,7 +391,7 @@ function emitAllow(agent: string, reason?: string, event = "PreToolUse"): void {
 // content", separately from the exit-0 hookSpecificOutput.permissionDecision path). Setting this
 // alongside the JSON is belt-and-suspenders, not a replacement -- the JSON still carries the
 // clean reason text; exit 2 just guarantees the block itself isn't silently skipped.
-const EXIT_2_FAILS_CLOSED = new Set(["claude-code", "codex", "cursor", "copilot-cli", "opencode"]);
+const EXIT_2_FAILS_CLOSED = new Set(["claude-code", "codex", "cursor", "copilot-cli", "gemini", "opencode"]);
 
 // Claude Code / Codex hook contract: a JSON decision on stdout denies the tool call or prompt.
 // Other agents get a stderr note only (their block contracts differ and aren't verified), except
