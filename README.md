@@ -50,6 +50,7 @@ AgentBeam is not Claude-specific. Setup discovers the agents actually installed 
 | GitHub Copilot CLI | Pre-tool protection and activity capture |
 | Cursor | Pre-tool protection and activity capture |
 | OpenCode | Shim-based protection where supported |
+| Jev (TypeSafe AI) | Discovery only — config/artifact presence; ecosystem is too fragmented across third-party CLIs (`jev-cli`, `jev-axi`, `jev-guard`) for a single hook contract yet |
 
 Agent configuration is updated non-destructively, without replacing existing hooks.
 

@@ -27,6 +27,10 @@ export interface AgentDefinition {
   unmergeHookConfig: ((existing: Obj, command: string) => Obj) | null;
   /** Payload adapter id used by src/hook-adapters.ts to normalize this agent's stdin JSON. */
   adapter: "passthrough" | "copilot-camel" | "generic" | "gemini";
+  /** Whether the AGENT ITSELF (not just this entry's payload verification) is unverified — the
+   * ecosystem around it is too new or too fragmented (e.g. many competing third-party CLIs with
+   * no single canonical hook contract) to trust as a merge target yet. Detection-only. */
+  unverifiedEcosystem?: boolean;
   /** Whether the adapter above was verified against vendor documentation (vs. best-effort). */
   verifiedPayload: boolean;
   notes: string;
@@ -185,6 +189,21 @@ export const AGENTS: AgentDefinition[] = [
     hookConfigPath: null, pluginPath: ".opencode/plugins/beam.ts", hookEventName: "tool.execute.before",
     mergeHookConfig: null, unmergeHookConfig: null, adapter: "passthrough", verifiedPayload: true,
     notes: "Uses OpenCode's native tool.execute.before plugin hook."
+  },
+  {
+    id: "jev", name: "Jev (TypeSafe AI)",
+    // TypeSafe's own Jev tooling and at least half a dozen independent third-party CLIs
+    // (jev-cli, jev-axi, jev-guard, ...) each pick their own config layout, so unlike the
+    // agents above there's no single vendor-documented directory or hook contract to target.
+    // These are the paths seen across that ecosystem as of Sept 2026; treat as best-effort.
+    configs: [".config/jev", ".config/jev-axi", ".jev"], artifacts: [".config/jev-axi/stats"],
+    hookConfigPath: null, hookEventName: null,
+    mergeHookConfig: null, unmergeHookConfig: null,
+    adapter: "generic", verifiedPayload: false, unverifiedEcosystem: true,
+    notes: "Jev is TypeSafe AI's non-generative 'System One' judgment model (launched 2026-09-15), " +
+      "increasingly wired into other agents' tool-call gating (e.g. jev-guard) rather than run as " +
+      "a coding agent itself. No single vendor hook contract exists yet across the many third-party " +
+      "CLIs wrapping it, so this entry is discovery-only (config/artifact presence), not installable."
   },
 ];
 
