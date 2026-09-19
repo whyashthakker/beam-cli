@@ -120,6 +120,28 @@ async function findClaudeCodeModel(home: string, sessionId: string): Promise<str
   return "";
 }
 
+async function findClaudeCodeUsage(home: string, sessionId: string): Promise<{ input_tokens?: number; output_tokens?: number }> {
+  if (!sessionId) return {};
+  const projectsDir = join(home, ".claude", "projects");
+  let dirs: string[]; try { dirs = await readdir(projectsDir); } catch { return {}; }
+  for (const dir of dirs) {
+    let content: string; try { content = await readFile(join(projectsDir, dir, `${sessionId}.jsonl`), "utf8"); } catch { continue; }
+    const lines = content.split("\n");
+    for (let i = lines.length - 1; i >= 0 && i >= lines.length - MODEL_LOOKUP_TAIL_LINES; i--) {
+      try {
+        const row = JSON.parse(lines[i]) as Record<string, unknown>;
+        const message = row.message && typeof row.message === "object" ? row.message as Record<string, unknown> : {};
+        const usage = message.usage && typeof message.usage === "object" ? message.usage as Record<string, unknown> : {};
+        if (row.type === "assistant" && (typeof usage.input_tokens === "number" || typeof usage.output_tokens === "number")) {
+          return { input_tokens: typeof usage.input_tokens === "number" ? usage.input_tokens : undefined, output_tokens: typeof usage.output_tokens === "number" ? usage.output_tokens : undefined };
+        }
+      } catch { /* skip malformed transcript rows */ }
+    }
+    return {};
+  }
+  return {};
+}
+
 async function walkJsonlFiles(dir: string, out: string[]): Promise<void> {
   let entries;
   try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
@@ -165,6 +187,30 @@ async function findCodexModel(home: string, sessionId: string): Promise<string> 
   return "";
 }
 
+async function findCodexUsage(home: string, sessionId: string): Promise<{ input_tokens?: number; output_tokens?: number }> {
+  if (!sessionId) return {};
+  const files: { path: string; mtimeMs: number }[] = [];
+  for (const root of [join(home, ".codex", "sessions"), join(home, ".codex", "archived_sessions")]) {
+    const found: string[] = []; await walkJsonlFiles(root, found);
+    for (const path of found) { try { files.push({ path, mtimeMs: (await stat(path)).mtimeMs }); } catch { /* skip */ } }
+  }
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const { path } of files.slice(0, CODEX_MODEL_LOOKUP_MAX_FILES)) {
+    let content: string; try { content = await readFile(path, "utf8"); } catch { continue; }
+    let matchesSession = false; let usage: Record<string, unknown> | undefined;
+    for (const line of content.split("\n")) {
+      let row: Record<string, unknown>; try { row = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+      const payload = row.payload && typeof row.payload === "object" ? row.payload as Record<string, unknown> : {};
+      if (row.type === "session_meta" && (payload.session_id === sessionId || payload.id === sessionId)) matchesSession = true;
+      const info = payload.info && typeof payload.info === "object" ? payload.info as Record<string, unknown> : {};
+      const total = info.last_token_usage && typeof info.last_token_usage === "object" ? info.last_token_usage as Record<string, unknown> : undefined;
+      if (row.type === "event_msg" && payload.type === "token_count" && total) usage = total;
+    }
+    if (matchesSession && usage) return { input_tokens: typeof usage.input_tokens === "number" ? usage.input_tokens : undefined, output_tokens: typeof usage.output_tokens === "number" ? usage.output_tokens : undefined };
+  }
+  return {};
+}
+
 async function readStdin(limitBytes: number): Promise<string> {
   let input = "";
   // A hook is launched with piped stdin. Explicitly resume the stream so the
@@ -194,8 +240,17 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     if (!data.model) {
       try {
         const sessionId = String(data.session_id ?? data.sessionId ?? "");
-        if (sourceAgent === "claude-code") data.model = await findClaudeCodeModel(home, sessionId);
-        else if (sourceAgent === "codex") data.model = await findCodexModel(home, sessionId);
+        if (sourceAgent === "claude-code") {
+          data.model = await findClaudeCodeModel(home, sessionId);
+          const usage = await findClaudeCodeUsage(home, sessionId);
+          if (usage.input_tokens !== undefined) data.input_tokens = usage.input_tokens;
+          if (usage.output_tokens !== undefined) data.output_tokens = usage.output_tokens;
+        } else if (sourceAgent === "codex") {
+          data.model = await findCodexModel(home, sessionId);
+          const usage = await findCodexUsage(home, sessionId);
+          if (usage.input_tokens !== undefined) data.input_tokens = usage.input_tokens;
+          if (usage.output_tokens !== undefined) data.output_tokens = usage.output_tokens;
+        }
       } catch { /* best-effort enrichment only -- never block the hook on this */ }
     }
 
