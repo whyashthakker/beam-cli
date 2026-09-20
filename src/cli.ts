@@ -26,6 +26,7 @@ import { cyan, green } from "./color.js";
 import { runAgent } from "./run.js";
 import { AGENT_BINARIES, installShims, listShims, pathExportLine, shimDir, uninstallShims } from "./shims.js";
 import { runMcpProxy } from "./mcp-proxy.js";
+import { registerJevCommands } from "./jev-cli.js";
 
 // Lets 'BEAM_API_URL=... beam connect' style overrides live in a .env file instead of the
 // shell profile. Checked in cwd first (handy when developing from the repo), then in
@@ -60,6 +61,8 @@ const program = new Command()
   .name("beam")
   .description("Local observation and heuristic risk scanning for AI agent activity")
   .version(packageJson.version);
+
+registerJevCommands(program);
 
 program.command("setup")
   .description("One-shot onboarding: wire beam's hook into every detected agent, connect this device, and optionally start the background service")

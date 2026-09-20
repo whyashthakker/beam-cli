@@ -135,6 +135,7 @@ describe("captureHook", () => {
   // and triggers workspace forwarding / enforcement during these unit tests.
   beforeEach(async () => {
     process.env.BEAM_DATA_DIR = await tempDir("beam-hook-");
+    process.env.BEAM_HOME = process.env.BEAM_DATA_DIR;
   });
 
   function withStdin(payload: string): void {

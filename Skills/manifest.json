@@ -122,6 +122,10 @@
     {
       "name": "agent-network-segmentation",
       "group": "Deployment and operations"
+    },
+    {
+      "name": "jev-action-judge",
+      "group": "AI trust boundaries"
     }
   ],
   "agents": [
@@ -142,6 +146,7 @@
     "ai-agent-deployment-and-incident-response",
     "ai-agent-web-and-transport-security",
     "beam-security-skills-and-subagents",
-    "what-is-ai-agent-monitoring"
+    "what-is-ai-agent-monitoring",
+    "beam-cli-jev-action-judging"
   ]
 }

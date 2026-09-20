@@ -184,5 +184,6 @@ export async function runSetup(): Promise<void> {
   console.log(`  ${cyan("beam studio")}          open the activity dashboard`);
   console.log(`  ${cyan("beam service status")}  check whether the collector is running`);
   console.log(`  ${cyan("beam agent list")}      check hook status per agent`);
+  console.log(`  ${cyan("beam jev --help")}      optional remote action judging (off by default)`);
   if (shimmable.length) console.log(`  ${cyan(`beam shims install ${shimmable.map(a => a.id).join(" ")}`)}   sandbox ${shimmable.map(a => a.name).join(", ")} automatically`);
 }

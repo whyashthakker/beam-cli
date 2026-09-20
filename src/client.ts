@@ -9,6 +9,7 @@ import { evaluate, readPolicy } from "./policy.js";
 import { extractAgent } from "./extract.js";
 import { loadCustomRules } from "./custom-rules.js";
 import { redactSensitive } from "./data-detectors.js";
+import { applyJevHook } from "./jev.js";
 
 export async function readToken(): Promise<string> {
   if (process.env.BEAM_TOKEN) return process.env.BEAM_TOKEN;
@@ -224,7 +225,7 @@ async function readStdin(limitBytes: number): Promise<string> {
   return input;
 }
 
-// Never throws: a Claude Code hook must not block or fail the agent if capture fails.
+// Never throws: best-effort capture must not suppress configured policy enforcement.
 export async function captureHook(sourceAgent = "claude-code", home = homedir()): Promise<void> {
   try {
     const input = await readStdin(100_000);
@@ -299,6 +300,10 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
         reason: "This action accesses a path outside the current workspace.",
       };
     }
+
+    const jev = await applyJevHook(decision, data);
+    decision = jev.decision;
+    if (jev.judgment) process.stderr.write(`Beam Jev: ${JSON.stringify(jev.judgment)}\n`);
 
     data.policy_decision = { action: decision.action, rule: decision.rule, reason: decision.reason, risk_score: decision.riskScore, risk_level: decision.riskLevel, risk_factors: decision.riskFactors };
     const hookEvent = String(data.hook_event_name ?? "PreToolUse");
@@ -385,7 +390,7 @@ function isBeamSelfProtectionTarget(tool: string, command: string, target: strin
   const text = `${tool} ${command} ${target}`;
   const targetPath = target ? resolve(target) : "";
   const touchesBeamFiles = Boolean(targetPath && (targetPath === beamHome || targetPath.startsWith(`${beamHome}${sep}`) || targetPath === beamData || targetPath.startsWith(`${beamData}${sep}`))) || /(?:^|[\s"'\/])\.beam(?:[\/\s"']|$)|beam[\\/]data[\\/]policy\.json/i.test(text);
-  const stopsBeam = /\b(?:beam\s+(?:service\s+(?:stop|uninstall)|uninstall)|(?:launchctl|systemctl|pkill|killall)\b[^\n]*\bbeam\b|npm\s+(?:uninstall|remove)\b[^\n]*@?agent-beam|rm\b[^\n]*(?:\.beam|beam-cli|@agent-beam))/i.test(text);
+  const stopsBeam = /\b(?:beam\s+(?:service\s+(?:stop|uninstall)|jev\s+(?:configure|disable)|uninstall)|(?:launchctl|systemctl|pkill|killall)\b[^\n]*\bbeam\b|npm\s+(?:uninstall|remove)\b[^\n]*@?agent-beam|rm\b[^\n]*(?:\.beam|beam-cli|@agent-beam))/i.test(text);
   return touchesBeamFiles || stopsBeam;
 }
 
