@@ -157,18 +157,52 @@ describe("captureHook", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("maps UserPromptSubmit prompt onto command/event_type/tool_name", async () => {
+  it("maps UserPromptSubmit onto event_type/tool_name without forwarding the prompt text", async () => {
     process.env.BEAM_TOKEN = "t";
     withStdin(JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: "help me deploy" }));
     const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
       const body = JSON.parse(String(init.body));
       expect(body.event_type).toBe("prompt.submit");
       expect(body.tool_name).toBe("UserPromptSubmit");
-      expect(body.command).toBe("help me deploy");
+      expect(body.command).toBeUndefined();
+      expect(body.prompt).toBeUndefined();
+      expect(JSON.stringify(body)).not.toContain("help me deploy");
       return new Response("{}", { status: 200 });
     });
     global.fetch = fetchMock as unknown as typeof fetch;
     await captureHook("codex");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("never forwards the session id for a prompt.submit event", async () => {
+    process.env.BEAM_TOKEN = "t";
+    // Forced deny (via a matching policy) purely so /ingest actually fires here -- an allowed
+    // prompt.submit event skips ingest entirely, which would make the assertions below vacuous.
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: ["UserPromptSubmit"], blockedCommandPatterns: [], disabledAgents: [] } }));
+    withStdin(JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: "help me deploy", session_id: "s1" }));
+    const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      expect(body.session_id).toBeUndefined();
+      expect(body.sessionId).toBeUndefined();
+      expect(body.session).toBeUndefined();
+      return new Response("{}", { status: 200 });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    await captureHook();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the session id for non-prompt hook events", async () => {
+    process.env.BEAM_TOKEN = "t";
+    withStdin(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, session_id: "s1" }));
+    const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      expect(body.session_id).toBe("s1");
+      return new Response("{}", { status: 200 });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    await captureHook();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 

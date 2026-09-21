@@ -146,6 +146,16 @@ export function normalize(raw: Obj): Event {
   if (!Number.isFinite(Date.parse(timestamp))) throw new Error("Invalid event timestamp.");
   const clean = (s: string) => redact(s).slice(0, 500);
   const stableId = str(raw.event_id ?? raw.finding_id ?? raw.id);
+  // A hook's own tool_use_id (Claude Code's "toolu_...", Codex's call_id, Cursor's tool_use_id --
+  // all verified to carry this field, see agents.ts notes) identifies one physical tool call
+  // regardless of which hook config observed it. That matters when the *same* Claude Code CLI
+  // invocation is wrapped by more than one installed hook -- e.g. run from inside Cursor's own
+  // agent/IDE, which spawns Claude Code as a subprocess but also fires its own preToolUse hook for
+  // the same tool call beam already installed into .claude/settings.json. Deliberately left out of
+  // the source_agent-namespaced stableId branch below (unlike event_id/finding_id, which come from
+  // independent import sources that legitimately could reuse the same id) so both hook firings
+  // collapse into a single event instead of duplicating on the dashboard.
+  const toolUseId = str(raw.tool_use_id ?? raw.toolUseId);
   const usage = obj(raw.usage ?? raw.token_usage ?? raw.tokenUsage);
   const inputTokens = number(raw.input_tokens ?? raw.inputTokens ?? usage.input_tokens ?? usage.inputTokens ?? usage.prompt_tokens ?? usage.promptTokens);
   const outputTokens = number(raw.output_tokens ?? raw.outputTokens ?? usage.output_tokens ?? usage.outputTokens ?? usage.completion_tokens ?? usage.completionTokens);
@@ -158,14 +168,19 @@ export function normalize(raw: Obj): Event {
   const mcpServer = explicitMcpServer || (toolParts ? toolParts[1] : "");
   const mcpTool = explicitMcpTool || (toolParts ? toolParts[2] : "");
   const mcpRequestType = explicitMcpResource ? "resource" : mcpTool ? "tool" : "unknown";
+  const phase = (() => { const event = str(raw.hook_event_name).toLowerCase(); return event === "pretooluse" ? "proposed" : event === "posttooluse" ? "completed hook" : "observed"; })();
   return {
-    id: createHash("sha256").update(stableId ? `${str(raw.source_agent)}:${str(obj(raw.endpoint).hostname)}:${stableId}` : JSON.stringify(raw)).digest("hex"),
+    id: createHash("sha256").update(
+      stableId ? `${str(raw.source_agent)}:${str(obj(raw.endpoint).hostname)}:${stableId}`
+      : toolUseId ? `tool_use:${str(obj(raw.endpoint).hostname)}:${phase}:${toolUseId}`
+      : JSON.stringify(raw)
+    ).digest("hex"),
     timestamp: new Date(timestamp).toISOString(), receivedAt: new Date().toISOString(), agent: clean(str(raw.source_agent ?? raw.agent, "custom")),
     session: clean(str(raw.session_id ?? raw.sessionId ?? raw.session, "unassigned")), type: clean(type), tool: clean(tool), summary: redact(detail).slice(0, 4000),
     project: clean(str(raw.project_path ?? raw.cwd)), source: clean(str(raw.source_type, raw.hook_event_name ? "hook" : "import")),
     endpoint: clean(str(obj(raw.endpoint).hostname ?? raw.hostname, "local")), model: clean(str(raw.model)),
-    phase: (() => { const event = str(raw.hook_event_name).toLowerCase(); return event === "pretooluse" ? "proposed" : event === "posttooluse" ? "completed hook" : "observed"; })(),
-    provenance: { recordId: clean(stableId), schemaVersion: clean(str(raw.schema_version)),
+    phase,
+    provenance: { recordId: clean(stableId || toolUseId), schemaVersion: clean(str(raw.schema_version)),
       citedEventIds: Array.isArray(raw.cited_event_ids) ? raw.cited_event_ids.filter((v): v is string => typeof v === "string").slice(0, 100).map(clean) : [],
       tags: Array.isArray(raw.tags) ? raw.tags.filter((v): v is string => typeof v === "string").slice(0, 100).map(clean) : [],
       evidence: redact(JSON.stringify(raw.evidence_refs ?? raw.evidence ?? {})).slice(0, 8000) },

@@ -305,6 +305,20 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     decision = jev.decision;
     if (jev.judgment) process.stderr.write(`Beam Jev: ${JSON.stringify(jev.judgment)}\n`);
 
+    // Detection and policy enforcement above already ran against the real prompt text and
+    // session id -- neither is forwarded to the local collector or the workspace dashboard from
+    // this point on. event_type/tool_name still identify a prompt-submit event; the content and
+    // the session identifier do not leave this machine. Scoped to prompt.submit only -- deleting
+    // session_id on every event type broke session grouping (and the tool_use_id dedup in
+    // core.ts, which is keyed per-hostname/phase but not per-session) for all other hook events.
+    if (data.event_type === "prompt.submit") {
+      delete data.prompt;
+      delete data.command;
+      delete data.session_id;
+      delete data.sessionId;
+      delete data.session;
+    }
+
     data.policy_decision = { action: decision.action, rule: decision.rule, reason: decision.reason, risk_score: decision.riskScore, risk_level: decision.riskLevel, risk_factors: decision.riskFactors };
     const hookEvent = String(data.hook_event_name ?? "PreToolUse");
     let event = safeNormalize(data);
@@ -328,9 +342,14 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     // 2. Local capture (best-effort — a failure here must not skip enforcement or throw). The
     //    running collector (serve.ts) also batches this event into its own workspace forward --
     //    see ForwardQueue in forward.ts -- so most events reach the dashboard in groups rather
-    //    than one request per action.
-    try { await send("/ingest", JSON.stringify(data)); }
-    catch (e) { console.error(e instanceof Error ? e.message : String(e)); }
+    //    than one request per action. Allowed prompt.submit events are skipped here: policy
+    //    enforcement above already ran against them, but every keystroke-triggered prompt
+    //    otherwise floods the Activity/Overview views with noise nobody reviews. A blocked
+    //    prompt is still surfaced -- see step 3 below.
+    if (data.event_type !== "prompt.submit" || decision.action === "deny") {
+      try { await send("/ingest", JSON.stringify(data)); }
+      catch (e) { console.error(e instanceof Error ? e.message : String(e)); }
+    }
 
     // 3. A policy-blocked action carries a finding the collector's own normalize() can't
     //    reconstruct (it only knows about *this* process's policy decision) -- forward it to the
