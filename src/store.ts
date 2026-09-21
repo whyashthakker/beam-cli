@@ -6,6 +6,26 @@ import { approvalAuditEvent, validateApprovalRequest } from "./approvals.js";
 import type { ApprovalRequest, ApprovalDecision } from "./approvals.js";
 export type ApprovalAudit = { event: string; request_id: string; policy_id?: string; user?: string; agent: string; decision?: string; timestamp: string; reason?: string };
 
+// core.normalize()'s id already collapses two hook firings for the *same* tool call when both
+// carry an identical tool_use_id -- but a wrapping agent (e.g. Cursor's own preToolUse hook
+// firing for a tool call that also went through an installed Claude Code PreToolUse hook, because
+// both configs are present on disk even though only one agent is actually running) mints its own
+// tool_use_id rather than forwarding the inner agent's, so that id-based dedup never engages and
+// the same physical command shows up twice under two different "agent" labels. This is a second,
+// looser pass: two events from *different* agents, same phase/type/command/cwd, within a few
+// seconds of each other are almost certainly one physical action observed by two hooks, not two
+// independent runs -- so only the first-seen one is kept.
+const CROSS_AGENT_DEDUP_WINDOW_MS = 3000;
+const CROSS_AGENT_DEDUP_SCAN_WINDOW = 200;
+function isCrossAgentDuplicate(candidate: Event, pool: Event[]): boolean {
+  const t = Date.parse(candidate.timestamp);
+  if (!Number.isFinite(t)) return false;
+  return pool.some(e => e.agent !== candidate.agent
+    && e.phase === candidate.phase && e.type === candidate.type
+    && e.summary === candidate.summary && e.project === candidate.project
+    && Math.abs(Date.parse(e.timestamp) - t) <= CROSS_AGENT_DEDUP_WINDOW_MS);
+}
+
 export class Store {
   events: Event[] = [];
   scans: Scan[] = [];
@@ -61,7 +81,16 @@ export class Store {
   addEvents(rows: Event[]) {
     return this.serialized(async () => {
       const ids = new Set(this.events.map(e => e.id));
-      const fresh = rows.filter(r => { if (ids.has(r.id)) return false; ids.add(r.id); return true; });
+      // Recent tail only: a cross-agent duplicate is always close in time to its twin, and this
+      // keeps the scan cheap even once the store holds thousands of events.
+      const recentTail = this.events.slice(-CROSS_AGENT_DEDUP_SCAN_WINDOW);
+      const fresh: Event[] = [];
+      for (const r of rows) {
+        if (ids.has(r.id)) continue;
+        if (isCrossAgentDuplicate(r, recentTail) || isCrossAgentDuplicate(r, fresh)) continue;
+        ids.add(r.id);
+        fresh.push(r);
+      }
       let next = [...this.events, ...fresh].slice(-this.maxEvents);
       if (fresh.length) {
         // Re-evaluate cross-event sequence rules, but only for sessions this batch actually

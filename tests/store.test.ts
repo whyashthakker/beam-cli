@@ -74,6 +74,39 @@ describe("Store cross-event sequence detection", () => {
   });
 });
 
+describe("Store cross-agent duplicate suppression", () => {
+  it("keeps only the first event when two agents log the same command/cwd within the dedup window", async () => {
+    const store = await tempStore();
+    const cursor = makeEvent({ id: "cursor-1", agent: "cursor", timestamp: "2026-01-01T00:00:00.000Z", summary: 'echo "hello world"' });
+    const claude = makeEvent({ id: "claude-1", agent: "claude-code", timestamp: "2026-01-01T00:00:00.900Z", summary: 'echo "hello world"' });
+    const result = await store.addEvents([cursor, claude]);
+
+    expect(result.accepted).toBe(1);
+    expect(store.events).toHaveLength(1);
+    expect(store.events[0].agent).toBe("cursor");
+  });
+
+  it("keeps both events when the same agent logs the same command twice", async () => {
+    const store = await tempStore();
+    const first = makeEvent({ id: "e-a", agent: "cursor", timestamp: "2026-01-01T00:00:00.000Z", summary: 'echo "hello world"' });
+    const second = makeEvent({ id: "e-b", agent: "cursor", timestamp: "2026-01-01T00:00:00.900Z", summary: 'echo "hello world"' });
+    const result = await store.addEvents([first, second]);
+
+    expect(result.accepted).toBe(2);
+    expect(store.events).toHaveLength(2);
+  });
+
+  it("keeps both events when two agents log the same command far apart in time", async () => {
+    const store = await tempStore();
+    const cursor = makeEvent({ id: "cursor-2", agent: "cursor", timestamp: "2026-01-01T00:00:00.000Z", summary: 'echo "hello world"' });
+    const claude = makeEvent({ id: "claude-2", agent: "claude-code", timestamp: "2026-01-01T00:00:10.000Z", summary: 'echo "hello world"' });
+    const result = await store.addEvents([cursor, claude]);
+
+    expect(result.accepted).toBe(2);
+    expect(store.events).toHaveLength(2);
+  });
+});
+
 describe("Store approval persistence", () => {
   it("persists approval requests, lifecycle changes, and audit records", async () => {
     const store = await tempStore();

@@ -1,6 +1,6 @@
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { getDataDirectory, getTelemetryUrl } from "./config.js";
+import { getDataDirectory } from "./config.js";
 import { lastGoodPolicyPath } from "./policy.js";
 import { readIdentity } from "./enroll.js";
 import type { Event, Scan } from "./core.js";
@@ -10,12 +10,17 @@ function policyPath(): string {
   return join(getDataDirectory(), "policy.json");
 }
 
-// Fire-and-forget: forwarding to the workspace must never block or fail the agent.
+// Fire-and-forget: forwarding to the workspace must never block or fail the agent. Like every
+// other identity-authenticated call in this file, this must hit the *enrolled* device's own
+// identity.apiBase -- not a separately configured URL -- otherwise a device enrolled against a
+// non-default workspace API (self-hosted, staging, a local dev dashboard) silently forwards
+// events to the wrong place while `beam whoami`/`beam account` and policy sync (which do use
+// identity.apiBase) keep reporting the device as enrolled and healthy.
 export async function forwardEvents(events: Event | Event[]): Promise<void> {
   const identity = await readIdentity();
   if (!identity) return;
   try {
-    await fetch(`${getTelemetryUrl()}/v1/ingest`, {
+    await fetch(`${identity.apiBase}/v1/ingest`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -34,7 +39,7 @@ export async function forwardMcpInventory(servers: McpInventory[]): Promise<bool
   const identity = await readIdentity();
   if (!identity) return false;
   try {
-    const response = await fetch(`${getTelemetryUrl()}/v1/mcp/inventory`, {
+    const response = await fetch(`${identity.apiBase}/v1/mcp/inventory`, {
       method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${identity.deviceSecret}` },
       body: JSON.stringify({ servers }), signal: AbortSignal.timeout(5000),
     });
