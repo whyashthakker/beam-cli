@@ -54,8 +54,12 @@ export async function createCollector(options: { directory: string; token: strin
         const supported = records.filter(r => !r.record_type || ["event", "finding"].includes(String(r.record_type)));
         const normalized = supported.map(normalize);
         const result = await store.addEvents(normalized);
-        forwardQueue.push(normalized);
-        return json(url.pathname === "/v1/logs" ? {} : { ...result, skipped: records.length - supported.length });
+        // Forward what the store actually kept, not the raw input batch -- addEvents() already
+        // drops cross-agent duplicates (see store.ts's findCrossAgentDuplicate) and, when needed,
+        // relabels an already-forwarded duplicate's agent; forwarding the unfiltered batch here
+        // would undo that and send every duplicate straight to the workspace dashboard anyway.
+        forwardQueue.push([...result.events, ...result.relabeled]);
+        return json(url.pathname === "/v1/logs" ? {} : { accepted: result.accepted, duplicates: result.duplicates, skipped: records.length - supported.length });
       }
       const data = JSON.parse(body);
       if (url.pathname === "/scan") {

@@ -86,6 +86,31 @@ describe("Store cross-agent duplicate suppression", () => {
     expect(store.events[0].agent).toBe("cursor");
   });
 
+  it("relabels a same-id duplicate (already collapsed upstream by tool_use_id) to the specific agent", async () => {
+    const store = await tempStore();
+    const claude = makeEvent({ id: "shared-id", agent: "claude-code", timestamp: "2026-01-01T00:00:00.000Z", summary: 'echo "hello world"' });
+    const cursor = makeEvent({ id: "shared-id", agent: "cursor", timestamp: "2026-01-01T00:00:00.900Z", summary: 'echo "hello world"' });
+    const result = await store.addEvents([claude, cursor]);
+
+    expect(result.accepted).toBe(1);
+    expect(store.events).toHaveLength(1);
+    expect(store.events[0].agent).toBe("cursor");
+  });
+
+  it("relabels a same-id duplicate that was already persisted in an earlier addEvents call", async () => {
+    const store = await tempStore();
+    const claude = makeEvent({ id: "shared-id-2", agent: "claude-code", timestamp: "2026-01-01T00:00:00.000Z", summary: 'echo "hello world"' });
+    await store.addEvents([claude]);
+    const cursor = makeEvent({ id: "shared-id-2", agent: "cursor", timestamp: "2026-01-01T00:00:00.900Z", summary: 'echo "hello world"' });
+    const result = await store.addEvents([cursor]);
+
+    expect(result.accepted).toBe(0);
+    expect(result.relabeled).toHaveLength(1);
+    expect(result.relabeled[0].agent).toBe("cursor");
+    expect(store.events).toHaveLength(1);
+    expect(store.events[0].agent).toBe("cursor");
+  });
+
   it("keeps both events when the same agent logs the same command twice", async () => {
     const store = await tempStore();
     const first = makeEvent({ id: "e-a", agent: "cursor", timestamp: "2026-01-01T00:00:00.000Z", summary: 'echo "hello world"' });
@@ -94,6 +119,33 @@ describe("Store cross-agent duplicate suppression", () => {
 
     expect(result.accepted).toBe(2);
     expect(store.events).toHaveLength(2);
+  });
+
+  it("relabels the surviving event to the specific agent when the generic claude-code echo arrives first", async () => {
+    const store = await tempStore();
+    const claude = makeEvent({ id: "claude-3", agent: "claude-code", timestamp: "2026-01-01T00:00:00.000Z", summary: 'echo "hello world"' });
+    const cursor = makeEvent({ id: "cursor-3", agent: "cursor", timestamp: "2026-01-01T00:00:00.900Z", summary: 'echo "hello world"' });
+    const result = await store.addEvents([claude, cursor]);
+
+    expect(result.accepted).toBe(1);
+    expect(store.events).toHaveLength(1);
+    expect(store.events[0].agent).toBe("cursor");
+    expect(store.events[0].id).toBe("claude-3");
+  });
+
+  it("relabels a duplicate that was already persisted in an earlier addEvents call", async () => {
+    const store = await tempStore();
+    const claude = makeEvent({ id: "claude-4", agent: "claude-code", timestamp: "2026-01-01T00:00:00.000Z", summary: 'echo "hello world"' });
+    await store.addEvents([claude]);
+    const cursor = makeEvent({ id: "cursor-4", agent: "cursor", timestamp: "2026-01-01T00:00:00.900Z", summary: 'echo "hello world"' });
+    const result = await store.addEvents([cursor]);
+
+    expect(result.accepted).toBe(0);
+    expect(result.relabeled).toHaveLength(1);
+    expect(result.relabeled[0].id).toBe("claude-4");
+    expect(result.relabeled[0].agent).toBe("cursor");
+    expect(store.events).toHaveLength(1);
+    expect(store.events[0].agent).toBe("cursor");
   });
 
   it("keeps both events when two agents log the same command far apart in time", async () => {
