@@ -258,6 +258,151 @@ describe("captureHook", () => {
     expect(captured?.model).toBe("gpt-5-codex");
   });
 
+  it("backfills token usage for codex from the transcript_path the hook payload points at, even when it doesn't match ~/.codex/sessions by mtime", async () => {
+    process.env.BEAM_TOKEN = "t";
+    const home = await tempDir("beam-hook-codex-usage-home-");
+    // Deliberately outside the usual sessions/archived_sessions scan roots findCodexUsage()
+    // also supports, so this only passes if transcript_path itself is being used.
+    const transcriptPath = path.join(home, ".codex", "sessions", "elsewhere", "rollout-x.jsonl");
+    await writeJsonl(transcriptPath, [
+      { type: "session_meta", payload: { session_id: "thr_2", cwd: "/workspace" } },
+      { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 111, output_tokens: 22 } } } },
+    ]);
+    withStdin(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, session_id: "thr_2", transcript_path: transcriptPath }));
+    let captured: Record<string, unknown> | undefined;
+    const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
+      captured = JSON.parse(String(init.body));
+      return new Response("{}", { status: 200 });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    await captureHook("codex", home);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(captured?.input_tokens).toBe(111);
+    expect(captured?.output_tokens).toBe(22);
+  });
+
+  it("still backfills token usage for codex when the hook payload already includes model", async () => {
+    // Codex 0.155.1+ sends `model` as a common field on every hook event (not just when it was
+    // previously unset) -- token backfill must not be silently skipped just because model backfill
+    // was already unnecessary.
+    process.env.BEAM_TOKEN = "t";
+    const home = await tempDir("beam-hook-codex-model-and-usage-home-");
+    const transcriptPath = path.join(home, ".codex", "sessions", "rollout-y.jsonl");
+    await writeJsonl(transcriptPath, [
+      { type: "session_meta", payload: { session_id: "thr_4", cwd: "/workspace" } },
+      { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 777, output_tokens: 88 } } } },
+    ]);
+    withStdin(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, session_id: "thr_4", model: "gpt-5-codex", transcript_path: transcriptPath }));
+    let captured: Record<string, unknown> | undefined;
+    const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
+      captured = JSON.parse(String(init.body));
+      return new Response("{}", { status: 200 });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    await captureHook("codex", home);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(captured?.model).toBe("gpt-5-codex");
+    expect(captured?.input_tokens).toBe(777);
+    expect(captured?.output_tokens).toBe(88);
+  });
+
+  it("ignores a transcript_path outside ~/.codex and falls back to the mtime scan", async () => {
+    process.env.BEAM_TOKEN = "t";
+    const home = await tempDir("beam-hook-codex-usage-fallback-home-");
+    await writeJsonl(path.join(home, ".codex", "sessions", "rollout-1.jsonl"), [
+      { type: "session_meta", payload: { session_id: "thr_3", cwd: "/workspace" } },
+      { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 5, output_tokens: 6 } } } },
+    ]);
+    const outsideHome = await tempDir("beam-outside-codex-home-");
+    const maliciousPath = path.join(outsideHome, "not-a-real-transcript.jsonl");
+    await writeJsonl(maliciousPath, [
+      { type: "session_meta", payload: { session_id: "thr_3" } },
+      { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 999, output_tokens: 999 } } } },
+    ]);
+    withStdin(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, session_id: "thr_3", transcript_path: maliciousPath }));
+    let captured: Record<string, unknown> | undefined;
+    const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
+      captured = JSON.parse(String(init.body));
+      return new Response("{}", { status: 200 });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    await captureHook("codex", home);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(captured?.input_tokens).toBe(5);
+    expect(captured?.output_tokens).toBe(6);
+  });
+
+  it("does not double-count codex tokens when two tool calls fire before the next token_count event is written", async () => {
+    // A single Codex turn that makes several tool calls fires PreToolUse once per call; if none
+    // of them wait for a fresh token_count event, they'd all read the same total and each
+    // separately report it as new usage without the cursor.
+    process.env.BEAM_TOKEN = "t";
+    const home = await tempDir("beam-hook-codex-usage-dedup-home-");
+    const transcriptPath = path.join(home, ".codex", "sessions", "rollout-dedup.jsonl");
+    await writeJsonl(transcriptPath, [
+      { type: "session_meta", payload: { session_id: "thr_5", cwd: "/workspace" } },
+      { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 100, output_tokens: 40 } } } },
+    ]);
+    const captures: (Record<string, unknown> | undefined)[] = [];
+    const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
+      captures.push(JSON.parse(String(init.body)));
+      return new Response("{}", { status: 200 });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    withStdin(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, session_id: "thr_5", transcript_path: transcriptPath }));
+    await captureHook("codex", home);
+    withStdin(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "pwd" }, session_id: "thr_5", transcript_path: transcriptPath }));
+    await captureHook("codex", home);
+
+    expect(captures[0]?.input_tokens).toBe(100);
+    expect(captures[0]?.output_tokens).toBe(40);
+    expect(captures[1]?.input_tokens).toBeUndefined();
+    expect(captures[1]?.output_tokens).toBeUndefined();
+
+    // A third tool call after Codex writes the *next* token_count event should report only the
+    // new increment, not the full cumulative total again.
+    await writeJsonl(transcriptPath, [
+      { type: "session_meta", payload: { session_id: "thr_5", cwd: "/workspace" } },
+      { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 100, output_tokens: 40 } } } },
+      { type: "event_msg", payload: { type: "token_count", info: { total_token_usage: { input_tokens: 150, output_tokens: 60 } } } },
+    ]);
+    withStdin(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "whoami" }, session_id: "thr_5", transcript_path: transcriptPath }));
+    await captureHook("codex", home);
+    expect(captures[2]?.input_tokens).toBe(50);
+    expect(captures[2]?.output_tokens).toBe(20);
+  });
+
+  it("does not double-count claude-code tokens when one turn requests two tool calls", async () => {
+    // Claude Code logs one JSONL row per streamed content block, so a single assistant turn that
+    // requests two tool calls appears as two "assistant" rows sharing one message.id, both
+    // carrying that same turn's full usage -- only the hook for the first tool_use block should
+    // report it.
+    process.env.BEAM_TOKEN = "t";
+    const home = await tempDir("beam-hook-claude-usage-dedup-home-");
+    const usage = { input_tokens: 200, output_tokens: 50 };
+    await writeJsonl(path.join(home, ".claude", "projects", "p", "s.jsonl"), [
+      { type: "assistant", session_id: "s", cwd: "/repo", timestamp: "2026-01-01T00:00:00.000Z", message: { id: "msg_1", model: "claude-sonnet-5", usage, content: [{ type: "tool_use", id: "call-1", name: "Bash", input: { command: "ls" } }] } },
+      { type: "assistant", session_id: "s", cwd: "/repo", timestamp: "2026-01-01T00:00:00.100Z", message: { id: "msg_1", model: "claude-sonnet-5", usage, content: [{ type: "tool_use", id: "call-2", name: "Bash", input: { command: "pwd" } }] } },
+    ]);
+    const captures: (Record<string, unknown> | undefined)[] = [];
+    const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
+      captures.push(JSON.parse(String(init.body)));
+      return new Response("{}", { status: 200 });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    withStdin(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, session_id: "s", tool_use_id: "call-1" }));
+    await captureHook("claude-code", home);
+    withStdin(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "pwd" }, session_id: "s", tool_use_id: "call-2" }));
+    await captureHook("claude-code", home);
+
+    expect(captures[0]?.input_tokens).toBe(200);
+    expect(captures[0]?.output_tokens).toBe(50);
+    expect(captures[1]?.input_tokens).toBeUndefined();
+    expect(captures[1]?.output_tokens).toBeUndefined();
+  });
+
   it("does not overwrite a model the agent's own hook payload already provided", async () => {
     process.env.BEAM_TOKEN = "t";
     const home = await tempDir("beam-hook-cursor-home-");

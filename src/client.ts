@@ -1,4 +1,4 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getBeamHome, getCollectorUrl, getDataDirectory } from "./config.js";
@@ -121,24 +121,67 @@ async function findClaudeCodeModel(home: string, sessionId: string): Promise<str
   return "";
 }
 
-async function findClaudeCodeUsage(home: string, sessionId: string): Promise<{ input_tokens?: number; output_tokens?: number }> {
+// Claude Code logs one JSONL row per streamed content block, not one row per API response -- a
+// single assistant turn that requests N tool calls (each firing its own PreToolUse hook) shows up
+// as N separate "assistant" rows sharing one message.id, and every one of them repeats that same
+// turn's full usage. Naively taking "whatever usage is in the most recent row" for every one of
+// those N hook firings sums the same tokens N times. usage-cursor.json remembers the last
+// message id already attributed per session so only the first hook firing for a given turn
+// reports its usage; the rest correctly report nothing new.
+type UsageCursorFile = {
+  claude?: Record<string, string>;
+  codex?: Record<string, { input_tokens: number; output_tokens: number }>;
+};
+
+async function loadUsageCursor(): Promise<UsageCursorFile> {
+  try { return JSON.parse(await readFile(join(getDataDirectory(), "usage-cursor.json"), "utf8")) as UsageCursorFile; }
+  catch { return {}; }
+}
+
+async function saveUsageCursor(cursor: UsageCursorFile): Promise<void> {
+  try {
+    const dir = getDataDirectory();
+    await mkdir(dir, { recursive: true });
+    const target = join(dir, "usage-cursor.json");
+    const temp = `${target}.${process.pid}.tmp`;
+    await writeFile(temp, JSON.stringify(cursor));
+    await rename(temp, target);
+  } catch { /* best-effort enrichment only */ }
+}
+
+async function findClaudeCodeUsage(home: string, sessionId: string, toolUseId: string | undefined, cursor: UsageCursorFile): Promise<{ input_tokens?: number; output_tokens?: number }> {
   if (!sessionId) return {};
   const projectsDir = join(home, ".claude", "projects");
   let dirs: string[]; try { dirs = await readdir(projectsDir); } catch { return {}; }
   for (const dir of dirs) {
     let content: string; try { content = await readFile(join(projectsDir, dir, `${sessionId}.jsonl`), "utf8"); } catch { continue; }
     const lines = content.split("\n");
-    for (let i = lines.length - 1; i >= 0 && i >= lines.length - MODEL_LOOKUP_TAIL_LINES; i--) {
+    const start = Math.max(0, lines.length - MODEL_LOOKUP_TAIL_LINES);
+    let matched: { messageId: string; usage: Record<string, unknown> } | undefined;
+    for (let i = lines.length - 1; i >= start; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
       try {
-        const row = JSON.parse(lines[i]) as Record<string, unknown>;
+        const row = JSON.parse(line) as Record<string, unknown>;
+        if (row.type !== "assistant") continue;
         const message = row.message && typeof row.message === "object" ? row.message as Record<string, unknown> : {};
-        const usage = message.usage && typeof message.usage === "object" ? message.usage as Record<string, unknown> : {};
-        if (row.type === "assistant" && (typeof usage.input_tokens === "number" || typeof usage.output_tokens === "number")) {
-          return { input_tokens: typeof usage.input_tokens === "number" ? usage.input_tokens : undefined, output_tokens: typeof usage.output_tokens === "number" ? usage.output_tokens : undefined };
+        const messageId = typeof message.id === "string" ? message.id : undefined;
+        const usage = message.usage && typeof message.usage === "object" ? message.usage as Record<string, unknown> : undefined;
+        if (!messageId || !usage || (typeof usage.input_tokens !== "number" && typeof usage.output_tokens !== "number")) continue;
+        // A PreToolUse hook can match this row to its own tool_use_id -- pin to that exact row
+        // rather than "whichever assistant row happens to be last" once one is available.
+        if (toolUseId) {
+          const blocks = Array.isArray(message.content) ? message.content as Record<string, unknown>[] : [];
+          if (!blocks.some(b => b && b.type === "tool_use" && b.id === toolUseId)) continue;
         }
+        matched = { messageId, usage };
+        break;
       } catch { /* skip malformed transcript rows */ }
     }
-    return {};
+    if (!matched) return {};
+    if (cursor.claude?.[sessionId] === matched.messageId) return {}; // already attributed by an earlier tool call in this same turn
+    cursor.claude = { ...cursor.claude, [sessionId]: matched.messageId };
+    return { input_tokens: typeof matched.usage.input_tokens === "number" ? matched.usage.input_tokens : undefined, output_tokens: typeof matched.usage.output_tokens === "number" ? matched.usage.output_tokens : undefined };
   }
   return {};
 }
@@ -188,28 +231,65 @@ async function findCodexModel(home: string, sessionId: string): Promise<string> 
   return "";
 }
 
-async function findCodexUsage(home: string, sessionId: string): Promise<{ input_tokens?: number; output_tokens?: number }> {
-  if (!sessionId) return {};
-  const files: { path: string; mtimeMs: number }[] = [];
-  for (const root of [join(home, ".codex", "sessions"), join(home, ".codex", "archived_sessions")]) {
-    const found: string[] = []; await walkJsonlFiles(root, found);
-    for (const path of found) { try { files.push({ path, mtimeMs: (await stat(path)).mtimeMs }); } catch { /* skip */ } }
-  }
-  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  for (const { path } of files.slice(0, CODEX_MODEL_LOOKUP_MAX_FILES)) {
-    let content: string; try { content = await readFile(path, "utf8"); } catch { continue; }
-    let matchesSession = false; let usage: Record<string, unknown> | undefined;
-    for (const line of content.split("\n")) {
-      let row: Record<string, unknown>; try { row = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
-      const payload = row.payload && typeof row.payload === "object" ? row.payload as Record<string, unknown> : {};
-      if (row.type === "session_meta" && (payload.session_id === sessionId || payload.id === sessionId)) matchesSession = true;
-      const info = payload.info && typeof payload.info === "object" ? payload.info as Record<string, unknown> : {};
-      const total = info.last_token_usage && typeof info.last_token_usage === "object" ? info.last_token_usage as Record<string, unknown> : undefined;
-      if (row.type === "event_msg" && payload.type === "token_count" && total) usage = total;
+// Codex's own "last_token_usage" is a per-turn delta, but a turn that makes several tool calls
+// (each firing its own PreToolUse hook) can have 2+ hooks fire before Codex writes the *next*
+// token_count event -- every one of those hooks would then read the exact same delta and
+// double-count it. total_token_usage is cumulative for the whole session instead, so subtracting
+// the amount usage-cursor.json already attributed for this session yields the real, un-double-
+// counted increment, and reading it twice before it changes correctly yields a zero delta.
+function totalTokenUsageFromTokenCountLines(content: string, requireSessionId?: string): { matchesSession: boolean; total?: { input_tokens: number; output_tokens: number } } {
+  let matchesSession = !requireSessionId;
+  let total: { input_tokens: number; output_tokens: number } | undefined;
+  for (const line of content.split("\n")) {
+    let row: Record<string, unknown>; try { row = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+    const payload = row.payload && typeof row.payload === "object" ? row.payload as Record<string, unknown> : {};
+    if (requireSessionId && row.type === "session_meta" && (payload.session_id === requireSessionId || payload.id === requireSessionId)) matchesSession = true;
+    const info = payload.info && typeof payload.info === "object" ? payload.info as Record<string, unknown> : {};
+    const totalUsage = info.total_token_usage && typeof info.total_token_usage === "object" ? info.total_token_usage as Record<string, unknown> : undefined;
+    if (row.type === "event_msg" && payload.type === "token_count" && totalUsage
+      && typeof totalUsage.input_tokens === "number" && typeof totalUsage.output_tokens === "number") {
+      total = { input_tokens: totalUsage.input_tokens, output_tokens: totalUsage.output_tokens };
     }
-    if (matchesSession && usage) return { input_tokens: typeof usage.input_tokens === "number" ? usage.input_tokens : undefined, output_tokens: typeof usage.output_tokens === "number" ? usage.output_tokens : undefined };
   }
-  return {};
+  return { matchesSession, total };
+}
+
+async function findCodexUsage(home: string, sessionId: string, transcriptPath: string | undefined, cursor: UsageCursorFile): Promise<{ input_tokens?: number; output_tokens?: number }> {
+  // Every Codex hook payload carries transcript_path pointing at exactly this session's rollout
+  // file (learn.chatgpt.com/docs/hooks) -- reading that directly is both simpler and more
+  // reliable than guessing which of the most-recently-modified files under ~/.codex/sessions
+  // belongs to this session. Still constrained to ~/.codex, since the path rides in untrusted
+  // hook input. Falls back to the mtime-scan below when a payload doesn't carry it (older Codex
+  // builds, or tests).
+  let total: { input_tokens: number; output_tokens: number } | undefined;
+  if (transcriptPath) {
+    const root = resolve(join(home, ".codex"));
+    const resolved = resolve(transcriptPath);
+    if (resolved === root || resolved.startsWith(`${root}${sep}`)) {
+      let content: string | undefined; try { content = await readFile(resolved, "utf8"); } catch { /* fall through to scan */ }
+      if (content !== undefined) total = totalTokenUsageFromTokenCountLines(content).total;
+    }
+  }
+  if (!total && sessionId) {
+    const files: { path: string; mtimeMs: number }[] = [];
+    for (const root of [join(home, ".codex", "sessions"), join(home, ".codex", "archived_sessions")]) {
+      const found: string[] = []; await walkJsonlFiles(root, found);
+      for (const path of found) { try { files.push({ path, mtimeMs: (await stat(path)).mtimeMs }); } catch { /* skip */ } }
+    }
+    files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const { path } of files.slice(0, CODEX_MODEL_LOOKUP_MAX_FILES)) {
+      let content: string; try { content = await readFile(path, "utf8"); } catch { continue; }
+      const { matchesSession, total: found } = totalTokenUsageFromTokenCountLines(content, sessionId);
+      if (matchesSession && found) { total = found; break; }
+    }
+  }
+  if (!total || !sessionId) return {};
+  const prev = cursor.codex?.[sessionId] ?? { input_tokens: 0, output_tokens: 0 };
+  const deltaInput = Math.max(0, total.input_tokens - prev.input_tokens);
+  const deltaOutput = Math.max(0, total.output_tokens - prev.output_tokens);
+  cursor.codex = { ...cursor.codex, [sessionId]: total };
+  if (deltaInput === 0 && deltaOutput === 0) return {};
+  return { input_tokens: deltaInput, output_tokens: deltaOutput };
 }
 
 async function readStdin(limitBytes: number): Promise<string> {
@@ -238,20 +318,34 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
       data.tool_name = data.tool_name ?? "UserPromptSubmit";
       data.command = data.command ?? data.prompt;
     }
-    if (!data.model) {
+    // Model and token-usage backfill are independent: a newer agent build (Codex 0.155.1+ sends
+    // `model` as a common field on every hook event -- see learn.chatgpt.com/docs/hooks) can
+    // already provide data.model while still never sending input_tokens/output_tokens. Gating
+    // both lookups on `!data.model` together meant that once an agent started self-reporting its
+    // model, this silently stopped backfilling tokens too -- each needs its own guard.
+    if (!data.model || (data.input_tokens === undefined && data.output_tokens === undefined)) {
       try {
         const sessionId = String(data.session_id ?? data.sessionId ?? "");
+        const needsUsage = data.input_tokens === undefined && data.output_tokens === undefined;
+        const cursor = needsUsage ? await loadUsageCursor() : undefined;
         if (sourceAgent === "claude-code") {
-          data.model = await findClaudeCodeModel(home, sessionId);
-          const usage = await findClaudeCodeUsage(home, sessionId);
-          if (usage.input_tokens !== undefined) data.input_tokens = usage.input_tokens;
-          if (usage.output_tokens !== undefined) data.output_tokens = usage.output_tokens;
+          if (!data.model) data.model = await findClaudeCodeModel(home, sessionId);
+          if (cursor) {
+            const toolUseId = typeof data.tool_use_id === "string" ? data.tool_use_id : undefined;
+            const usage = await findClaudeCodeUsage(home, sessionId, toolUseId, cursor);
+            if (usage.input_tokens !== undefined) data.input_tokens = usage.input_tokens;
+            if (usage.output_tokens !== undefined) data.output_tokens = usage.output_tokens;
+          }
         } else if (sourceAgent === "codex") {
-          data.model = await findCodexModel(home, sessionId);
-          const usage = await findCodexUsage(home, sessionId);
-          if (usage.input_tokens !== undefined) data.input_tokens = usage.input_tokens;
-          if (usage.output_tokens !== undefined) data.output_tokens = usage.output_tokens;
+          if (!data.model) data.model = await findCodexModel(home, sessionId);
+          if (cursor) {
+            const transcriptPath = typeof data.transcript_path === "string" ? data.transcript_path : undefined;
+            const usage = await findCodexUsage(home, sessionId, transcriptPath, cursor);
+            if (usage.input_tokens !== undefined) data.input_tokens = usage.input_tokens;
+            if (usage.output_tokens !== undefined) data.output_tokens = usage.output_tokens;
+          }
         }
+        if (cursor) await saveUsageCursor(cursor);
       } catch { /* best-effort enrichment only -- never block the hook on this */ }
     }
 
