@@ -159,6 +159,10 @@ describe("captureHook", () => {
 
   it("maps UserPromptSubmit onto event_type/tool_name without forwarding the prompt text", async () => {
     process.env.BEAM_TOKEN = "t";
+    // Forced deny (via a matching policy) purely so /ingest actually fires here -- an allowed
+    // prompt.submit event skips ingest entirely, which would make the assertions below vacuous.
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: ["UserPromptSubmit"], blockedCommandPatterns: [], disabledAgents: [] } }));
     withStdin(JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: "help me deploy" }));
     const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
       const body = JSON.parse(String(init.body));
