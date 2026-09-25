@@ -6,7 +6,7 @@ import type { ApprovalPolicy } from "./approvals.js";
 
 export type PolicyMode = "observe" | "advisory" | "enforce";
 export type PolicyAction = "ALLOW" | "ASK" | "BLOCK" | "REDACT" | "AUDIT";
-export interface PolicyRule { id: string; title?: string; action: PolicyAction; risk?: number; tool?: string; command?: string; args?: string[]; path?: string; url?: string; role?: string; user?: string; agent?: string; cwd?: string; repository?: string; branch?: string; environment?: string; time?: { after?: string; before?: string }; reason?: string; approval?: ApprovalPolicy }
+export interface PolicyRule { id: string; title?: string; action: PolicyAction; risk?: number; tool?: string; command?: string; commandLine?: string; args?: string[]; path?: string; url?: string; role?: string; user?: string; agent?: string; cwd?: string; repository?: string; branch?: string; environment?: string; time?: { after?: string; before?: string }; reason?: string; approval?: ApprovalPolicy }
 export interface PolicyRules { mode: PolicyMode; blockedTools: string[]; blockedCommandPatterns: string[]; disabledAgents: string[]; rules?: PolicyRule[]; risk?: { askAt?: number; blockAt?: number }; customDetectors?: CustomDetector[] }
 export interface PolicyBundle { version: number; rules: PolicyRules; notAfter: string | null; errors?: string[] }
 const EMPTY: PolicyRules = { mode: "observe", blockedTools: [], blockedCommandPatterns: [], disabledAgents: [], rules: [], customDetectors: [] };
@@ -59,6 +59,7 @@ function matches(r: PolicyRule, c: ActionContext & { riskScore: number }): boole
   if (!same(r.role, c.role) || !same(r.user, c.user) || !same(r.agent, c.agent) || !same(r.repository, c.repository) || !same(r.branch, c.branch) || !same(r.environment, c.environment)) return false;
   if (r.cwd && !glob(r.cwd, c.cwd ?? "")) return false;
   if (r.command && !glob(r.command, c.command.split(/\s+/)[0] ?? "")) return false;
+  if (r.commandLine && !glob(r.commandLine, c.command)) return false;
   if (r.path && !glob(r.path, c.path ?? "")) return false;
   if (r.url && !glob(r.url, c.url ?? "")) return false;
   if (r.args && r.args.some((a, i) => !glob(a, c.args?.[i] ?? ""))) return false;
@@ -66,7 +67,7 @@ function matches(r: PolicyRule, c: ActionContext & { riskScore: number }): boole
   if (r.time && c.time) { const t = c.time.slice(11, 16); if (r.time.after && t < r.time.after || r.time.before && t > r.time.before) return false; }
   return true;
 }
-function specificity(r: PolicyRule): number { return [r.tool, r.command, r.args?.length, r.path, r.url, r.role, r.user, r.agent, r.cwd, r.repository, r.branch, r.environment, r.time].filter(Boolean).length; }
+function specificity(r: PolicyRule): number { return [r.tool, r.command, r.commandLine, r.args?.length, r.path, r.url, r.role, r.user, r.agent, r.cwd, r.repository, r.branch, r.environment, r.time].filter(Boolean).length; }
 
 export function evaluate(bundle: PolicyBundle | null, ctx: ActionContext): Decision {
   const info = riskInfo(ctx); const score = info.score; const base = { mode: bundle?.rules.mode ?? "observe", policyVersion: bundle?.version ?? 0, riskScore: score, riskLevel: info.level, riskFactors: info.factors, customDetectors: bundle?.rules.customDetectors ?? [], actor: ctx.user, role: ctx.role, agent: ctx.agent, tool: ctx.tool, command: ctx.command, args: ctx.args, resource: ctx.path ?? ctx.url, errors: bundle?.errors };
@@ -84,9 +85,15 @@ export function evaluate(bundle: PolicyBundle | null, ctx: ActionContext): Decis
   const reason = selected?.reason ?? (action === "BLOCK" ? `Risk score ${score} exceeds the block threshold.` : action === "ASK" ? `Risk score ${score} requires approval.` : action === "REDACT" ? "Sensitive data must be transformed before this action." : undefined);
   // An explicit ASK rule is an approval gate in every non-observe policy mode. Advisory
   // changes the default posture for unmatched/risk-threshold actions, but must not downgrade
-  // a manager's explicit request for approval into a stderr-only warning.
+  // a manager's explicit request for approval into a stderr-only warning. A pinned-command BLOCK
+  // rule (commandLine set -- exclusively what the risk panel's "Block" quick action writes, see
+  // dashboard lib/policy.ts) gets the same treatment: it's a deliberate decision on one exact
+  // command the UI promised would be refused outright, not a risk-threshold guess, so advisory
+  // mode must not soften it into an "ask" prompt either. A broader BLOCK -- a legacy blocked
+  // tool/pattern/agent, or a structured rule matched by tool/path/etc without commandLine --
+  // still follows the mode's default posture, same as before.
   const mapped: DecisionAction = action === "BLOCK"
-    ? (bundle.rules.mode === "enforce" ? "deny" : bundle.rules.mode === "advisory" ? "ask" : "warn")
+    ? (selected?.commandLine ? "deny" : bundle.rules.mode === "enforce" ? "deny" : bundle.rules.mode === "advisory" ? "ask" : "warn")
     : action.toLowerCase() as DecisionAction;
   return { ...base, action: mapped, reason, policy: "local policy", rule: selected?.id, approval: selected?.approval };
 }
