@@ -5,11 +5,14 @@ import { getBeamHome, getCollectorUrl, getDataDirectory } from "./config.js";
 import { normalize, scanText, type Event, type Scan } from "./core.js";
 import { adaptHookPayload } from "./hook-adapters.js";
 import { forwardEvents } from "./forward.js";
-import { evaluate, readPolicy } from "./policy.js";
+import { evaluate, readPolicy, type Decision } from "./policy.js";
 import { extractAgent } from "./extract.js";
 import { loadCustomRules } from "./custom-rules.js";
 import { redactSensitive } from "./data-detectors.js";
 import { applyJevHook } from "./jev.js";
+import { isPathTrusted, readTrustedPaths } from "./trusted-paths.js";
+import { addBlockedTarget, isTargetBlocked, readBlockedTargets } from "./blocked-targets.js";
+import { promptTty } from "./tty-prompt.js";
 
 export async function readToken(): Promise<string> {
   if (process.env.BEAM_TOKEN) return process.env.BEAM_TOKEN;
@@ -370,7 +373,10 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
       environment: typeof data.environment === "string" ? data.environment : undefined,
       time: typeof data.timestamp === "string" ? data.timestamp : undefined,
     });
-    if (decision.action === "allow" && isEnvironmentAccess(String(data.tool_name ?? ""), command, String(toolInput.file_path ?? toolInput.path ?? data.file_path ?? ""), toolInput)) {
+    if ((decision.action === "allow" || decision.action === "warn") && isEnvironmentAccess(String(data.tool_name ?? ""), command, String(toolInput.file_path ?? toolInput.path ?? data.file_path ?? ""), toolInput)) {
+      // Sensitive data (.env, credentials, secrets) is never left at a soft, easy-to-miss
+      // stderr warning -- it's always promoted to a real approval gate, regardless of what the
+      // matched policy rule or risk mapping would otherwise have produced.
       decision = {
         ...decision,
         action: "ask",
@@ -387,17 +393,34 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
         reason: "Beam protection cannot be disabled, removed, or modified by an agent.",
       };
     }
-    if (decision.action === "allow" && workspace && isOutsideWorkspace(workspace, targetPath, command)) {
-      decision = {
-        ...decision,
-        action: "ask",
-        reason: "This action accesses a path outside the current workspace.",
-      };
+    const policyMode = decision.mode;
+    if (decision.action === "allow" && policyMode !== "observe" && workspace) {
+      const escaping = outsideWorkspacePaths(workspace, targetPath, command);
+      if (escaping.length) {
+        // A human can pre-approve specific outside-workspace paths with `beam trust <path>`
+        // (~/.beam/data/trusted-paths.json) so this ask doesn't fire again for them. The agent
+        // can't write that file itself -- isBeamSelfProtectionTarget above blocks it.
+        const trusted = await readTrustedPaths().catch(() => []);
+        if (!trusted.length || escaping.some(path => !isPathTrusted(path, trusted))) {
+          decision = {
+            ...decision,
+            action: "ask",
+            reason: "This action accesses a path outside the current workspace.",
+          };
+        }
+      }
     }
 
     const jev = await applyJevHook(decision, data);
     decision = jev.decision;
     if (jev.judgment) process.stderr.write(`Beam Jev: ${JSON.stringify(jev.judgment)}\n`);
+
+    // "warn" only ever comes out of evaluate() when the policy's mode is neither "enforce" nor
+    // "advisory" (see policy.ts) -- a manager's explicit ASK/BLOCK rule under either of those
+    // modes already resolved to "ask"/"deny" above, untouched by this. A remote-configured
+    // enforce/advisory policy from the collector therefore stays mandatory; this interactive
+    // step only ever runs for Beam's own soft, non-mandatory fallback.
+    if (decision.action === "warn") decision = await resolveWarnInteractively(decision, targetPath, command);
 
     // Detection and policy enforcement above already ran against the real prompt text and
     // session id -- neither is forwarded to the local collector or the workspace dashboard from
@@ -430,6 +453,9 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
         data = transformed.data;
       }
     } else if (decision.action === "warn") {
+      // No TTY was available to ask interactively (headless run, CI, detached process) --
+      // fail open with a visible warning rather than blocking a hook that has nowhere to
+      // prompt.
       process.stderr.write(`\n⚠ Beam policy (advisory): ${decision.reason}\n`);
     }
 
@@ -470,6 +496,34 @@ function safeNormalize(data: Record<string, unknown>): Event | null {
   try { return normalize(data); } catch { return null; }
 }
 
+// Resolves a "warn" decision by asking a human at the terminal what to do, since a stderr-only
+// warning is easy to miss and the action proceeds either way. Falls back to leaving the decision
+// as "warn" (handled the old way -- printed to stderr, action proceeds) when there's no TTY to
+// prompt on, or a previous "Block always" choice already covers this exact target.
+async function resolveWarnInteractively(decision: Decision, targetPath: string, command: string): Promise<Decision> {
+  const blocked = await readBlockedTargets().catch(() => []);
+  if (blocked.length && isTargetBlocked({ path: targetPath || undefined, command }, blocked)) {
+    return { ...decision, action: "deny", rule: "beam.block-always", reason: `${decision.reason ?? "Blocked by workspace policy."} (blocked always by a previous choice)` };
+  }
+  const choice = await promptTty(
+    `⚠ Beam policy (advisory): ${decision.reason ?? "This action was flagged for review."}`,
+    [
+      { key: "c", label: "Continue -- allow this one action" },
+      { key: "s", label: "Stop -- block this one action" },
+      { key: "b", label: "Block always -- remember this and block it on every future run" },
+      { key: "r", label: "Redact -- strip sensitive data from this action, then continue" },
+    ],
+  );
+  if (choice === "c") return { ...decision, action: "allow" };
+  if (choice === "s") return { ...decision, action: "deny", reason: decision.reason ?? "Blocked by user choice." };
+  if (choice === "b") {
+    await addBlockedTarget(targetPath || command).catch(() => {});
+    return { ...decision, action: "deny", rule: "beam.block-always", reason: decision.reason ?? "Blocked by user choice (always)." };
+  }
+  if (choice === "r") return { ...decision, action: "redact" };
+  return decision;
+}
+
 function isEnvironmentAccess(tool: string, command: string, path: string, input: Record<string, unknown>): boolean {
   const text = `${tool} ${command} ${path} ${Object.values(input).filter(value => typeof value === "string").join(" ")}`;
   // File reads: .env, .env.local, .env.prod, etc. Also catch common env/config
@@ -482,19 +536,22 @@ function isEnvironmentAccess(tool: string, command: string, path: string, input:
     || /\$\{?(?:[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH|PRIVATE|API)[A-Z0-9_]*)\}?/.test(text);
 }
 
-function isOutsideWorkspace(cwd: string, target: string, command: string): boolean {
-  if (!cwd) return false;
+// Returns the resolved absolute paths, if any, that a candidate path/command references outside
+// `cwd` -- empty when nothing escapes the workspace.
+function outsideWorkspacePaths(cwd: string, target: string, command: string): string[] {
+  if (!cwd) return [];
   const text = `${target} ${command}`;
   const candidates = [
     ...(isAbsolute(target) ? [target] : []),
     ...[...text.matchAll(/(?:^|\s)(\/[^\s"';&|]+)/g)].map(match => match[1]),
   ];
   const root = resolve(cwd);
-  return candidates.some(candidate => {
-    const path = resolve(root, candidate);
-    const escaped = relative(root, path);
-    return escaped === ".." || escaped.startsWith(`..${sep}`) || isAbsolute(escaped);
-  });
+  return candidates
+    .map(candidate => resolve(root, candidate))
+    .filter(path => {
+      const escaped = relative(root, path);
+      return escaped === ".." || escaped.startsWith(`..${sep}`) || isAbsolute(escaped);
+    });
 }
 
 function isBeamSelfProtectionTarget(tool: string, command: string, target: string): boolean {

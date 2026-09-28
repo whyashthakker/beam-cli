@@ -1,6 +1,6 @@
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { getDataDirectory } from "./config.js";
+import { getApiUrl, getDataDirectory } from "./config.js";
 import { lastGoodPolicyPath } from "./policy.js";
 import { readIdentity } from "./enroll.js";
 import type { Event, Scan } from "./core.js";
@@ -34,18 +34,35 @@ export async function forwardEvents(events: Event | Event[]): Promise<void> {
   }
 }
 
-export async function forwardMcpInventory(servers: McpInventory[]): Promise<boolean> {
-  if (!servers.length) return true;
+export interface ForwardMcpInventoryResult { ok: boolean; reason?: string }
+
+// Unlike every other call in this file, this deliberately does NOT use identity.apiBase (the
+// dashboard host, app.agentbeam.com by default). As of now /v1/mcp/inventory only exists on the
+// dedicated collector API (collector.agentbeam.com, getApiUrl()'s default) -- the dashboard
+// carries the account/policy/enterprise-package surface but hasn't picked up this route yet. If
+// that changes and the dashboard gains this route (or proxies it), this can go back to
+// identity.apiBase like the rest of this file.
+export async function forwardMcpInventory(servers: McpInventory[]): Promise<ForwardMcpInventoryResult> {
+  if (!servers.length) return { ok: true };
   const identity = await readIdentity();
-  if (!identity) return false;
+  if (!identity) return { ok: false, reason: "This device isn't connected to a Beam workspace." };
+  const collectorBase = getApiUrl();
   try {
-    const response = await fetch(`${identity.apiBase}/v1/mcp/inventory`, {
+    const response = await fetch(`${collectorBase}/v1/mcp/inventory`, {
       method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${identity.deviceSecret}` },
       body: JSON.stringify({ servers }), signal: AbortSignal.timeout(5000),
     });
-    return response.ok;
-  } catch { /* offline / older workspace API — local protection remains active */ }
-  return false;
+    if (response.ok) return { ok: true };
+    // 404 means a collector deployment that predates this route; anything else (401/403/5xx) is
+    // a real problem worth surfacing rather than folding into the same generic message.
+    const reason = response.status === 404
+      ? "This workspace's collector doesn't support MCP inventory yet."
+      : `Collector responded with HTTP ${response.status}.`;
+    return { ok: false, reason };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, reason: `Could not reach ${collectorBase}: ${message}` };
+  }
 }
 
 export const FORWARD_BATCH_SIZE = 6;

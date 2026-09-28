@@ -23,7 +23,7 @@ function logDirectory(): string {
 }
 
 export interface ServiceOptions { port?: number; home?: string }
-export interface ServiceInfo { platform: string; managed: boolean; configPath: string; running?: boolean; raw?: string }
+export interface ServiceInfo { platform: string; managed: boolean; configPath: string; running?: boolean; raw?: string; port?: number }
 
 // --- macOS: launchd user agent ---
 
@@ -65,11 +65,12 @@ export function macPlist(port: number, dataDir: string): string {
 async function macInstall(options: ServiceOptions): Promise<ServiceInfo> {
   const path = macPlistPath(options.home);
   const dataDir = getDataDirectory();
+  const port = options.port ?? 4319;
   await mkdir(join(dataDir, "logs"), { recursive: true });
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, macPlist(options.port ?? 4319, dataDir));
+  await writeFile(path, macPlist(port, dataDir));
   await run("launchctl", ["load", "-w", path]).catch(() => {});
-  return { platform: "darwin", managed: true, configPath: path };
+  return { platform: "darwin", managed: true, configPath: path, port };
 }
 
 async function macUninstall(home?: string): Promise<void> {
@@ -113,11 +114,12 @@ WantedBy=default.target
 async function systemdInstall(options: ServiceOptions): Promise<ServiceInfo> {
   const path = systemdUnitPath(options.home);
   const dataDir = getDataDirectory();
+  const port = options.port ?? 4319;
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, systemdUnit(options.port ?? 4319, dataDir));
+  await writeFile(path, systemdUnit(port, dataDir));
   await run("systemctl", ["--user", "daemon-reload"]);
   await run("systemctl", ["--user", "enable", "--now", "beam.service"]);
-  return { platform: "linux", managed: true, configPath: path };
+  return { platform: "linux", managed: true, configPath: path, port };
 }
 
 async function systemdUninstall(home?: string): Promise<void> {
@@ -180,4 +182,14 @@ export async function serviceLogPaths(): Promise<{ out: string; err?: string }> 
 export async function readServiceConfig(home?: string): Promise<string | null> {
   const path = osPlatform() === "darwin" ? macPlistPath(home) : systemdUnitPath(home);
   try { return await readFile(path, "utf8"); } catch { return null; }
+}
+
+// The port a previously-installed service was configured for -- startService()/stopService()
+// take no port option of their own, so a caller wanting to health-check after 'service start'
+// needs to recover it from the already-written plist/unit rather than assume the default.
+export async function configuredPort(home?: string): Promise<number> {
+  const config = await readServiceConfig(home);
+  if (!config) return 4319;
+  const match = config.match(/--port[\s<>\w\/]*?(\d+)/);
+  return match ? Number(match[1]) : 4319;
 }

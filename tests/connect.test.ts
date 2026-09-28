@@ -12,6 +12,7 @@ const originalFetch = global.fetch;
 beforeEach(() => {
   process.env = { ...originalEnv };
   delete process.env.BEAM_DASHBOARD_URL;
+  delete process.env.BEAM_API_URL;
   delete process.env.BEAM_HOME;
   delete process.env.BEAM_DATA_DIR;
 });
@@ -79,8 +80,9 @@ describe("startConnect", () => {
 
       expect(identity.deviceId).toBe("dev_1");
       expect(identity.orgId).toBe("org_1");
-      // Always the CLI's own configured base (BEAM_DASHBOARD_URL here), never the server's
-      // api_base -- a misconfigured or malicious server can't redirect future device traffic.
+      // Always the CLI's own configured dashboard base (BEAM_DASHBOARD_URL here), never the
+      // server's api_base -- a misconfigured or malicious server can't redirect future device
+      // traffic to a different host.
       expect(identity.apiBase).toBe("http://localhost:3001");
       expect(pollCount).toBe(3);
       await expect(readIdentity()).resolves.toMatchObject({ deviceId: "dev_1" });

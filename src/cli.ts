@@ -7,7 +7,8 @@ import { captureHook, extractPreview, extractSave, importEvents, readToken, relo
 import { supportsExtraction } from "./extract.js";
 import { AGENTS } from "./agents.js";
 import { installAllDetectedHooks, installHook, uninstallAllHooks } from "./install.js";
-import { installService, serviceLogPaths, serviceStatus, startService, stopService, uninstallService } from "./service.js";
+import { configuredPort, installService, serviceLogPaths, serviceStatus, startService, stopService, uninstallService } from "./service.js";
+import { waitForCollectorUp } from "./collector-health.js";
 import { getBeamHome, getCollectorUrl, getDataDirectory, getIdentityPath } from "./config.js";
 import { clearIdentity, enrollDevice, readIdentity } from "./enroll.js";
 import { startConnect } from "./connect.js";
@@ -27,6 +28,9 @@ import { runAgent } from "./run.js";
 import { AGENT_BINARIES, installShims, listShims, pathExportLine, shimDir, uninstallShims } from "./shims.js";
 import { runMcpProxy } from "./mcp-proxy.js";
 import { registerJevCommands } from "./jev-cli.js";
+import { addTrustedPath, readTrustedPaths, removeTrustedPath, trustedPathsFile } from "./trusted-paths.js";
+import { blockedTargetsFile, readBlockedTargets, removeBlockedTarget } from "./blocked-targets.js";
+import { checkForUpdate, installUpdate } from "./update.js";
 
 // Lets 'BEAM_API_URL=... beam connect' style overrides live in a .env file instead of the
 // shell profile. Checked in cwd first (handy when developing from the repo), then in
@@ -93,14 +97,28 @@ service.command("install")
   .option("-p, --port <port>", "port to listen on")
   .action(async (options: { port?: string }) => {
     const result = await installService({ port: options.port ? Number(options.port) : undefined });
-    console.log(`✔ Installed and started the beam service (${result.platform})\n  config: ${result.configPath}`);
+    const up = await waitForCollectorUp(result.port ?? 4319);
+    if (up) {
+      console.log(`✔ Installed and started the beam service (${result.platform})\n  config: ${result.configPath}`);
+    } else {
+      console.log(`✖ Installed the beam service (${result.platform}), but it isn't responding on port ${result.port ?? 4319} yet.\n  config: ${result.configPath}\n  Check the logs: beam service logs`);
+      process.exitCode = 1;
+    }
   });
 
 service.command("uninstall")
   .description("Stop and remove the background service")
   .action(async () => { await uninstallService(); console.log("✔ Removed the beam service."); });
 
-service.command("start").description("Start the installed background service").action(async () => { await startService(); console.log("✔ Started."); });
+service.command("start")
+  .description("Start the installed background service")
+  .action(async () => {
+    await startService();
+    const port = await configuredPort();
+    const up = await waitForCollectorUp(port);
+    if (up) console.log("✔ Started.");
+    else { console.log(`✖ Told to start, but the collector isn't responding on port ${port} yet.\n  Check the logs: beam service logs`); process.exitCode = 1; }
+  });
 service.command("stop").description("Stop the installed background service").action(async () => { await stopService(); console.log("✔ Stopped."); });
 
 service.command("status")
@@ -265,6 +283,27 @@ program.command("sync")
     if (result.status === "not-enrolled") throw new Error("This device is not enrolled. Run 'beam enroll --code <code>'.");
     if (result.status === "unreachable") throw new Error("Could not reach the Beam workspace. Check the network or 'beam whoami'.");
     console.log(result.status === "updated" ? `✔ Policy v${result.version} synced → ${result.path}` : "✔ Policy already up to date.");
+  });
+
+program.command("update")
+  .description("Update the globally installed beam CLI to the latest published version")
+  .option("--check", "only check for an update, don't install it")
+  .action(async (options: { check?: boolean }) => {
+    let check: Awaited<ReturnType<typeof checkForUpdate>>;
+    try {
+      check = await checkForUpdate(packageJson.version);
+    } catch (e) {
+      throw new Error(`Could not check for updates: ${(e as Error).message}`);
+    }
+    if (check.upToDate) { console.log(`✔ beam is up to date (v${check.current}).`); return; }
+    console.log(`A new version is available: v${check.current} → v${check.latest}`);
+    if (options.check) return;
+    try {
+      await installUpdate(check.latest);
+      console.log(`✔ Updated to v${check.latest}. Restart any running beam service to pick it up: 'beam service stop && beam service start'.`);
+    } catch (e) {
+      throw new Error(`Could not install the update automatically: ${(e as Error).message}\n  Run manually: npm install -g @agent-beam/beam@${check.latest}`);
+    }
   });
 
 const shims = program.command("shims").description("Make agent CLIs (claude, codex, ...) sandboxed automatically, without typing 'beam run'");
@@ -434,6 +473,51 @@ rule.command("reload")
     const result = await reloadRemoteRules();
     console.log(`Loaded ${result.loaded} custom rule${result.loaded === 1 ? "" : "s"} from ${result.path}.`);
     for (const e of result.errors) console.log(`✖ ${e}`);
+  });
+
+const trust = program.command("trust").description("Manage the global allowlist of outside-workspace paths Beam won't ask about again (advisory/enforce mode only)");
+
+trust.command("add <path>")
+  .description("Pre-approve a path or directory (or a glob containing '*') so Beam stops asking about it")
+  .action(async (path: string) => {
+    await addTrustedPath(path);
+    console.log(`✔ Trusted: ${path}`);
+  });
+
+trust.command("remove <path>")
+  .alias("rm")
+  .description("Remove a path from the trusted allowlist")
+  .action(async (path: string) => {
+    await removeTrustedPath(path);
+    console.log(`✔ Untrusted: ${path}`);
+  });
+
+trust.command("list")
+  .alias("ls")
+  .description("List all trusted outside-workspace paths")
+  .action(async () => {
+    const paths = await readTrustedPaths();
+    if (!paths.length) { console.log(`No trusted paths (${trustedPathsFile()}).`); return; }
+    for (const p of paths) console.log(p);
+  });
+
+const block = program.command("block").description("Audit or undo entries added by the 'Block always' choice on a warn prompt");
+
+block.command("remove <target>")
+  .alias("rm")
+  .description("Remove a target from the blocked list")
+  .action(async (target: string) => {
+    await removeBlockedTarget(target);
+    console.log(`✔ Unblocked: ${target}`);
+  });
+
+block.command("list")
+  .alias("ls")
+  .description("List all blocked targets")
+  .action(async () => {
+    const targets = await readBlockedTargets();
+    if (!targets.length) { console.log(`No blocked targets (${blockedTargetsFile()}).`); return; }
+    for (const t of targets) console.log(t);
   });
 
 try {

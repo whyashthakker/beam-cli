@@ -3,6 +3,7 @@ import { readIdentity } from "./enroll.js";
 import { startConnect } from "./connect.js";
 import { installEnterprisePackage } from "./enterprise-install.js";
 import { installService } from "./service.js";
+import { waitForCollectorUp } from "./collector-health.js";
 import { openBrowser } from "./open-browser.js";
 import { checkbox, confirm, renderTable, withSpinner } from "./prompts.js";
 import { showFirstRunWelcome } from "./owl.js";
@@ -148,8 +149,8 @@ export async function runSetup(): Promise<void> {
   }
   if (identity && mcpInventory.length) {
     const sent = await withSpinner("Sending MCP inventory", () => forwardMcpInventory(mcpInventory));
-    if (sent) ok(`Sent ${mcpInventory.length} MCP server${mcpInventory.length === 1 ? "" : "s"} to the dashboard.`);
-    else fail("Could not send MCP inventory; local MCP protection remains active and it will be retried on the next setup.");
+    if (sent.ok) ok(`Sent ${mcpInventory.length} MCP server${mcpInventory.length === 1 ? "" : "s"} to the dashboard.`);
+    else fail(`Could not send MCP inventory (${sent.reason ?? "unknown reason"}); local MCP protection remains active and it will be retried on the next setup.`);
   }
 
   // --- Step 4: background collector service ---
@@ -158,7 +159,11 @@ export async function runSetup(): Promise<void> {
   if (shouldStart) {
     try {
       const result = await withSpinner("Installing and starting the beam service", () => installService());
-      serviceStatus = `running (${result.platform})`;
+      // installService() only confirms the launchd plist / systemd unit was written and loaded --
+      // not that the collector process it points at actually came up. Verify that for real before
+      // reporting success, so a crashed/misconfigured service doesn't show as "running".
+      const up = await withSpinner("Checking the collector is responding", () => waitForCollectorUp(result.port ?? 4319));
+      serviceStatus = up ? `running (${result.platform})` : `installed but not responding (${result.platform}) — check 'beam service logs'`;
     } catch (err) {
       serviceStatus = `failed: ${(err as Error).message}`;
     }

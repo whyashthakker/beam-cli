@@ -87,9 +87,13 @@ export async function startConnect(): Promise<ConnectSession> {
         deviceId: data.device_id,
         deviceSecret: data.device_secret,
         orgId: data.org_id,
-        // Always the CLI's own configured base (BEAM_DASHBOARD_URL or the app.agentbeam.com
-        // default) -- never whatever the server hands back, so a misconfigured deployment can't
-        // redirect a device's future traffic to the wrong host.
+        // Always the CLI's own configured dashboard base (BEAM_DASHBOARD_URL or the
+        // app.agentbeam.com default) -- never whatever the server hands back, so a misconfigured
+        // deployment can't redirect a device's future traffic to the wrong host. This is the
+        // dashboard, not the dedicated collector (see forward.ts's forwardMcpInventory): as of
+        // now the dashboard implements the full account/policy/enterprise-package surface, while
+        // the collector only carries a couple of routes (MCP inventory, /v1/recent) that don't
+        // exist on the dashboard yet.
         apiBase: base,
         publicKey: pub,
         privateKey: priv,
