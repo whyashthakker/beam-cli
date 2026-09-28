@@ -134,4 +134,45 @@ describe("evaluate", () => {
     expect(d.approval?.level).toBe("MANAGER");
   });
 
+  it("matches a commandLine rule against the exact full command", () => {
+    const d = evaluate(
+      bundle({ rules: [{ id: "risk-123", commandLine: "rm -rf /tmp/build-cache", action: "ALLOW" }] }),
+      { ...ctx, command: "rm -rf /tmp/build-cache" },
+    );
+    expect(d.action).toBe("allow");
+    expect(d.rule).toBe("risk-123");
+  });
+
+  it("does not match a commandLine rule against a different full command sharing the same binary", () => {
+    const d = evaluate(
+      bundle({ rules: [{ id: "risk-123", commandLine: "rm -rf /tmp/build-cache", action: "ALLOW" }] }),
+      { ...ctx, command: "rm -rf /" },
+    );
+    expect(d.action).toBe("deny");
+  });
+
+  it("does not let a commandLine rule interfere with an existing command (binary-name) rule", () => {
+    const policy = bundle({ rules: [
+      { id: "rm-allow", tool: "Bash", command: "rm", action: "ALLOW" },
+      { id: "risk-123", tool: "Bash", commandLine: "rm -rf /tmp/build-cache", action: "BLOCK", reason: "flagged finding" },
+    ] });
+    expect(evaluate(policy, { ...ctx, command: "rm -rf /tmp/other" }).action).toBe("allow");
+    const d = evaluate(policy, { ...ctx, command: "rm -rf /tmp/build-cache" });
+    expect(d.action).toBe("deny");
+    expect(d.rule).toBe("risk-123");
+  });
+
+  it("still denies a risk-panel commandLine BLOCK rule in advisory mode, instead of downgrading it to ask", () => {
+    const d = evaluate(
+      bundle({ mode: "advisory", rules: [{ id: "risk-123", tool: "Bash", commandLine: "rm -rf /tmp/build-cache", action: "BLOCK", reason: "flagged finding" }] }),
+      { ...ctx, command: "rm -rf /tmp/build-cache" },
+    );
+    expect(d.action).toBe("deny");
+    expect(d.rule).toBe("risk-123");
+  });
+
+  it("still asks for a legacy blocked tool in advisory mode (no pinned command, so mode still governs it)", () => {
+    expect(evaluate(bundle({ mode: "advisory", blockedTools: ["Bash"] }), ctx).action).toBe("ask");
+  });
+
 });
