@@ -10,6 +10,7 @@ import { readIdentity } from "./enroll.js";
 import { syncPolicy } from "./forward.js";
 import { installAllDetectedHooks, type InstallAllResult } from "./install.js";
 import { startOsMonitor } from "./os-monitor.js";
+import { checkForTampering, recordExpectedHooks } from "./tamper.js";
 
 function toWebRequest(req: IncomingMessage): Promise<Request> {
   return new Promise((resolvePromise, reject) => {
@@ -59,7 +60,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
   // installed agent (or one that showed up after the last `beam start`) starts getting captured
   // without a separate manual `beam agent install-all` step. Never blocks or fails startup --
   // a single agent's config being unwritable shouldn't stop the collector from serving.
-  const agentInstalls = await installAllDetectedHooks(options.agentHome ?? homedir()).catch(() => [] as InstallAllResult[]);
+  const agentHome = options.agentHome ?? homedir();
+  const agentInstalls = await installAllDetectedHooks(agentHome).catch(() => [] as InstallAllResult[]);
+  // 'beam start' just reconciled hook installs itself, so whatever's on disk right now is
+  // authorized -- reset the tamper baseline to it before the poll loop below starts comparing
+  // against it, otherwise a hook this very start-up left untouched (already installed) could
+  // still be missing an up-to-date baseline from a version of beam that predates tamper.ts.
+  await recordExpectedHooks(agentHome).catch(() => {});
   // Loaded once per process into core.ts's shared rule set; a file edit needs a restart to apply.
   // Errors are returned, not logged here -- the caller (cli.ts) owns all console output, since
   // this same function also runs unattended inside the background service process.
@@ -109,6 +116,21 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
     policyTimer.unref?.();
   }
 
+  // Watches for beam's own hooks disappearing from an agent's config outside any beam command
+  // (hand-edited or wiped config file) -- see tamper.ts. Runs regardless of enrollment so a
+  // removal still shows up in the local studio view even offline; forwardEvents() inside
+  // checkForTampering is what's actually gated on the device being enrolled.
+  const tamperPoll = () => {
+    void checkForTampering(agentHome).then(async events => {
+      if (!events.length) return;
+      await app.store.addEvents(events);
+      app.forwardQueue.push(events);
+      for (const event of events) console.error(`\n⚠ ${event.summary}`);
+    }).catch(() => {});
+  };
+  const tamperTimer = setInterval(tamperPoll, 60_000);
+  tamperTimer.unref?.();
+
   // Observes AI agent activity directly (process start/exit, network connections) so agents that
   // don't cooperate with any hook -- or that run through a GUI/IDE surface with no hook path at
   // all -- still get captured. See os-monitor.ts. macOS only; a no-op elsewhere.
@@ -122,6 +144,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
   return {
     url: `http://${hostname}:${boundPort}`, token, directory, customRules, agentInstalls,
     policySync: Boolean(identity),
-    close: () => { if (policyTimer) clearInterval(policyTimer); osMonitor.stop(); app.forwardQueue.flush(); server.close(); },
+    close: () => { if (policyTimer) clearInterval(policyTimer); clearInterval(tamperTimer); osMonitor.stop(); app.forwardQueue.flush(); server.close(); },
   };
 }

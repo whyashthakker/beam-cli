@@ -26,7 +26,7 @@ export async function fetchAccount(identity: Identity): Promise<Account> {
       const body = (await response.json()) as { error?: string };
       if (body.error) message = body.error;
     } catch { /* keep the status-only message */ }
-    if (response.status === 401) message = "This device's credentials were revoked. Run 'beam enroll' or 'beam connect' again.";
+    if (response.status === 401) message = "This device's credentials were revoked. Run 'beam setup' again.";
     throw new Error(message);
   }
 

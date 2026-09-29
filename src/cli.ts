@@ -6,11 +6,11 @@ import { startServer } from "./serve.js";
 import { captureHook, extractPreview, extractSave, importEvents, readToken, reloadRemoteRules, scanFile } from "./client.js";
 import { supportsExtraction } from "./extract.js";
 import { AGENTS } from "./agents.js";
-import { installAllDetectedHooks, installHook, uninstallAllHooks } from "./install.js";
+import { installAllDetectedHooks, installHook, uninstallAllHooks, uninstallHook } from "./install.js";
 import { configuredPort, installService, serviceLogPaths, serviceStatus, startService, stopService, uninstallService } from "./service.js";
 import { waitForCollectorUp } from "./collector-health.js";
 import { getBeamHome, getCollectorUrl, getDataDirectory, getIdentityPath } from "./config.js";
-import { clearIdentity, enrollDevice, readIdentity } from "./enroll.js";
+import { clearIdentity, readIdentity } from "./enroll.js";
 import { startConnect } from "./connect.js";
 import { runSetup, promptYesNo } from "./setup.js";
 import { installEnterprisePackage } from "./enterprise-install.js";
@@ -31,6 +31,7 @@ import { registerJevCommands } from "./jev-cli.js";
 import { addTrustedPath, readTrustedPaths, removeTrustedPath, trustedPathsFile } from "./trusted-paths.js";
 import { blockedTargetsFile, readBlockedTargets, removeBlockedTarget } from "./blocked-targets.js";
 import { checkForUpdate, installUpdate } from "./update.js";
+import { recordExpectedHooks, reportControlEvent } from "./tamper.js";
 
 // Lets 'BEAM_API_URL=... beam connect' style overrides live in a .env file instead of the
 // shell profile. Checked in cwd first (handy when developing from the repo), then in
@@ -79,7 +80,7 @@ program.command("start")
     const result = await startServer({ port: options.port ? Number(options.port) : undefined });
     const rulesNote = result.customRules.loaded ? `\nCustom rules loaded: ${result.customRules.loaded} from ${result.customRules.path}` : "";
     for (const message of result.customRules.errors) console.error(`✖ ${message}`);
-    const policyNote = result.policySync ? "\nPolicy sync: on (every 60s)" : "\nPolicy sync: off (device not enrolled — run 'beam enroll')";
+    const policyNote = result.policySync ? "\nPolicy sync: on (every 60s)" : "\nPolicy sync: off (device not enrolled — run 'beam setup')";
     const newlyInstalled = result.agentInstalls.filter(r => r.status === "installed");
     const installNote = newlyInstalled.length
       ? `\nAgent hooks installed: ${newlyInstalled.map(r => r.name).join(", ")}`
@@ -89,6 +90,24 @@ program.command("start")
     }
     console.log(`Beam collector running.\nMode: observe only\nLocal storage: ${result.directory}${rulesNote}${policyNote}${installNote}\nRun 'beam agent list' to see every detected agent's capture status.\nRun 'beam token' for the pairing token.`);
   });
+
+// Shared gate for every command that reduces or removes beam's visibility on this device
+// (stopping/uninstalling the service, detaching an agent's hook, or logging out entirely). On an
+// enrolled device these are exactly the actions an employee could otherwise use to go dark to
+// their org's dashboard without anyone knowing -- see tamper.ts. So each one prints what will
+// actually happen and, when enrolled, that the org admin will be notified this device did it,
+// then requires an explicit "Yes" (or --yes, for scripted/CI use) before doing anything. There is
+// no path to run the underlying action without either declining here or accepting the notice: the
+// action and the report are the same decision, not two.
+async function confirmControlAction(message: string, identity: Awaited<ReturnType<typeof readIdentity>>, yes?: boolean): Promise<boolean> {
+  console.log(
+    identity
+      ? `${message}\nYour organization admin will be notified that this device (${identity.hostname}) did this.`
+      : message
+  );
+  if (yes) return true;
+  return promptYesNo("\nProceed?", false);
+}
 
 const service = program.command("service").description("Run the collector as a background service (launchd on macOS, systemd --user on Linux)");
 
@@ -108,7 +127,18 @@ service.command("install")
 
 service.command("uninstall")
   .description("Stop and remove the background service")
-  .action(async () => { await uninstallService(); console.log("✔ Removed the beam service."); });
+  .option("--yes", "skip the confirmation prompt")
+  .action(async (options: { yes?: boolean }) => {
+    const identity = await readIdentity();
+    const proceed = await confirmControlAction(
+      "This will stop and remove beam's background service. It will no longer observe or policy-enforce AI agent activity on this device.",
+      identity, options.yes
+    );
+    if (!proceed) { console.log("Cancelled."); return; }
+    if (identity) await reportControlEvent("service-uninstall", `Beam service removed on ${identity.hostname}`, "This device ran 'beam service uninstall'. Beam's background collector will no longer start automatically -- it is not observing or policy-enforcing until 'beam service install' runs again.");
+    await uninstallService();
+    console.log("✔ Removed the beam service.");
+  });
 
 service.command("start")
   .description("Start the installed background service")
@@ -119,7 +149,20 @@ service.command("start")
     if (up) console.log("✔ Started.");
     else { console.log(`✖ Told to start, but the collector isn't responding on port ${port} yet.\n  Check the logs: beam service logs`); process.exitCode = 1; }
   });
-service.command("stop").description("Stop the installed background service").action(async () => { await stopService(); console.log("✔ Stopped."); });
+service.command("stop")
+  .description("Stop the installed background service")
+  .option("--yes", "skip the confirmation prompt")
+  .action(async (options: { yes?: boolean }) => {
+    const identity = await readIdentity();
+    const proceed = await confirmControlAction(
+      "This will stop beam's background service. It will not observe or policy-enforce AI agent activity on this device until it's started again.",
+      identity, options.yes
+    );
+    if (!proceed) { console.log("Cancelled."); return; }
+    if (identity) await reportControlEvent("service-stop", `Beam service stopped on ${identity.hostname}`, "This device ran 'beam service stop'. Beam's background collector is not running -- it is not observing or policy-enforcing until it's started again.");
+    await stopService();
+    console.log("✔ Stopped.");
+  });
 
 service.command("status")
   .description("Show whether the background service is installed and running")
@@ -148,28 +191,11 @@ program.command("studio")
     console.log("Opening beam studio in your browser…");
   });
 
-program.command("enroll")
-  .description("Enroll this device with your Beam workspace using a code from your manager")
-  .requiredOption("--code <code>", "enrollment code, e.g. BEAM-XXXX-XXXX-XXXX")
-  .option("--url <url>", "Beam API base URL (default $BEAM_API_URL or https://collector.agentbeam.com)")
-  .action(async (options: { code: string; url?: string }) => {
-    const existing = await readIdentity();
-    if (existing) console.error(`Replacing the existing enrollment (device ${existing.deviceId}).`);
-    const identity = await enrollDevice(options);
-    console.log(
-      `${green("✔")} Enrolled device ${identity.deviceId}\n` +
-      `  org:      ${identity.orgId}\n` +
-      `  api:      ${identity.apiBase}\n` +
-      `  identity: ${getIdentityPath()} (0600)\n\n` +
-      cyan(`Next: beam agent install-all && beam start`)
-    );
-  });
-
 program.command("whoami")
   .description("Show this device's enrollment, if any")
   .action(async () => {
     const identity = await readIdentity();
-    if (!identity) throw new Error("This device is not enrolled. Run 'beam enroll --code <code>'.");
+    if (!identity) throw new Error("This device is not enrolled. Run 'beam setup'.");
     console.log(`device: ${identity.deviceId}\norg:    ${identity.orgId}\napi:    ${identity.apiBase}\nhost:   ${identity.hostname} (${identity.os})\nsince:  ${identity.enrolledAt}`);
   });
 
@@ -177,7 +203,7 @@ program.command("account")
   .description("Show the signed-in user and workspace this device is connected to")
   .action(async () => {
     const identity = await readIdentity();
-    if (!identity) throw new Error("This device is not enrolled. Run 'beam connect' or 'beam enroll --code <code>'.");
+    if (!identity) throw new Error("This device is not enrolled. Run 'beam setup'.");
     const account = await fetchAccount(identity);
     console.log(
       `user:   ${account.user.email}${account.user.name ? ` (${account.user.name})` : ""}\n` +
@@ -189,12 +215,22 @@ program.command("account")
 
 program.command("logout")
   .description("Disconnect this device from your Beam workspace and remove local credentials")
-  .action(async () => {
+  .option("--yes", "skip the confirmation prompt")
+  .action(async (options: { yes?: boolean }) => {
     const identity = await readIdentity();
     if (!identity) {
       console.log("This device is not enrolled -- nothing to do.");
       return;
     }
+    const proceed = await confirmControlAction(
+      "This will disconnect this device from your Beam workspace. It will stop reporting activity until it's re-enrolled.",
+      identity, options.yes
+    );
+    if (!proceed) { console.log("Cancelled."); return; }
+    // Sent while identity.json still exists, so it authenticates -- and before revokeDevice()
+    // below, so it's an authenticated "I chose to log out" record rather than something an admin
+    // has to infer from the device simply going quiet (see tamper.ts).
+    await reportControlEvent("logout", `Beam logged out on ${identity.hostname}`, `This device was logged out via 'beam logout'. It is no longer enrolled and will stop reporting until re-enrolled.`);
     try {
       await revokeDevice(identity);
     } catch (e) {
@@ -212,18 +248,25 @@ program.command("uninstall")
   .action(async (options: { yes?: boolean; keepPackage?: boolean }) => {
     const beamHome = getBeamHome();
     const dataDir = getDataDirectory();
+    const identityBeforeUninstall = await readIdentity();
 
-    console.log(
+    const proceed = await confirmControlAction(
       "This will remove:\n" +
       "  - the beam background service (if installed)\n" +
       "  - beam's hooks from every AI agent config it was wired into\n" +
       `  - ${beamHome} (identity, cached policy, event logs, custom rules)\n` +
       "  - this device's registration with your Beam workspace" +
-      (options.keepPackage ? "" : "\n  - the globally installed beam (and beam-enterprise, if present) npm package")
+      (options.keepPackage ? "" : "\n  - the globally installed beam (and beam-enterprise, if present) npm package"),
+      identityBeforeUninstall, options.yes
     );
-    if (!options.yes) {
-      const proceed = await promptYesNo("\nProceed?", false);
-      if (!proceed) { console.log("Cancelled."); return; }
+    if (!proceed) { console.log("Cancelled."); return; }
+
+    // Sent first, before anything below touches identity.json, the service, or hooks -- so the
+    // workspace has an authenticated "this was a deliberate 'beam uninstall'" record even if a
+    // later step in this command fails partway through. See tamper.ts: this is what distinguishes
+    // an authorized removal from the silent kind checkForTampering() is built to catch.
+    if (identityBeforeUninstall) {
+      await reportControlEvent("uninstall", `Beam uninstalled on ${identityBeforeUninstall.hostname}`, "This device ran 'beam uninstall'. Its background service, agent hooks, and local data are being removed, and its registration is being revoked.");
     }
 
     try {
@@ -233,12 +276,20 @@ program.command("uninstall")
       console.log(`— Skipped background service (${(e as Error).message}).`);
     }
 
-    const hookResults = await uninstallAllHooks();
-    const removedHooks = hookResults.filter(r => r.removed);
-    if (removedHooks.length) {
-      for (const r of removedHooks) console.log(`✔ Removed beam's hook from ${r.agent}\n  → ${r.path}`);
-    } else {
-      console.log("— No installed agent hooks found.");
+    // Wrapped like uninstallService() above: one agent's hook config being unreadable (invalid
+    // JSON, a permission error) must not abort the rest of 'beam uninstall' -- in particular it
+    // must not skip revokeDevice() below, or the device is wiped locally but the dashboard shows
+    // it as connected forever with nothing left running here to ever tell it otherwise.
+    try {
+      const hookResults = await uninstallAllHooks();
+      const removedHooks = hookResults.filter(r => r.removed);
+      if (removedHooks.length) {
+        for (const r of removedHooks) console.log(`✔ Removed beam's hook from ${r.agent}\n  → ${r.path}`);
+      } else {
+        console.log("— No installed agent hooks found.");
+      }
+    } catch (e) {
+      console.log(`— Could not remove every agent hook (${(e as Error).message}).`);
     }
 
     const identity = await readIdentity();
@@ -280,7 +331,7 @@ program.command("sync")
   .description("Pull the latest policy from your Beam workspace into ~/.beam/data/policy.json")
   .action(async () => {
     const result = await syncPolicy();
-    if (result.status === "not-enrolled") throw new Error("This device is not enrolled. Run 'beam enroll --code <code>'.");
+    if (result.status === "not-enrolled") throw new Error("This device is not enrolled. Run 'beam setup'.");
     if (result.status === "unreachable") throw new Error("Could not reach the Beam workspace. Check the network or 'beam whoami'.");
     console.log(result.status === "updated" ? `✔ Policy v${result.version} synced → ${result.path}` : "✔ Policy already up to date.");
   });
@@ -407,7 +458,25 @@ agent.command("install")
   .argument("<agent>", "agent id, e.g. claude-code, codex, cursor, copilot-cli")
   .action(async (agentId: string) => {
     const result = await installHook(agentId);
+    await recordExpectedHooks();
     console.log(result.alreadyInstalled ? `✔ Already installed for ${result.agent}\n  → ${result.path}` : `✔ Installed beam hook for ${result.agent}\n  → ${result.path}`);
+  });
+
+agent.command("uninstall")
+  .description("Detach beam's hook from a single agent's own hook config, leaving everything else installed")
+  .argument("<agent>", "agent id, e.g. claude-code, codex, cursor, copilot-cli")
+  .option("--yes", "skip the confirmation prompt")
+  .action(async (agentId: string, options: { yes?: boolean }) => {
+    const identity = await readIdentity();
+    const proceed = await confirmControlAction(
+      `This will detach beam's hook from ${agentId}. Its activity will no longer be observed or policy-enforced by beam.`,
+      identity, options.yes
+    );
+    if (!proceed) { console.log("Cancelled."); return; }
+    if (identity) await reportControlEvent(`agent-uninstall-${agentId}`, `Beam hook detached from ${agentId} on ${identity.hostname}`, `This device ran 'beam agent uninstall ${agentId}'. ${agentId} is no longer being observed or policy-enforced by beam.`);
+    const result = await uninstallHook(agentId);
+    await recordExpectedHooks();
+    console.log(result.removed ? `✔ Detached beam's hook from ${result.agent}\n  → ${result.path}` : `— No beam hook found for ${result.agent}.`);
   });
 
 agent.command("extract")
@@ -431,6 +500,7 @@ agent.command("install-all")
   .description("Detect which agents are actually installed on this machine and wire beam's hook into all of them")
   .action(async () => {
     const results = await installAllDetectedHooks();
+    await recordExpectedHooks();
     for (const r of results) {
       if (r.status === "installed") console.log(`✔ Installed for ${r.name}\n  → ${r.path}`);
       else if (r.status === "already-installed") console.log(`✔ Already installed for ${r.name}`);

@@ -40,6 +40,20 @@ function legacyHookCommand(agentId: string): string {
   return `beam hook ${agentId}`;
 }
 
+// Recognizes any hook command beam itself could have written for this agent, regardless
+// of which install wrote it -- the current absolute-path form (resolveHookCommand embeds the
+// running process's own node/cli.js paths, which differ between a global npm install, a local
+// dev checkout, or the same install after 'beam update' relocates it) or the pre-fix bare legacy
+// form. Without this, uninstalling from a *different* beam install than the one that originally
+// wrote the entry compares an exact string that can never match -- 'beam uninstall' reports
+// success but silently leaves the hook installed and beam still fully monitoring/enforcing.
+// Matching the install-independent ` hook <agentId>` suffix (plus a `cli.js` sanity check, so an
+// unrelated hook that merely happens to end similarly isn't swept up) fixes that.
+function isOwnHookCommand(agentId: string): (command: string) => boolean {
+  const suffix = ` hook ${agentId}`;
+  return (command: string) => command === legacyHookCommand(agentId) || (command.includes("cli.js") && command.endsWith(suffix));
+}
+
 export async function installHook(agentId: string, home = homedir()): Promise<InstallResult> {
   const agent = findAgent(agentId);
   if (!agent) throw new Error(`Unknown agent '${agentId}'. Run 'beam agent list' to see supported agents.`);
@@ -63,8 +77,9 @@ export async function installHook(agentId: string, home = homedir()): Promise<In
     }
   }
 
-  // Strip any pre-fix legacy entry first so re-installing migrates it rather than duplicating.
-  const base = agent.unmergeHookConfig(existing, legacyHookCommand(agent.id));
+  // Strip any existing beam entry first -- legacy bare form, or an absolute-path form written by
+  // a different beam install -- so re-installing migrates/replaces it rather than duplicating.
+  const base = agent.unmergeHookConfig(existing, isOwnHookCommand(agent.id));
   const merged = agent.mergeHookConfig(base, command);
   const alreadyInstalled = JSON.stringify(merged) === JSON.stringify(existing) && raw.trim() !== "";
 
@@ -103,10 +118,9 @@ export async function uninstallHook(agentId: string, home = homedir()): Promise<
     throw e;
   }
 
-  // Remove both the current absolute-path command and any pre-fix legacy "beam hook <agent>"
-  // entry, so uninstall cleans up a machine regardless of which form was installed.
-  const withoutCurrent = agent.unmergeHookConfig(existing, resolveHookCommand(agent.id));
-  const updated = agent.unmergeHookConfig(withoutCurrent, legacyHookCommand(agent.id));
+  // Removes beam's entry regardless of which install (this one, a different one, or the pre-fix
+  // legacy bare form) originally wrote it -- see isOwnHookCommand.
+  const updated = agent.unmergeHookConfig(existing, isOwnHookCommand(agent.id));
   const removed = JSON.stringify(updated) !== JSON.stringify(existing);
   if (removed) await writeFile(path, `${JSON.stringify(updated, null, 2)}\n`);
 
@@ -124,6 +138,40 @@ export async function uninstallAllHooks(home = homedir()): Promise<UninstallResu
     results.push(await uninstallHook(agent.id, home));
   }
   return results;
+}
+
+// Read-only: does this agent's config currently contain beam's own hook entry? Unlike isDetected
+// below (which only checks that the agent itself is present), this checks beam's specific entry
+// -- so it goes false the moment a hand edit, a wiped config file, or anything else outside
+// installHook/uninstallHook removes it. tamper.ts polls this to notice that kind of removal.
+export async function isHookInstalled(agentId: string, home = homedir()): Promise<boolean> {
+  const agent = findAgent(agentId);
+  if (!agent) return false;
+  if (agent.id === "opencode" && agent.pluginPath) {
+    const existing = await readFile(join(home, agent.pluginPath), "utf8").catch(() => "");
+    return existing === OPEN_CODE_PLUGIN;
+  }
+  if (!agent.hookConfigPath || !agent.unmergeHookConfig) return false;
+  let existing: Obj = {};
+  try {
+    const raw = await readFile(hookConfigFullPath(agent, home), "utf8");
+    existing = raw.trim() ? JSON.parse(raw) as Obj : {};
+  } catch { return false; }
+  // Same diff trick uninstallHook uses to report `removed`: if stripping beam's entry out would
+  // actually change the config, beam's entry must be in there right now.
+  const withoutBeam = agent.unmergeHookConfig(existing, isOwnHookCommand(agent.id));
+  return JSON.stringify(withoutBeam) !== JSON.stringify(existing);
+}
+
+// Every agent id whose hook is live on disk right now, regardless of whether beam remembers
+// installing it -- the ground truth tamper.ts's baseline gets compared against.
+export async function installedHookAgentIds(home = homedir()): Promise<string[]> {
+  const ids: string[] = [];
+  for (const agent of AGENTS) {
+    if (agent.id !== "opencode" && (!agent.hookConfigPath || !agent.unmergeHookConfig)) continue;
+    if (await isHookInstalled(agent.id, home)) ids.push(agent.id);
+  }
+  return ids;
 }
 
 async function isDetected(agent: AgentDefinition, home: string): Promise<boolean> {

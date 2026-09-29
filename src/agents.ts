@@ -22,9 +22,15 @@ export interface AgentDefinition {
   /**
    * Reverse of mergeHookConfig — strips beam's hook entry back out, leaving any other hooks the
    * agent or the user configured untouched. Must be idempotent — safe to call on a config that
-   * never had beam installed (a no-op).
+   * never had beam installed (a no-op). Takes a predicate rather than an exact command string:
+   * a hook's command embeds the absolute path to whichever beam install wrote it (see
+   * resolveHookCommand in install.ts), which differs between a global npm install, a local dev
+   * checkout, or the same install after 'beam update' changes its resolved path. An uninstall
+   * running from a *different* beam install than the one that wrote the entry must still
+   * recognize and remove it -- matching only one exact string silently leaves it in place (and
+   * beam fully monitoring/enforcing) instead. See isOwnHookCommand in install.ts.
    */
-  unmergeHookConfig: ((existing: Obj, command: string) => Obj) | null;
+  unmergeHookConfig: ((existing: Obj, isOwnCommand: (command: string) => boolean) => Obj) | null;
   /** Payload adapter id used by src/hook-adapters.ts to normalize this agent's stdin JSON. */
   adapter: "passthrough" | "copilot-camel" | "generic" | "gemini";
   /** Whether the AGENT ITSELF (not just this entry's payload verification) is unverified — the
@@ -81,11 +87,11 @@ function mergeCopilotHooks(event: string) {
 // Reverse of mergeClaudeStyleHooks: drops beam's command out of each entry's inner hooks array
 // (rather than the whole entry), so a user-added hook sharing the same matcher is left alone.
 function unmergeClaudeStyleHooks(event: string) {
-  return (existing: Obj, command: string): Obj => {
+  return (existing: Obj, isOwnCommand: (command: string) => boolean): Obj => {
     const hooks = obj(existing.hooks);
     if (!(event in hooks)) return existing;
     const list = arr(hooks[event]).map(obj)
-      .map(entry => ({ ...entry, hooks: arr(entry.hooks).map(obj).filter(h => h.command !== command) }))
+      .map(entry => ({ ...entry, hooks: arr(entry.hooks).map(obj).filter(h => !isOwnCommand(String(h.command ?? ""))) }))
       .filter(entry => arr(entry.hooks).length > 0);
     return { ...existing, hooks: { ...hooks, [event]: list } };
   };
@@ -93,20 +99,20 @@ function unmergeClaudeStyleHooks(event: string) {
 
 // Reverse of mergeCursorHooks.
 function unmergeCursorHooks(event: string) {
-  return (existing: Obj, command: string): Obj => {
+  return (existing: Obj, isOwnCommand: (command: string) => boolean): Obj => {
     const hooks = obj(existing.hooks);
     if (!(event in hooks)) return existing;
-    const list = arr(hooks[event]).map(obj).filter(entry => entry.command !== command);
+    const list = arr(hooks[event]).map(obj).filter(entry => !isOwnCommand(String(entry.command ?? "")));
     return { ...existing, hooks: { ...hooks, [event]: list } };
   };
 }
 
 // Reverse of mergeCopilotHooks.
 function unmergeCopilotHooks(event: string) {
-  return (existing: Obj, command: string): Obj => {
+  return (existing: Obj, isOwnCommand: (command: string) => boolean): Obj => {
     const hooks = obj(existing.hooks);
     if (!(event in hooks)) return existing;
-    const list = arr(hooks[event]).map(obj).filter(entry => entry.bash !== command);
+    const list = arr(hooks[event]).map(obj).filter(entry => !isOwnCommand(String(entry.bash ?? "")));
     return { ...existing, hooks: { ...hooks, [event]: list } };
   };
 }
@@ -120,8 +126,8 @@ function unmergeCopilotHooks(event: string) {
 function mergeAll(mergers: Array<(existing: Obj, command: string) => Obj>) {
   return (existing: Obj, command: string): Obj => mergers.reduce((acc, merge) => merge(acc, command), existing);
 }
-function unmergeAll(unmergers: Array<(existing: Obj, command: string) => Obj>) {
-  return (existing: Obj, command: string): Obj => unmergers.reduce((acc, unmerge) => unmerge(acc, command), existing);
+function unmergeAll(unmergers: Array<(existing: Obj, isOwnCommand: (command: string) => boolean) => Obj>) {
+  return (existing: Obj, isOwnCommand: (command: string) => boolean): Obj => unmergers.reduce((acc, unmerge) => unmerge(acc, isOwnCommand), existing);
 }
 
 export const AGENTS: AgentDefinition[] = [
