@@ -25,7 +25,7 @@ async function readError(response: Response, fallback: string): Promise<string> 
 
 // Starts a browser-based pairing request: registers this device's public key and a one-time
 // connect token with the dashboard, then hands back a URL to open and a poll() to wait on.
-// Unlike 'beam enroll', there's no code to type -- the dashboard authorizes the token once the
+// There's no code to type -- the dashboard authorizes the token once the
 // signed-in user's browser session confirms it, and poll() picks that up on the CLI side.
 export async function startConnect(): Promise<ConnectSession> {
   const base = getDashboardUrl();

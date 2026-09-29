@@ -135,7 +135,7 @@ export async function runSetup(): Promise<void> {
     skip("Skipped. Run 'beam connect' whenever you're ready.");
   }
   // --- Step 3: fetch this device's effective policy (org + any user-level override), if enrolled ---
-  // A device can be enrolled from a previous `beam setup`/`beam enroll` run without this run ever
+  // A device can be enrolled from a previous `beam setup` run without this run ever
   // reaching Step 2's connect branch above -- so this always runs off whatever `identity` ended up
   // being, not just the freshly-connected path.
   step(3, "Fetching your org's policy");

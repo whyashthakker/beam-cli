@@ -3,7 +3,16 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "@jest/globals";
-import { installAllDetectedHooks, installHook, uninstallAllHooks, uninstallHook } from "../src/install.js";
+import { installAllDetectedHooks, installHook, isHookInstalled, uninstallAllHooks, uninstallHook } from "../src/install.js";
+
+// A hook written by a *different* beam install (a global npm install vs. a local dev checkout,
+// or the same install before a 'beam update' relocated it) -- same shape resolveHookCommand
+// produces, just under a path this test run didn't itself resolve. Reproduces the real bug this
+// file's "different beam install" tests guard: 'beam uninstall' reporting success while a
+// cross-install hook entry silently stays wired in and beam keeps fully monitoring/enforcing.
+function otherInstallCommand(agentId: string): string {
+  return `"/usr/local/bin/node" "/some/other/beam-install/dist/cli.js" hook ${agentId}`;
+}
 
 // installHook now embeds the absolute path to the running node binary and cli.js (see
 // src/install.ts) instead of a bare "beam hook <agent>", so it works even when the shell
@@ -150,6 +159,18 @@ describe("installHook", () => {
     await fs.mkdir(path.join(home, ".claude"), { recursive: true });
     await fs.writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({
       hooks: { PreToolUse: [{ matcher: "", hooks: [{ type: "command", command: "beam hook claude-code" }] }] },
+    }));
+    await installHook("claude-code", home);
+    const config = JSON.parse(await fs.readFile(path.join(home, ".claude", "settings.json"), "utf8"));
+    expect(config.hooks.PreToolUse).toHaveLength(1);
+    expect(config.hooks.PreToolUse[0].hooks[0].command).toBe(expectedCommand("claude-code"));
+  });
+
+  it("replaces a hook written by a different beam install rather than duplicating it", async () => {
+    const home = await tempHome();
+    await fs.mkdir(path.join(home, ".claude"), { recursive: true });
+    await fs.writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({
+      hooks: { PreToolUse: [{ matcher: "", hooks: [{ type: "command", command: otherInstallCommand("claude-code") }] }] },
     }));
     await installHook("claude-code", home);
     const config = JSON.parse(await fs.readFile(path.join(home, ".claude", "settings.json"), "utf8"));
@@ -304,6 +325,27 @@ describe("uninstallHook", () => {
   it("rejects an unknown agent", async () => {
     const home = await tempHome();
     await expect(uninstallHook("not-a-real-agent", home)).rejects.toThrow("Unknown agent");
+  });
+
+  it("removes a hook written by a different beam install (different absolute cli.js path)", async () => {
+    const home = await tempHome();
+    await fs.mkdir(path.join(home, ".claude"), { recursive: true });
+    await fs.writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({
+      hooks: { PreToolUse: [{ matcher: "", hooks: [{ type: "command", command: otherInstallCommand("claude-code") }] }] },
+    }));
+    const result = await uninstallHook("claude-code", home);
+    expect(result.removed).toBe(true);
+    const config = JSON.parse(await fs.readFile(path.join(home, ".claude", "settings.json"), "utf8"));
+    expect(config.hooks.PreToolUse).toHaveLength(0);
+  });
+
+  it("isHookInstalled recognizes a hook written by a different beam install", async () => {
+    const home = await tempHome();
+    await fs.mkdir(path.join(home, ".claude"), { recursive: true });
+    await fs.writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({
+      hooks: { PreToolUse: [{ matcher: "", hooks: [{ type: "command", command: otherInstallCommand("claude-code") }] }] },
+    }));
+    expect(await isHookInstalled("claude-code", home)).toBe(true);
   });
 
   it("uninstalls the native OpenCode plugin", async () => {
