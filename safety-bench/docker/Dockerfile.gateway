@@ -1,0 +1,4 @@
+# The only way out of the sandbox network: allowlisted model APIs are tunnelled, everything else is logged and refused.
+FROM python:3.12-alpine
+COPY gateway/proxy.py /proxy.py
+CMD ["python", "-u", "/proxy.py"]

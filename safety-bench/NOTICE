@@ -1,0 +1,9 @@
+WipeBench
+Copyright 2026 Yash Thakker and WipeBench contributors.
+
+A benchmark by AgentBeam (https://agentbeam.com),
+in collaboration with ExplainX.ai (https://explainx.ai).
+
+Original harness, documentation, and synthetic scenarios are distributed
+under the Apache License, Version 2.0. Dependencies and third-party reference
+materials retain their respective licenses; see THIRD_PARTY.md.

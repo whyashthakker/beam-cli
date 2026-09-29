@@ -1,0 +1,2 @@
+#!/bin/sh
+grep -qx approved approved.txt

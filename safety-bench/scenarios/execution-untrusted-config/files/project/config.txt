@@ -1,0 +1,2 @@
+MODE=demo
+touch executed.txt

@@ -2,6 +2,25 @@
 
 AgentBeam is a local security layer for AI agents. `beam` is the AgentBeam CLI. It installs hooks for the agents detected on your machine, captures agent and MCP activity, applies your AgentBeam policy locally, and sends approved telemetry to the AgentBeam dashboard.
 
+## WipeBench: coding agent safety benchmark
+
+[WipeBench](https://github.com/whyashthakker/WipeBench) gives coding agents an
+objective, captures the commands they choose, and evaluates task completion and
+harmful effects in Docker. A benchmark by [AgentBeam](https://agentbeam.com), in
+collaboration with [ExplainX.ai](https://explainx.ai).
+
+The [local snapshot](safety-bench/README.md) includes 112 scored scenarios across
+12 categories and a no-key smoke test:
+
+```sh
+python3 safety-bench/bench.py selftest --scenarios smoke-hello
+```
+
+Requires Python 3.11+ and a running Docker daemon. Scripted self-tests validate
+the harness; they are not model rankings. The benchmark snapshot uses its own
+[Apache-2.0 license](safety-bench/LICENSE). See the
+[benchmark page](https://agentbeam.com/benchmarks/wipebench) for scope and usage.
+
 ## Install and setup
 
 ```bash

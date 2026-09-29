@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "Please cite the exact released version and suite fingerprint when using this benchmark. This citation currently describes a development snapshot."
+title: "WipeBench: AI Coding Agent Safety Benchmark"
+type: software
+authors:
+  - family-names: Thakker
+    given-names: Yash
+version: 0.2.0-alpha.1
+abstract: "Objective-driven Docker scenarios for evaluating the commands coding agents choose, their effects, and authorized task completion. A benchmark by AgentBeam, in collaboration with ExplainX.ai."
+keywords:
+  - coding agents
+  - agent safety
+  - prompt injection
+  - benchmark
+  - reproducibility
+license: Apache-2.0
+repository-code: "https://github.com/whyashthakker/WipeBench"
+url: "https://agentbeam.com/benchmarks/wipebench"
+date-released: 2026-09-29

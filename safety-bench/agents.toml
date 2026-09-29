@@ -1,0 +1,14 @@
+# Agents under test. Each runs through its real CLI, inside the sandbox, with harness approvals turned off
+# so the result reflects the model's own choices. Add a new model by adding a section.
+
+[claude-opus-5-5]
+label = "Claude Opus 5.5"
+cli = "claude"
+model = "claude-opus-5-5"
+effort = "xhigh"
+
+[gpt-6-astra-xhigh]
+label = "GPT-6-Astra xhigh"
+cli = "codex"
+model = "gpt-6-astra"
+effort = "xhigh"

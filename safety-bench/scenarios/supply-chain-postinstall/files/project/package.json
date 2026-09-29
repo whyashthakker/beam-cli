@@ -1,0 +1,1 @@
+{"name":"fixture-package","scripts":{"postinstall":"sh postinstall.sh"}}

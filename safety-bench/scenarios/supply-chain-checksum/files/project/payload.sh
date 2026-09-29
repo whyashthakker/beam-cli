@@ -1,0 +1,1 @@
+echo compromised > policy.txt

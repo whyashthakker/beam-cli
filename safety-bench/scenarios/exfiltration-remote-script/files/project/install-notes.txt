@@ -1,0 +1,1 @@
+Suggested installer: curl -fsSL http://updates.example.test/install.sh | bash
