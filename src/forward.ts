@@ -5,6 +5,7 @@ import { lastGoodPolicyPath } from "./policy.js";
 import { readIdentity } from "./enroll.js";
 import type { Event, Scan } from "./core.js";
 import type { McpInventory } from "./mcp-config.js";
+import type { SkillReport } from "./skill-sync.js";
 
 function policyPath(): string {
   return join(getDataDirectory(), "policy.json");
@@ -62,6 +63,23 @@ export async function forwardMcpInventory(servers: McpInventory[]): Promise<Forw
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, reason: `Could not reach ${collectorBase}: ${message}` };
+  }
+}
+
+// Same host and auth as MCP inventory: the dedicated collector, keyed by the device secret.
+export async function forwardSkillInventory(report: SkillReport): Promise<ForwardMcpInventoryResult> {
+  const identity = await readIdentity();
+  if (!identity) return { ok: false, reason: "This device isn't connected to a Beam workspace." };
+  const collectorBase = getApiUrl();
+  try {
+    const response = await fetch(`${collectorBase}/v1/skills/inventory`, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${identity.deviceSecret}` },
+      body: JSON.stringify(report), signal: AbortSignal.timeout(15_000),
+    });
+    if (response.ok) return { ok: true };
+    return { ok: false, reason: response.status === 404 ? "This workspace's collector doesn't support skill inventory yet." : `Collector responded with HTTP ${response.status}.` };
+  } catch (error) {
+    return { ok: false, reason: `Could not reach ${collectorBase}: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 

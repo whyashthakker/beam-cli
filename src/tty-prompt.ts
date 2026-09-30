@@ -32,7 +32,9 @@ export async function promptTty(message: string, choices: TtyChoice[]): Promise<
       clearTimeout(timer);
       rl.close();
       input.destroy();
-      output.destroy();
+      // Flush the prompt before closing the terminal stream. Destroying it immediately can
+      // interrupt an in-flight write and emit ERR_STREAM_DESTROYED after the choice is read.
+      output.end();
       resolvePromise(value);
     };
     const timer = setTimeout(() => finish(null), PROMPT_TIMEOUT_MS);

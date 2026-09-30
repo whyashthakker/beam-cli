@@ -12,6 +12,7 @@ import { syncPolicy } from "./forward.js";
 import { AGENT_BINARIES } from "./shims.js";
 import { installMcpProxies } from "./mcp-config.js";
 import { forwardMcpInventory } from "./forward.js";
+import { indexAndReportSkills } from "./skill-setup.js";
 
 const TOTAL_STEPS = 5;
 function step(n: number, title: string): void {
@@ -38,7 +39,7 @@ export const promptYesNo = confirm;
 // glance instead of reading as one flat block of text.
 function statusValue(value: string): string {
   if (value.startsWith("failed")) return red(value);
-  if (value === "none" || value === "not connected" || value === "not started" || value === "skipped") return dim(value);
+  if (value === "none" || value === "none found" || value === "not connected" || value === "not started" || value === "skipped") return dim(value);
   return green(value);
 }
 
@@ -57,6 +58,7 @@ export async function runSetup(): Promise<void> {
   let dashboardStatus = "not connected";
   let serviceStatus = "not started";
   let policyStatus = "not enrolled";
+  let skillsStatus = "none found";
 
   // --- Step 1: detect agents, then let the user choose which ones get the hook ---
   step(1, "Detecting AI agents on this machine");
@@ -153,6 +155,28 @@ export async function runSetup(): Promise<void> {
     else fail(`Could not send MCP inventory (${sent.reason ?? "unknown reason"}); local MCP protection remains active and it will be retried on the next setup.`);
   }
 
+  // --- Skills: index what is installed and report it, so the dashboard has the full list from day one ---
+  // The agents' own skill folders are always covered. Searching the rest of the home folder for
+  // skills inside project repos is what makes macOS ask for Desktop/Documents/Downloads access, so
+  // it is a question here -- and never happens in a non-interactive run.
+  console.log(`\n  ${dim("Skills")}`);
+  const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  const searchProjects = interactive && await promptYesNo("  Also search your home folder for skills inside project folders? (macOS may ask for access to Desktop, Documents and Downloads)");
+  try {
+    const skills = await withSpinner("Indexing installed skills", () => indexAndReportSkills({ searchProjects }));
+    const risky = skills.highRisk ? `, ${skills.highRisk} high/critical` : "";
+    if (skills.total) ok(`Found ${skills.total} skill${skills.total === 1 ? "" : "s"}${risky}${searchProjects ? "" : " in your agents' skill folders"}.`);
+    else skip("No skills found.");
+    if (skills.sync.status === "sent") ok("Reported skill names and risk scores to the dashboard.");
+    else if (skills.sync.status === "unchanged") ok("Dashboard already has this skill list.");
+    else if (skills.sync.status === "failed") fail(`Could not report skills (${skills.sync.reason ?? "unknown reason"}); it will be retried by the daily check.`);
+    skillsStatus = `${skills.total} found${risky}${skills.sync.status === "sent" || skills.sync.status === "unchanged" ? ", reported" : ""}`;
+    if (!searchProjects && skills.total) skip("Project folders weren't searched. Run 'beam skills index' any time to include them.");
+  } catch (err) {
+    skillsStatus = `failed: ${(err as Error).message}`;
+    fail(`Could not index skills: ${(err as Error).message}`);
+  }
+
   // --- Step 4: background collector service ---
   step(4, "Starting the background collector");
   const shouldStart = await promptYesNo("  Start the beam background service now (survives reboot/logout)?");
@@ -183,6 +207,7 @@ export async function runSetup(): Promise<void> {
     { label: "Agent hooks", value: agentSummaryColor(agentSummary) },
     { label: "Dashboard", value: statusValue(dashboardStatus) },
     { label: "Policy", value: statusValue(policyStatus) },
+    { label: "Skills", value: statusValue(skillsStatus) },
     { label: "Service", value: statusValue(serviceStatus) },
   ]));
   console.log(`\n${dim("Useful next commands:")}`);

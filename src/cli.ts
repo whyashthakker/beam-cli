@@ -22,8 +22,13 @@ import { loadCustomRules } from "./custom-rules.js";
 import { sequenceRuleCatalog } from "./sequences.js";
 import { printBanner } from "./banner.js";
 import { runWithSudoFallback } from "./elevate.js";
-import { renderColumns, withSpinner } from "./prompts.js";
-import { cyan, green } from "./color.js";
+import { confirm, renderColumns, withSpinner } from "./prompts.js";
+import { cyan, dim, green, red } from "./color.js";
+import { ALL_SKILL_AGENTS, addSkill, isBlocked, scanInstalledSkills } from "./skills.js";
+import { scanSkillDir, type SkillScan } from "./skill-scan.js";
+import { syncSkillInventory } from "./skill-sync.js";
+import { agentSkillRoots, deviceSkillsScore, indexSkills, inventoryFile, readInventory, trustedHashes } from "./skill-inventory.js";
+import { readTrustedSkills, trustSkill, untrustSkill } from "./trusted-skills.js";
 import { runAgent } from "./run.js";
 import { AGENT_BINARIES, installShims, listShims, pathExportLine, shimDir, uninstallShims } from "./shims.js";
 import { runMcpProxy } from "./mcp-proxy.js";
@@ -425,6 +430,134 @@ program.command("scan")
   .option("--mcp", "treat the file as an MCP configuration instead of a skill")
   .option("--save", "also save the report to the running collector")
   .action(async (file: string, options: { mcp?: boolean; save?: boolean }) => console.log(JSON.stringify(await scanFile(file, options), null, 2)));
+
+function printSkillScan(scan: SkillScan): void {
+  const badge = scan.risk === "critical" || scan.risk === "high" ? red(scan.risk.toUpperCase()) : scan.risk === "medium" ? scan.risk : green(scan.findings.length ? scan.risk : "clean");
+  console.log(`\n${scan.name}  [${badge}]  risk score ${scan.score}/100 (${scan.level})  ${scan.filesScanned} files scanned`);
+  for (const f of scan.findings.slice(0, 10)) console.log(`  ${f.severity.padEnd(8)} ${f.title}  ${dim(`${f.file}${f.line ? `:${f.line}` : ""}`)}\n           ${dim(f.evidence.split("\n")[0].slice(0, 100))}`);
+  if (scan.findings.length > 10) console.log(dim(`  … ${scan.findings.length - 10} more (use --json for all)`));
+  for (const s of scan.skipped) console.log(dim(`  skipped ${s}`));
+}
+
+const add = program.command("add").description("Add reusable AI assets, scanned before they are installed");
+add.command("skill")
+  .description("Download a skill, scan it for prompt injection and risky instructions, then install it only if it passes")
+  .argument("<source>", "owner/repo, a GitHub/GitLab https URL, or a local folder")
+  .option("--skill <name>", "pick one skill when the source contains several")
+  .option("--agent <agent...>", `target agent(s): ${ALL_SKILL_AGENTS.join(", ")} (default: claude-code)`)
+  .option("--all-agents", "install for every supported agent")
+  .option("-g, --global", "install for your user instead of the current project")
+  .option("--force", "install even when the scan finds prompt injection or critical risk")
+  .option("--scan-only", "scan without installing anything")
+  .option("--json", "print the scan result as JSON")
+  .action(async (source: string, options: { skill?: string; agent?: string[]; allAgents?: boolean; global?: boolean; force?: boolean; scanOnly?: boolean; json?: boolean }) => {
+    let result;
+    try { result = await withSpinner(`Fetching and scanning ${source}`, () => addSkill(source, options)); }
+    catch (e) { console.error(`✖ ${e instanceof Error ? e.message : e}`); process.exitCode = 1; return; }
+    if (options.json) { console.log(JSON.stringify(result, null, 2)); }
+    else {
+      result.scans.forEach(printSkillScan);
+      console.log("");
+      for (const i of result.installed) console.log(`${green("✔")} Installed ${i.name} → ${i.path}`);
+      if (result.blocked.length) console.error(`✖ Not installed (prompt injection or critical risk): ${result.blocked.join(", ")}\n  Review the findings above. If you trust the source, re-run with --force.`);
+      if (options.scanOnly) console.log(dim("Scan only: nothing was installed."));
+    }
+    if (result.blocked.length) process.exitCode = 2;
+  });
+
+const skills = program.command("skills").description("Inspect installed agent skills");
+skills.command("scan")
+  .description("Scan installed skills (or one skill folder) for prompt injection and risky instructions")
+  .argument("[path]", "a skill folder; omit to scan every installed skill for the supported agents")
+  .option("--json", "print results as JSON")
+  .action(async (target: string | undefined, options: { json?: boolean }) => {
+    const scans = target ? [await scanSkillDir(path.resolve(target), path.basename(path.resolve(target)))] : await scanInstalledSkills();
+    if (options.json) console.log(JSON.stringify(scans, null, 2));
+    else if (!scans.length) console.log("No installed skills found.");
+    else scans.forEach(printSkillScan);
+    if (scans.some(isBlocked)) process.exitCode = 2;
+  });
+
+skills.command("index")
+  .description("Find every skill on this machine (repos, nested folders, plugins), scan them, and write the inventory file")
+  .option("--root <dir...>", "folders to search instead of your home directory")
+  .option("--agents-only", "only check the agents' own skill folders (~/.claude, ~/.agents, ...), not the rest of your home directory")
+  .option("--depth <n>", "maximum folder depth (default 10)")
+  .option("--json", "print the inventory as JSON")
+  .action(async (options: { root?: string[]; agentsOnly?: boolean; depth?: string; json?: boolean }) => {
+    const roots = options.agentsOnly ? await agentSkillRoots() : options.root?.map(r => path.resolve(r));
+    if (!options.json && !roots) console.error(dim("Searching your home folder for skills. macOS may ask you to allow access to Desktop, Documents or Downloads; use --agents-only to skip that."));
+    const search = () => indexSkills({ roots, maxDepth: options.depth ? Number(options.depth) : undefined });
+    const { inventory, changes } = options.json ? await search() : await withSpinner("Searching for skills", search);
+    if (options.json) { console.log(JSON.stringify({ inventory, changes }, null, 2)); return; }
+    const risky = inventory.skills.filter(s => s.level === "HIGH" || s.level === "CRITICAL").length;
+    console.log(`${green("✔")} ${inventory.skills.length} skills indexed (${risky} high/critical) → ${inventoryFile()}`);
+    if (changes.added.length || changes.modified.length || changes.removed.length) console.log(`  ${changes.added.length} new, ${changes.modified.length} modified, ${changes.removed.length} removed since last index`);
+    if (inventory.truncated) console.log(dim("  Search hit its time/size budget; some folders were not visited. Narrow it with --root."));
+    console.log(dim("Run 'beam skills list' to view them."));
+    // A new or changed skill is reported to the workspace right away (enrolled devices only).
+    const sent = await syncSkillInventory().catch(() => null);
+    if (sent?.status === "sent") console.log(dim(`Reported ${sent.skills} skills to your workspace.`));
+  });
+
+skills.command("list")
+  .alias("ls")
+  .description("List every skill in the inventory with its risk score (run 'beam skills index' first)")
+  .option("--risk <level>", "only show LOW, MEDIUM, HIGH or CRITICAL (that level and above)")
+  .option("--agent <agent>", "only show one agent, e.g. claude-code, codex, universal")
+  .option("--json", "print as JSON")
+  .action(async (options: { risk?: string; agent?: string; json?: boolean }) => {
+    let inv = await readInventory();
+    // Nothing has searched beyond the agents' own folders yet. Ask here, at the moment the list is
+    // wanted, rather than at install or startup -- this is what makes macOS ask for folder access.
+    if (!inv?.lastFullScanAt && process.stdin.isTTY && process.stdout.isTTY && !options.json) {
+      const ok = await confirm(`${inv ? "Skills inside your project folders haven't been searched." : "No skill list yet."} Search your home folder now? (macOS may ask for access to Desktop, Documents and Downloads)`, true);
+      if (ok) { await withSpinner("Searching for skills", () => indexSkills()); inv = await readInventory(); }
+      else if (!inv) { inv = (await indexSkills({ roots: await agentSkillRoots() })).inventory; }
+    }
+    if (!inv) { console.error("No inventory yet. Run: beam skills index"); process.exitCode = 1; return; }
+    const order = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]; const min = options.risk ? order.indexOf(options.risk.toUpperCase()) : 0;
+    if (min < 0) { console.error(`--risk must be one of ${order.join(", ")}`); process.exitCode = 1; return; }
+    const trusted = await trustedHashes();
+    const rows = inv.skills.filter(s => order.indexOf(s.level) >= min && (!options.agent || s.agent === options.agent));
+    if (options.json) { console.log(JSON.stringify(rows.map(s => ({ ...s, trusted: trusted.has(s.hash) })), null, 2)); return; }
+    console.log(renderColumns(["skill", "agent", "scope", "risk", "trusted", "path"], rows.map(s => [s.name, s.agent, s.scope, `${s.score} ${s.level}${s.injection ? " ⚠inj" : ""}`, trusted.has(s.hash) ? "yes" : "", s.dir])));
+    console.log(dim(`\n${rows.length} of ${inv.skills.length} skills · indexed ${inv.generatedAt}${inv.truncated ? " (partial)" : ""} · ${inventoryFile()}`));
+    const device = deviceSkillsScore(inv.skills, trusted);
+    console.log(`Device skills score: ${device.score}/100${device.highCount ? ` (${device.highCount} untrusted high/critical skill${device.highCount > 1 ? "s" : ""})` : ""}`);
+    if (!inv.lastFullScanAt) console.log(dim("Only the agents' own skill folders were checked. Run 'beam skills index' to search your project folders too."));
+  });
+
+skills.command("sync")
+  .description("Send skill names and risk scores (never contents) to your workspace, if they changed since the last send")
+  .option("--force", "send even if nothing changed")
+  .action(async (options: { force?: boolean }) => {
+    // Refreshes only the agents' own folders, so this never triggers a macOS folder-access prompt.
+    // Run 'beam skills index' first if you want project folders included.
+    const roots = await agentSkillRoots();
+    if (roots.length || !await readInventory()) await indexSkills({ roots });
+    const result = await syncSkillInventory({ force: options.force });
+    if (result.status === "sent") console.log(`${green("✔")} Sent ${result.skills} skills to your workspace.`);
+    else if (result.status === "unchanged") console.log("Nothing changed since the last send. Use --force to send anyway.");
+    else { console.error(`✖ ${result.status === "not-enrolled" ? "This device isn't connected to a workspace. Run: beam setup" : result.reason ?? result.status}`); process.exitCode = 1; }
+  });
+
+skills.command("trust")
+  .description("Mark a reviewed skill as trusted so the hook stops holding it for approval (pinned to its current content)")
+  .argument("<path>", "skill folder")
+  .action(async (target: string) => {
+    const dir = path.resolve(target); const scan = await scanSkillDir(dir, path.basename(dir));
+    printSkillScan(scan);
+    await trustSkill(scan.name, scan.hash);
+    console.log(`\n${green("✔")} Trusted ${scan.name} (score ${scan.score}/100). Any later edit to it will be scanned again.`);
+  });
+skills.command("untrust")
+  .description("Remove a skill from the trusted list")
+  .argument("<name-or-hash>")
+  .action(async (key: string) => console.log(`Removed ${await untrustSkill(key)} trusted skill(s).`));
+skills.command("trusted")
+  .description("List trusted skills")
+  .action(async () => { const l = await readTrustedSkills(); console.log(l.length ? renderColumns(["name", "hash", "trusted"], l.map(t => [t.name, t.hash.slice(0, 12), t.trustedAt])) : "No trusted skills."); });
 
 const mcp = program.command("mcp").description("Run and protect local MCP integrations");
 mcp.command("proxy")

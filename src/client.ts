@@ -13,6 +13,7 @@ import { applyJevHook } from "./jev.js";
 import { isPathTrusted, readTrustedPaths } from "./trusted-paths.js";
 import { addBlockedTarget, isTargetBlocked, readBlockedTargets } from "./blocked-targets.js";
 import { promptTty } from "./tty-prompt.js";
+import { gateSkill } from "./skill-gate.js";
 
 export async function readToken(): Promise<string> {
   if (process.env.BEAM_TOKEN) return process.env.BEAM_TOKEN;
@@ -401,14 +402,28 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
         // (~/.beam/data/trusted-paths.json) so this ask doesn't fire again for them. The agent
         // can't write that file itself -- isBeamSelfProtectionTarget above blocks it.
         const trusted = await readTrustedPaths().catch(() => []);
-        if (!trusted.length || escaping.some(path => !isPathTrusted(path, trusted))) {
-          decision = {
-            ...decision,
-            action: "ask",
-            reason: "This action accesses a path outside the current workspace.",
-          };
+        const untrusted = escaping.filter(path => !isPathTrusted(path, trusted));
+        if (untrusted.length) {
+          // Hooks run as child processes while the host agent owns the terminal. Reading
+          // /dev/tty here steals input from the host UI and can stall the session until timeout.
+          // Return ASK promptly so the host can show its own permission prompt instead.
+          decision = { ...decision, action: "ask", reason: "This action accesses a path outside the current workspace." };
         }
       }
+    }
+
+    // Skill gate: any call that loads a skill (the Skill tool, or a read of SKILL.md / skills.md)
+    // is scanned first, and its 0-100 risk score is surfaced in the approval prompt. Never
+    // downgrades a decision that already denies/asks, and a scan failure must not break the hook.
+    if (decision.action === "allow" || decision.action === "warn") {
+      try {
+        const skill = await gateSkill(String(data.tool_name ?? ""), toolInput, workspace, policyMode === "enforce");
+        if (skill) {
+          decision = { ...decision, riskScore: Math.max(decision.riskScore, skill.scan.score), riskLevel: skill.scan.level, riskFactors: [...decision.riskFactors, ...skill.scan.findings.slice(0, 5).map(f => f.title)] };
+          if (skill.action !== "allow") decision = { ...decision, action: skill.action, rule: "beam.skill-scan", reason: skill.reason };
+          else if (skill.reason) process.stderr.write(`\n⚠ Beam skill scan: ${skill.reason}\n`);
+        }
+      } catch { /* best-effort: an unreadable skill never blocks the agent by itself */ }
     }
 
     const jev = await applyJevHook(decision, data);

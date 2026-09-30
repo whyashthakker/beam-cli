@@ -10,6 +10,7 @@ import { readIdentity } from "./enroll.js";
 import { syncPolicy } from "./forward.js";
 import { installAllDetectedHooks, type InstallAllResult } from "./install.js";
 import { startOsMonitor } from "./os-monitor.js";
+import { checkSkillsIfDue } from "./skill-watch.js";
 import { checkForTampering, recordExpectedHooks } from "./tamper.js";
 
 function toWebRequest(req: IncomingMessage): Promise<Request> {
@@ -51,6 +52,8 @@ export interface StartServerOptions {
   agentHome?: string;
   /** Whether to run OS-level process/network monitoring (see os-monitor.ts). Defaults to on; tests disable it. */
   osMonitor?: boolean;
+  /** Whether to watch the agents' skill folders and report changes. Defaults to on unless osMonitor is off, so tests never touch the real home. */
+  skillIndex?: boolean;
 }
 
 export async function startServer(options: StartServerOptions = {}): Promise<{ url: string; token: string; directory: string; customRules: { path: string; loaded: number; errors: string[] }; policySync: boolean; agentInstalls: InstallAllResult[]; close: () => void }> {
@@ -141,9 +144,26 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
     app.forwardQueue.push(events);
   });
 
+  // Once a day (and at startup, if a day has passed since the last skill scan), looks for skills that
+  // were added or changed and tells the workspace -- no manual `beam skills sync` needed. Skills
+  // only: policy sync, tamper checks and event forwarding above keep their own timers. The hourly
+  // tick below just asks "is a day up yet?" (one small file read), so a laptop that was asleep at
+  // the moment it was due still catches up soon after waking. A report is sent only if names or
+  // scores changed (skill-sync.ts); see skill-watch.ts for what gets scanned.
+  let skillTimer: NodeJS.Timeout | undefined;
+  if (options.skillIndex ?? options.osMonitor !== false) {
+    const run = () => { void checkSkillsIfDue().then(result => {
+      if (!result) return;
+      for (const dir of [...result.changes.added, ...result.changes.modified]) console.error(`\nBeam skill inventory: ${result.changes.added.includes(dir) ? "new" : "modified"} skill ${dir} (run 'beam skills list')`);
+    }).catch(() => {}); };
+    run();
+    skillTimer = setInterval(run, 60 * 60_000);
+    skillTimer.unref?.();
+  }
+
   return {
     url: `http://${hostname}:${boundPort}`, token, directory, customRules, agentInstalls,
     policySync: Boolean(identity),
-    close: () => { if (policyTimer) clearInterval(policyTimer); clearInterval(tamperTimer); osMonitor.stop(); app.forwardQueue.flush(); server.close(); },
+    close: () => { if (policyTimer) clearInterval(policyTimer); clearInterval(tamperTimer); if (skillTimer) clearInterval(skillTimer); osMonitor.stop(); app.forwardQueue.flush(); server.close(); },
   };
 }

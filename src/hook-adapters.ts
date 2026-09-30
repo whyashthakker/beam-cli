@@ -8,13 +8,20 @@ function passthrough(raw: Obj): Obj {
 
 // GitHub Copilot CLI's preToolUse payload is camelCase and has no hook_event_name field —
 // it's implied by which hooks.json array the handler is registered under.
+// toolArgs arrives as a JSON *string* (docs.github.com Copilot hooks reference), so parse it --
+// left as a string, everything downstream reads tool_input as empty.
+function parseArgs(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  try { const parsed = JSON.parse(value); return parsed && typeof parsed === "object" ? parsed : value; } catch { return value; }
+}
+
 function copilotCamel(raw: Obj): Obj {
   return {
     ...raw,
     session_id: raw.sessionId ?? raw.session_id,
     cwd: raw.cwd,
     tool_name: raw.toolName ?? raw.tool_name,
-    tool_input: raw.toolArgs ?? raw.tool_input,
+    tool_input: parseArgs(raw.toolArgs ?? raw.tool_input),
     hook_event_name: raw.hook_event_name ?? "PreToolUse",
   };
 }
