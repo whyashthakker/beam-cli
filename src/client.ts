@@ -14,6 +14,7 @@ import { isPathTrusted, readTrustedPaths } from "./trusted-paths.js";
 import { addBlockedTarget, isTargetBlocked, readBlockedTargets } from "./blocked-targets.js";
 import { promptTty } from "./tty-prompt.js";
 import { gateSkill } from "./skill-gate.js";
+import { notePrompt, sessionContextFor, sessionTitlesEnabled } from "./session-title.js";
 
 export async function readToken(): Promise<string> {
   if (process.env.BEAM_TOKEN) return process.env.BEAM_TOKEN;
@@ -443,6 +444,26 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     // the session identifier do not leave this machine. Scoped to prompt.submit only -- deleting
     // session_id on every event type broke session grouping (and the tool_use_id dedup in
     // core.ts, which is keyed per-hostname/phase but not per-session) for all other hook events.
+    // The only things derived from a prompt that are allowed out: a session title (first prompt) and
+    // a short per-turn topic, both redacted and capped at 80 characters -- see session-title.ts.
+    // Raw prompt text still never leaves the machine.
+    if (sessionTitlesEnabled()) {
+      try {
+        const sessionId = String(data.session_id ?? data.sessionId ?? "");
+        // Cursor (beforeSubmitPrompt) and Gemini (BeforeAgent) name their prompt hook differently
+        // from Claude Code / Codex, and are not rewritten to prompt.submit above (each agent's
+        // block contract is keyed on its own event name), so recognise them here.
+        const otherPromptHook = ["beforeSubmitPrompt", "BeforeAgent"].includes(String(data.hook_event_name)) && typeof data.prompt === "string";
+        if (data.event_type === "prompt.submit" || otherPromptHook) {
+          await notePrompt(sessionId, String(data.prompt ?? ""), String(data.cwd ?? ""));
+          if (otherPromptHook) delete data.prompt; // the raw prompt must not travel further than this check
+        } else {
+          const context = await sessionContextFor(sourceAgent, sessionId, { home, transcriptPath: typeof data.transcript_path === "string" ? data.transcript_path : undefined });
+          if (context) { data.session_title = context.title; data.session_title_source = context.titleSource; data.turn = context.turn; data.turn_topic = context.topic; data.turn_shift = context.shift; }
+        }
+      } catch { /* best-effort: a title must never affect enforcement */ }
+    }
+
     if (data.event_type === "prompt.submit") {
       delete data.prompt;
       delete data.command;

@@ -3,7 +3,8 @@ import { findAgent, type Obj } from "./agents.js";
 // Claude Code, Codex, and Cursor all send tool_name/tool_input/session_id/cwd/hook_event_name
 // (core.normalize already reads exactly these fields, case-insensitively for hook_event_name).
 function passthrough(raw: Obj): Obj {
-  return raw;
+  // Cursor names its session `conversation_id`; without this its events are all "unassigned".
+  return raw.session_id === undefined && typeof raw.conversation_id === "string" ? { ...raw, session_id: raw.conversation_id } : raw;
 }
 
 // GitHub Copilot CLI's preToolUse payload is camelCase and has no hook_event_name field —
@@ -22,7 +23,8 @@ function copilotCamel(raw: Obj): Obj {
     cwd: raw.cwd,
     tool_name: raw.toolName ?? raw.tool_name,
     tool_input: parseArgs(raw.toolArgs ?? raw.tool_input),
-    hook_event_name: raw.hook_event_name ?? "PreToolUse",
+    // userPromptSubmitted carries `prompt` and no tool; treat it like Claude's UserPromptSubmit.
+    hook_event_name: raw.hook_event_name ?? (typeof raw.prompt === "string" && !(raw.toolName ?? raw.tool_name) ? "UserPromptSubmit" : "PreToolUse"),
   };
 }
 

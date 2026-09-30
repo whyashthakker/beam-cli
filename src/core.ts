@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
+import { changedLines, type LineChanges } from "./edit-stats.js";
 
 export type Severity = "critical" | "high" | "medium" | "info";
 export type Finding = { id: string; title: string; severity: Severity; explanation: string; evidence: string; line?: number };
 export type Event = {
-  id: string; timestamp: string; receivedAt: string; agent: string; session: string;
+  id: string; timestamp: string; receivedAt: string; agent: string; session: string; lines?: LineChanges; sessionTitle?: string; sessionTitleSource?: "prompt" | "agent"; turn?: { n: number; topic: string; shift: boolean };
   type: string; tool: string; summary: string; project: string; source: string;
   endpoint: string; model: string; phase: string; findings: Finding[];
   mcp?: { server: string; tool?: string; resource?: string; requestType?: "tool" | "resource" | "prompt" | "unknown" };
@@ -176,7 +177,9 @@ export function normalize(raw: Obj): Event {
       : JSON.stringify(raw)
     ).digest("hex"),
     timestamp: new Date(timestamp).toISOString(), receivedAt: new Date().toISOString(), agent: clean(str(raw.source_agent ?? raw.agent, "custom")),
-    session: clean(str(raw.session_id ?? raw.sessionId ?? raw.session, "unassigned")), type: clean(type), tool: clean(tool), summary: redact(detail).slice(0, 4000),
+    session: clean(str(raw.session_id ?? raw.sessionId ?? raw.session, "unassigned")),
+    ...(str(raw.session_title) ? { sessionTitle: clean(str(raw.session_title)).slice(0, 100), sessionTitleSource: raw.session_title_source === "agent" ? "agent" as const : "prompt" as const } : {}),
+    ...(number(raw.turn) ? { turn: { n: Math.floor(number(raw.turn) as number), topic: clean(str(raw.turn_topic)).slice(0, 100), shift: raw.turn_shift === true } } : {}), type: clean(type), tool: clean(tool), summary: redact(detail).slice(0, 4000),
     project: clean(str(raw.project_path ?? raw.cwd)), source: clean(str(raw.source_type, raw.hook_event_name ? "hook" : "import")),
     endpoint: clean(str(obj(raw.endpoint).hostname ?? raw.hostname, "local")), model: clean(str(raw.model)),
     phase,
@@ -185,6 +188,7 @@ export function normalize(raw: Obj): Event {
       tags: Array.isArray(raw.tags) ? raw.tags.filter((v): v is string => typeof v === "string").slice(0, 100).map(clean) : [],
       evidence: redact(JSON.stringify(raw.evidence_refs ?? raw.evidence ?? {})).slice(0, 8000) },
     ...(mcpServer || explicitMcpTool || explicitMcpResource ? { mcp: { server: clean(mcpServer || "unknown"), ...(mcpTool ? { tool: clean(mcpTool) } : {}), ...(explicitMcpResource ? { resource: clean(explicitMcpResource) } : {}), requestType: mcpRequestType } } : {}),
+    ...(type === "file.write" && changedLines(raw.tool_input ?? raw.input) ? { lines: changedLines(raw.tool_input ?? raw.input) } : {}),
     findings, inputTokens, outputTokens, costUsd,
   };
 }
