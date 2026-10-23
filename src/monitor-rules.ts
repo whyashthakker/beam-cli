@@ -2,15 +2,18 @@
 // HTTP access logs. Separate from the agent-hook catalog in core.ts on purpose -- application logs
 // are full of words like "env", "token" and "production" that would drown those rules -- but a few
 // built-in rules that mean the same thing anywhere (reverse shells, piped remote code, cloud
-// metadata access, prompt injection) are reused as-is. Heuristic, like everything else in Beam.
+// metadata access) are reused as-is. Attacks on LLM features (prompt injection and friends) come
+// from prompt-attacks.ts. Heuristic, like everything else in Beam.
 import { builtinRulesById, type RuleCategory } from "./rule-catalog.js";
 import type { CustomDetector } from "./data-detectors.js";
 import type { MonitorSeverity } from "./monitor-client.js";
+import { promptAttack, revealHidden } from "./prompt-attacks.js";
 
-export type LineSource = "log" | "http";
+/** log/http: lines from log files and traffic. prompt/output: text going into, or coming out of, an LLM (SDK). */
+export type LineSource = "log" | "http" | "prompt" | "output";
 export interface MonitorRule {
-  id: string; title: string; severity: MonitorSeverity; category: RuleCategory | "exploit";
-  /** Restricts the rule to access-log lines; omitted means every line. */
+  id: string; title: string; severity: MonitorSeverity; category: RuleCategory | "exploit" | "llm";
+  /** Where the rule applies; omitted means log and http lines (never prompts or model output). */
   sources?: LineSource[];
   /** `decoded` is URL-decoded (twice, for double encoding); `raw` is the line as written. */
   match: (decoded: string, raw: string) => boolean;
@@ -19,6 +22,23 @@ export interface MonitorRule {
 // Trailing boundary for shell commands, so `| id=5` in a log line isn't read as running `id`.
 const END = String.raw`(?=$|[\s;'"&|)\x60])`;
 const commandInjection = new RegExp(String.raw`(?:[;|\x60]|\$\(|&&)\s*(?:id|whoami|uname\s+-a|cat\s+/etc/(?:passwd|shadow)|(?:curl|wget)\s+\S+|nc\s+-\w|bash\s+-[ic]|sh\s+-c|ping\s+-c\s*\d+)${END}`, "i");
+// A URL-like parameter pointing the server at itself, its network or its cloud metadata, or a
+// scheme only an attacker wants fetched. LLM agents with browsing or fetch tools are a common way in.
+const ssrf = new RegExp([
+  String.raw`[?&][^=&\s]*=\s*(?:gopher|dict|ldap|tftp|jar|netdoc)://`,
+  String.raw`[?&][^=&\s]*(?:url|uri|link|src|dest|target|redirect|callback|webhook|feed|host|endpoint|proxy|image|fetch|next|return)[^=&\s]*=\s*(?:(?:https?|ftp)://(?:localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|0x7f\w*|2130706433|\[::(?:1|ffff:[^\]]*)?\]|10\.\d+\.\d+\.\d+|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|169\.254\.|100\.100\.100\.200|metadata\.google\.internal)|file:/)`,
+].join("|"), "i");
+// Credentials, by format. LLM provider keys are worth the most to an attacker right now.
+const SECRET = /-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk-(?:proj-|ant-|or-v1-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|AIza[0-9A-Za-z_-]{35}|gsk_[A-Za-z0-9]{40,}|hf_[A-Za-z0-9]{30,}|r8_[A-Za-z0-9]{30,}|xai-[A-Za-z0-9]{40,}|pplx-[A-Za-z0-9]{40,}|beam_app_[\w-]{20,})\b|\bauthorization:\s*bearer\s+[A-Za-z0-9._~+/-]{20,}/i;
+const XSS = /<script[\s>]|javascript:\s*[a-z(]|<(?:img|svg|body|iframe)\b[^>]{0,200}\son(?:error|load)\s*=|\bdocument\.cookie\b/i;
+const EVERYWHERE: LineSource[] = ["log", "http", "prompt", "output"];
+const SENSITIVE_FILE = /\/(?:\.env(?:\.[\w-]+)?|\.git\/(?:config|HEAD)|\.aws\/credentials|\.ssh\/id_\w+|wp-config\.php(?:\.bak)?|\.htpasswd|server-status|actuator\/(?:env|heapdump)|\.DS_Store)(?=[\s?"'#]|$)/i;
+const ACCESS_STATUS = /"[A-Z]+ \S+ HTTP\/[\d.]+" (\d{3})\b|"(?:status|httpStatus|status_code|statusCode|response_status)"\s*:\s*"?(\d{3})\b/;
+/** The response status in an access-log line was 2xx. */
+function isSuccess(line: string): boolean {
+  const m = line.match(ACCESS_STATUS);
+  return (m?.[1] ?? m?.[2] ?? "").startsWith("2");
+}
 
 const appRules: MonitorRule[] = [
   { id: "web.jndi_injection", title: "JNDI lookup (Log4Shell-style) injection", severity: "critical", category: "exploit",
@@ -35,22 +55,64 @@ const appRules: MonitorRule[] = [
     match: s => /\/(?:c99|r57|wso|b374k|webshell|cmd|shell)\.(?:php|jsp|aspx?)\b|[?&](?:cmd|exec|command)=(?:whoami|id|ls|uname|cat)\b/i.test(s) },
   { id: "web.deserialization", title: "Serialized object payload", severity: "high", category: "exploit",
     match: s => /\brO0AB[A-Za-z0-9+/=]{8,}|\bO:\d+:"[A-Za-z_\\]+":\d+:\{/.test(s) },
+  { id: "web.ssrf", title: "Server-side request forgery attempt", severity: "high", category: "exploit", sources: ["http"],
+    match: s => ssrf.test(s) },
   { id: "app.secret_in_log", title: "Credential written to logs", severity: "high", category: "secrets",
-    match: (_s, raw) => /-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|AIza[0-9A-Za-z_-]{35}|beam_app_[\w-]{20,})\b|\bauthorization:\s*bearer\s+[A-Za-z0-9._~+/-]{20,}/i.test(raw) },
+    match: (_s, raw) => SECRET.test(raw) },
   { id: "web.xss", title: "Cross-site scripting attempt", severity: "medium", category: "exploit",
-    match: s => /<script[\s>]|javascript:\s*[a-z(]|<(?:img|svg|body|iframe)\b[^>]{0,200}\son(?:error|load)\s*=|\bdocument\.cookie\b/i.test(s) },
+    match: s => XSS.test(s) },
   { id: "web.prototype_pollution", title: "Prototype pollution attempt", severity: "medium", category: "exploit",
     match: s => /\b__proto__\b\s*[\]["'=:.]|constructor\s*\[\s*["']?prototype/i.test(s) },
+  // Bots ask every site for /.env all day, so a probe alone is medium. One that got a 2xx back
+  // may have handed over the app's keys: high. (An app that answers 200 to every path, like a
+  // single-page app's catch-all, can trip the second.)
   { id: "web.sensitive_file_probe", title: "Probe for secrets or config files", severity: "medium", category: "recon", sources: ["http"],
-    match: s => /\/(?:\.env(?:\.[\w-]+)?|\.git\/(?:config|HEAD)|\.aws\/credentials|\.ssh\/id_\w+|wp-config\.php(?:\.bak)?|\.htpasswd|server-status|actuator\/(?:env|heapdump)|\.DS_Store)(?=[\s?"'#]|$)/i.test(s) },
+    match: s => SENSITIVE_FILE.test(s) },
+  { id: "web.secret_file_exposed", title: "Secret or config file served to a client", severity: "high", category: "secrets", sources: ["http"],
+    match: (s, raw) => SENSITIVE_FILE.test(s) && isSuccess(raw) },
   { id: "web.scanner", title: "Known attack tool", severity: "medium", category: "recon", sources: ["http"],
     match: s => /\b(?:sqlmap|nikto|nuclei|masscan|zgrab|acunetix|nessus|wpscan|dirbuster|gobuster|feroxbuster|ffuf|hydra|openvas|commix|xsstrike)\b/i.test(s) },
 ];
 
-const sharedRules: MonitorRule[] = builtinRulesById(["network.reverse-shell", "execution.remote", "execution.obfuscated", "network.metadata", "instructions.override"])
-  .map(r => ({ id: r.id, title: r.title, severity: r.severity === "info" ? "medium" : r.severity, category: r.category, match: (s: string) => r.match(s) }));
+// Attacks on the app's LLM features. Prompt-side rules also read traffic and logs, because
+// prompts arrive in query strings and apps log them; forged chat markers only count where a
+// client wrote them (a model server's own logs are full of its template).
+const llmRules: MonitorRule[] = [
+  { id: "llm.prompt_injection", title: "Prompt injection attempt", severity: "high", category: "llm", sources: EVERYWHERE,
+    match: s => promptAttack.override(s) },
+  { id: "llm.reviewer_manipulation", title: "Attempt to sway an AI reviewer", severity: "high", category: "llm", sources: EVERYWHERE,
+    match: s => promptAttack.reviewer(s) },
+  { id: "llm.hidden_instructions", title: "Hidden instructions in invisible Unicode", severity: "high", category: "llm", sources: EVERYWHERE,
+    match: s => promptAttack.hidden(s) },
+  { id: "llm.chat_template_injection", title: "Forged system or chat-template markers", severity: "high", category: "llm", sources: ["http", "prompt"],
+    match: s => promptAttack.chatTemplate(s) },
+  { id: "llm.secret_extraction", title: "Attempt to extract API keys or secrets", severity: "high", category: "llm", sources: ["log"],
+    match: s => promptAttack.secretRequest(s) },
+  { id: "llm.secret_extraction", title: "Attempt to extract API keys or secrets", severity: "high", category: "llm", sources: ["http", "prompt"],
+    match: s => promptAttack.secretRequest(s) || promptAttack.secretCommand(s) },
+  { id: "llm.jailbreak", title: "Jailbreak attempt", severity: "medium", category: "llm", sources: ["log", "http", "prompt"],
+    match: s => promptAttack.jailbreak(s) },
+  { id: "llm.prompt_extraction", title: "System prompt or data extraction attempt", severity: "medium", category: "llm", sources: ["log", "http", "prompt"],
+    match: s => promptAttack.extraction(s) },
+  { id: "llm.output_exfiltration", title: "Data exfiltration link in model output", severity: "high", category: "llm", sources: ["log"],
+    match: (_s, raw) => promptAttack.markdownExfil(raw) },
+  { id: "llm.output_exfiltration", title: "Data exfiltration link in model output", severity: "high", category: "llm", sources: ["output"],
+    match: (_s, raw) => promptAttack.htmlExfil(raw) },
+  { id: "llm.output_secret", title: "Credential in model output", severity: "high", category: "llm", sources: ["output"],
+    match: (_s, raw) => SECRET.test(raw) || promptAttack.envSecret(raw) },
+  { id: "llm.output_script", title: "Script or active HTML in model output", severity: "medium", category: "llm", sources: ["output"],
+    match: (_s, raw) => XSS.test(raw) },
+];
 
-export const monitorRules: MonitorRule[] = [...appRules, ...sharedRules];
+const sharedRules: MonitorRule[] = builtinRulesById(["network.reverse-shell", "execution.remote", "execution.obfuscated", "network.metadata"])
+  .map(r => ({
+    id: r.id, title: r.title, severity: r.severity === "info" ? "medium" : r.severity, category: r.category, match: (s: string) => r.match(s),
+    // An agent asked to fetch the metadata endpoint is the same attack as a request for it.
+    ...(r.id === "network.metadata" ? { sources: EVERYWHERE } : {}),
+  }));
+
+export const monitorRules: MonitorRule[] = [...appRules, ...llmRules, ...sharedRules];
+const CLASSIC: LineSource[] = ["log", "http"];
 
 const HTTP_LINE = /"(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE) \S+ HTTP\/[\d.]+"|^\S+ \S+ \S+ \[[^\]]+\] "|"(?:method|http_method|request_method)"\s*:\s*"[A-Z]+"/;
 export function lineSource(line: string): LineSource {
@@ -71,10 +133,11 @@ export function decodeForMatch(line: string): string {
   return s;
 }
 
-export function matchLine(line: string, source: LineSource = lineSource(line)): MonitorRule[] {
-  const decoded = decodeForMatch(line);
+/** The rules a line matches. Prompts and model output aren't URL-decoded: they aren't URLs. */
+export function matchLine(line: string, source: LineSource = lineSource(line), extra: MonitorRule[] = []): MonitorRule[] {
   const raw = line.length > 16_384 ? line.slice(0, 16_384) : line;
-  return monitorRules.filter(r => (!r.sources || r.sources.includes(source)) && r.match(decoded, raw));
+  const decoded = source === "prompt" || source === "output" ? raw : decodeForMatch(line);
+  return [...monitorRules, ...extra].filter(r => (r.sources ?? CLASSIC).includes(source) && r.match(decoded, raw));
 }
 
 /**
@@ -83,9 +146,10 @@ export function matchLine(line: string, source: LineSource = lineSource(line)): 
  * bearer tokens, URL userinfo, email addresses and the policy's custom detector matches.
  */
 export function redactLine(line: string, custom: CustomDetector[] = []): string {
-  let out = line.slice(0, 4000)
+  // Hidden Unicode text is made readable first, so it is redacted like the rest and a reviewer can see it.
+  let out = revealHidden(line.slice(0, 4000))
     .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-]*PRIVATE KEY-----|$)/g, "[REDACTED PRIVATE KEY]")
-    .replace(/\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|AIza[0-9A-Za-z_-]{35}|beam_app_[\w-]{20,})\b/g, "[REDACTED TOKEN]")
+    .replace(/\b(?:sk-(?:proj-|ant-|or-v1-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|AIza[0-9A-Za-z_-]{35}|gsk_[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|r8_[A-Za-z0-9]{20,}|xai-[A-Za-z0-9]{20,}|pplx-[A-Za-z0-9]{20,}|beam_app_[\w-]{20,})\b/g, "[REDACTED TOKEN]")
     .replace(/(bearer\s+)[A-Za-z0-9._~+/-]{8,}/gi, "$1[REDACTED]")
     .replace(/(\b(?:[\w-]*(?:api[_-]?key|token|secret|password|passwd|pwd|authorization|session|cookie)[\w-]*)["']?\s*[:=]\s*)["']?[^\s,"';&}\]]+/gi, "$1[REDACTED]")
     .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[REDACTED]@")
@@ -111,8 +175,21 @@ export function clientIp(line: string): string | undefined {
 
 const AUTH_PATH = /\/(?:login|signin|sign-in|auth|oauth|token|session|api\/v\d+\/auth|wp-login\.php|admin)\b/i;
 const AUTH_FAIL_TEXT = /\b(?:login|authentication|auth|sign[- ]?in)\s+(?:failed|failure|denied)|\binvalid\s+(?:password|credentials|username or password|api key|token)|\bfailed\s+password\b|\bincorrect\s+password\b|\bunauthori[sz]ed\b/i;
+const REQUEST_LINE = /"([A-Z]+) (\S+) HTTP\/[\d.]+"/;
+const JSON_METHOD = /"(?:method|http_method|request_method)"\s*:\s*"([A-Z]+)"/;
+const JSON_PATH = /"(?:path|uri|url|request_uri|requestPath)"\s*:\s*"([^"]+)"/;
+const LLM_PATH = /\/(?:chat|completions?|generate|llm|ai|assistant|agents?|ask|prompt|inference|copilot)(?:[/?#]|$)|\/v1\/(?:messages|responses|embeddings)(?:[/?#]|$)/i;
+/** A POST to what looks like an LLM endpoint (chat, completions, generate…), each one a paid model call. */
+export function isLlmRequest(line: string): boolean {
+  const request = line.match(REQUEST_LINE);
+  const method = request?.[1] ?? line.match(JSON_METHOD)?.[1];
+  const path = request?.[2] ?? line.match(JSON_PATH)?.[1];
+  return method === "POST" && Boolean(path && LLM_PATH.test(path.split("?")[0]!));
+}
+
 /** A failed sign-in: a 401/403 on an auth path in an access log, or an app's own "login failed" line. */
 export function isAuthFailure(line: string, source: LineSource): boolean {
+  if (source === "prompt" || source === "output") return false; // a chat message saying "login failed" isn't one
   if (source === "http") return (/"\s(?:401|403)\s/.test(line) || /"(?:status|httpStatus|status_code|statusCode|response_status)"\s*:\s*"?(?:401|403)\b/.test(line)) && AUTH_PATH.test(line);
   return AUTH_FAIL_TEXT.test(line);
 }

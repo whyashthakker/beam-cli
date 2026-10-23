@@ -1,10 +1,10 @@
 ---
 name: agentbeam-app-monitoring
-description: Add AgentBeam app monitoring to an application - check its dependencies for known vulnerabilities with beam cve check, and watch its logs and traffic for attacks around the clock with beam monitor - without changing how the app runs. Use when the user asks to monitor an app, server or service with AgentBeam, add beam monitor, or check dependencies with beam cve check.
+description: Add AgentBeam app monitoring to an application - check its dependencies for known vulnerabilities with beam cve check, watch its logs and traffic for attacks around the clock with beam monitor, and check what goes into and comes out of its LLM features for prompt injection and data exfiltration - without changing how the app runs. Use when the user asks to monitor an app, server or service with AgentBeam, add beam monitor, protect an LLM or chatbot feature from prompt injection, or check dependencies with beam cve check.
 license: AGPL-3.0-only
 metadata:
   author: Beam
-  version: "1.0.0"
+  version: "1.1.0"
   website: https://agentbeam.com
 ---
 
@@ -58,6 +58,16 @@ Add the in-app SDK. It needs only the app token, no extra service or platform cr
 - Express: an `app.use` middleware that calls `beam.request({ method: req.method, url: req.originalUrl, ip: req.ip, userAgent: req.get("user-agent") })` and then `next()`.
 
 The SDK never throws or blocks requests. The user sets `BEAM_APP_TOKEN` in the app's environment on their platform.
+
+#### If the app calls an LLM
+
+Find where the app sends text to a model (the OpenAI, Anthropic or AI SDK call, a LangChain chain, an agent loop) and where it uses the reply. Use the same `beam` instance:
+
+- Before the model call: `const check = beam.prompt(userMessage, { user: userId })`. Also pass content the model will read that a stranger could have written, like retrieved documents, web pages, emails and tool results, with a `label` such as `"retrieved web page"`. Pass an opaque user id or the client address, never an email.
+- On the reply, before it's shown, rendered as markdown or HTML, or handed to tools or another agent: `beam.output(replyText)`.
+- Suggest a canary: a random marker such as `canary-` plus 8 random hex characters. The user adds it to the model's instructions and to the app's configuration, and the app passes it as `createAppMonitor({ canaries: [marker] })`. If it ever shows up in a reply, the instructions leaked.
+
+Both calls return `{ flagged, severity, matches }` and only report; they don't stop anything. Ask the user before you make the app act on them, for example by refusing a prompt when `check.severity` is `"high"` or `"critical"`, or by not rendering a reply flagged with `llm.output_exfiltration`. If the prompts may hold personal data, offer `createAppMonitor({ excerpts: false })`: findings then carry the rule and sender but no text.
 
 ### 4b. Railway, when the app can't be changed
 
@@ -116,6 +126,7 @@ The test finding should appear within seconds on https://app.agentbeam.com/dashb
 
 ## Optional extras
 
+- **LLM features outside Node.js:** if the app logs its prompts or model replies, point `beam monitor --file` at that log. The same prompt injection rules read it.
 - **Review flagged lines with the user's own LLM:** set the `BEAM_LLM_*` variables (endpoint, model and, if the endpoint needs one, its key) where `beam monitor` runs.
 - **Separate alert channels:** add webhooks on the dashboard and limit each one to particular apps.
 - **Full guide:** https://docs.agentbeam.com/agent-cli/app-monitoring

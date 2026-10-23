@@ -1,17 +1,21 @@
 // AgentBeam App monitoring inside your app: `import { createAppMonitor } from "@agent-beam/beam/monitor"`.
 //
 // The in-process alternative to running `beam monitor` next to an app. Hand it each request
-// (Next.js middleware, an Express/Fastify hook) and, optionally, log lines. Detection runs right
+// (Next.js middleware, an Express/Fastify hook) and, optionally, log lines. Apps with LLM features
+// also hand it what goes into the model (prompt) and what comes out (output). Detection runs right
 // here with the same rules as the CLI; only redacted findings leave the process, in batches,
 // authenticated with the app's least-privilege BEAM_APP_TOKEN.
 //
 // It never throws, never blocks or alters a request, and never makes a request wait on the
 // network: findings are sent in the background (pass flush() to event.waitUntil in middleware).
+// prompt() and output() return what they found, so the app can decide to refuse or withhold.
 // If AgentBeam is unreachable, App monitoring is off for the workspace, or the monthly allowance
 // is spent, findings are dropped and the app doesn't notice. No dependencies and no Node.js
 // built-ins, so it runs in edge runtimes too.
-import type { MonitorFinding, MonitorLevel } from "./monitor-client.js";
+import type { MonitorFinding, MonitorLevel, MonitorSeverity } from "./monitor-client.js";
 import { MonitorPipeline, type SendOutcome } from "./monitor-pipeline.js";
+import { matchLine, type MonitorRule } from "./monitor-rules.js";
+import { containsCanary } from "./prompt-attacks.js";
 
 export interface AppMonitorOptions {
   /** The app's token from the dashboard (App monitoring > Apps). Default: BEAM_APP_TOKEN. */
@@ -22,6 +26,13 @@ export interface AppMonitorOptions {
   flushIntervalMs?: number;
   /** Diagnostics (misconfiguration, App monitoring turned off, revoked token). Silent by default. */
   onError?: (message: string) => void;
+  /**
+   * Random strings planted in your system prompt (at least 8 characters, e.g. "canary-7f3a9c1e").
+   * One showing up in output() means the system prompt leaked: a critical finding.
+   */
+  canaries?: string[];
+  /** False: findings from prompt() and output() carry the rule and sender but no text excerpt. Default true. */
+  excerpts?: boolean;
 }
 
 export interface RequestInfo {
@@ -33,18 +44,46 @@ export interface RequestInfo {
   status?: number | null;
 }
 
+export interface PromptInfo {
+  /** Who sent it, to group repeats and spot floods: the client address or an opaque user id (not an email). */
+  ip?: string | null;
+  user?: string | null;
+  /** Shown with the finding, e.g. "support chat" or "retrieved web page". Default "prompts" or "model output". */
+  label?: string;
+}
+
+/** What a local check found. Matches count whatever the dashboard's level; reporting follows the level. */
+export interface TextCheck {
+  flagged: boolean;
+  /** The most severe match, or null when nothing matched. */
+  severity: MonitorSeverity | null;
+  matches: { ruleId: string; title: string; severity: MonitorSeverity }[];
+}
+
 export interface AppMonitor {
   /** Check one incoming request. Cheap and synchronous; never throws. */
   request(info: RequestInfo): void;
   /** Check one application log line (errors, auth failures, anything the app prints). */
   log(line: string): void;
   /**
+   * Check text before it reaches your model: the user's message, or content the model will read
+   * (a retrieved document, web page, email or tool result). Flags prompt injection, hidden
+   * instructions, forged chat markers, jailbreaks and system prompt extraction, and floods from
+   * one sender. Synchronous and local; never throws.
+   */
+  prompt(text: string, info?: PromptInfo): TextCheck;
+  /**
+   * Check model output before you show it or act on it: zero-click exfiltration links, credentials,
+   * script, a leaked canary, and injected instructions passed along to the next agent.
+   */
+  output(text: string, info?: PromptInfo): TextCheck;
+  /**
    * Send pending findings when the flush interval is due (or now, with `force`). Returns the
    * in-flight send, so `event.waitUntil(beam.flush())` keeps it alive past the response; cheap to
    * call on every request. Never rejects.
    */
   flush(options?: { force?: boolean }): Promise<void>;
-  /** False when there's no valid token or it was revoked: every call is then a no-op. */
+  /** False when there's no valid token or it was revoked: nothing is reported, and prompt() and output() only check locally. */
   readonly enabled: boolean;
 }
 
@@ -63,21 +102,76 @@ function withTimeout(ms: number): { signal: AbortSignal; done: () => void } {
   return { signal: controller.signal, done: () => clearTimeout(timer) };
 }
 
-const noop: AppMonitor = { request() {}, log() {}, flush: async () => {}, enabled: false };
+const SEVERITY_RANK: Record<MonitorSeverity, number> = { critical: 3, high: 2, medium: 1, low: 0 };
+const clean = (): TextCheck => ({ flagged: false, severity: null, matches: [] });
+
+function canaryRule(canaries: string[]): MonitorRule[] {
+  const usable = canaries.filter(c => typeof c === "string" && c.replace(/[^a-z0-9]/gi, "").length >= 8);
+  return usable.length
+    ? [{ id: "llm.system_prompt_leak", title: "System prompt leaked in model output", severity: "critical", category: "llm", sources: ["output"],
+        match: (_s, raw) => containsCanary(raw, usable) }]
+    : [];
+}
+
+// Rules read 16 KB at a time; a long retrieved document is read in overlapping windows, up to 256 KB.
+const WINDOW = 16_384;
+const OVERLAP = 512;
+const MAX_TEXT = 262_144;
+
+/** The check, and the window that matched (what gets reported). */
+function scan(text: unknown, source: "prompt" | "output", extra: MonitorRule[] = []): { result: TextCheck; window: string } {
+  try {
+    if (typeof text !== "string" || !text.trim()) return { result: clean(), window: "" };
+    const all = text.slice(0, MAX_TEXT);
+    let window = all.slice(0, WINDOW);
+    let rules: MonitorRule[] = [];
+    for (let at = 0; at < all.length && !rules.length; at += WINDOW - OVERLAP) {
+      window = all.slice(at, at + WINDOW);
+      rules = matchLine(window, source, extra);
+    }
+    if (!rules.length) return { result: clean(), window: all.slice(0, WINDOW) };
+    const matches = rules.map(r => ({ ruleId: r.id, title: r.title, severity: r.severity }))
+      .filter((m, i, list) => list.findIndex(o => o.ruleId === m.ruleId) === i);
+    const severity = matches.reduce((worst, m) => (SEVERITY_RANK[m.severity] > SEVERITY_RANK[worst] ? m.severity : worst), matches[0]!.severity);
+    return { result: { flagged: true, severity, matches }, window };
+  } catch {
+    return { result: clean(), window: "" };
+  }
+}
+const check = (text: unknown, source: "prompt" | "output", extra?: MonitorRule[]) => scan(text, source, extra).result;
+
+/** Checks text bound for an LLM, locally, without reporting it anywhere. Never throws. */
+export function checkPrompt(text: string): TextCheck {
+  return check(text, "prompt");
+}
+
+/** Checks model output, locally, without reporting it anywhere. Pass your system prompt's canaries to catch leaks. */
+export function checkOutput(text: string, options: { canaries?: string[] } = {}): TextCheck {
+  return check(text, "output", canaryRule(options.canaries ?? []));
+}
+
+// Without a token the checks still work locally; nothing is reported.
+const noop: AppMonitor = {
+  request() {}, log() {}, flush: async () => {}, enabled: false,
+  prompt: text => checkPrompt(text),
+  output: text => checkOutput(text),
+};
 
 export function createAppMonitor(options: AppMonitorOptions = {}): AppMonitor {
   const report = (message: string) => { try { options.onError?.(message); } catch { /* never throw */ } };
   const token = options.token?.trim() || env("BEAM_APP_TOKEN");
+  const canaries = canaryRule(Array.isArray(options.canaries) ? options.canaries : []);
+  const local: AppMonitor = { ...noop, output: text => check(text, "output", canaries) };
   if (!token || !TOKEN.test(token)) {
     report("AgentBeam App monitoring is off: set BEAM_APP_TOKEN to the app's token (beam_app_…) from the dashboard.");
-    return noop;
+    return local;
   }
   const base = (options.dashboardUrl || env("BEAM_DASHBOARD_URL") || "https://app.agentbeam.com").replace(/\/+$/, "");
   let url: URL;
-  try { url = new URL(base); } catch { report(`AgentBeam App monitoring is off: ${base} isn't a valid URL.`); return noop; }
+  try { url = new URL(base); } catch { report(`AgentBeam App monitoring is off: ${base} isn't a valid URL.`); return local; }
   if (url.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
     report("AgentBeam App monitoring is off: refusing to send the app token over plain HTTP.");
-    return noop;
+    return local;
   }
 
   const flushEvery = Math.max(1000, options.flushIntervalMs ?? 5000);
@@ -143,15 +237,30 @@ export function createAppMonitor(options: AppMonitorOptions = {}): AppMonitor {
     return flushing;
   };
 
-  const ingest = (line: string, file: string) => {
+  const ingest = (line: string, file: string, ingestOptions?: Parameters<MonitorPipeline["ingestLine"]>[2]) => {
     try {
       ensureConfig();
       if (!level || revoked) return;
-      pipeline.ingestLine(line, file);
+      pipeline.ingestLine(line, file, ingestOptions);
       if (Date.now() - lastFlush >= flushEvery) void flush();
     } catch {
       /* never let monitoring affect the app */
     }
+  };
+
+  const llmText = (text: string, source: "prompt" | "output", info: PromptInfo | undefined): TextCheck => {
+    const { result, window } = scan(text, source, source === "output" ? canaries : []);
+    try {
+      if (!window.trim()) return result;
+      const client = String(info?.ip ?? info?.user ?? "").trim().slice(0, 80) || undefined;
+      const label = typeof info?.label === "string" && info.label.trim() ? info.label.trim().slice(0, 60) : source === "prompt" ? "prompts" : "model output";
+      // Clean prompts are still counted per sender, to spot floods.
+      if (result.flagged || (source === "prompt" && client))
+        ingest(window, label, { source, client, rules: source === "output" ? canaries : undefined, excerpt: options.excerpts !== false });
+    } catch {
+      /* never let monitoring affect the app */
+    }
+    return result;
   };
 
   void refreshConfig();
@@ -171,6 +280,8 @@ export function createAppMonitor(options: AppMonitorOptions = {}): AppMonitor {
     log(line) {
       if (typeof line === "string" && line.trim()) ingest(line.slice(0, 16_384), "app log");
     },
+    prompt: (text, info) => llmText(text, "prompt", info),
+    output: (text, info) => llmText(text, "output", info),
     flush: (options) => flush(Boolean(options?.force)).catch(() => {}),
   };
 }
