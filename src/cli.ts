@@ -39,7 +39,7 @@ import { blockedTargetsFile, readBlockedTargets, removeBlockedTarget } from "./b
 import { checkForUpdate, installUpdate } from "./update.js";
 import { WORKER_COMMAND, autoUpdateAllowed, autoUpdateTick, readUpdateState, runAutoUpdateWorker, writeUpdateState } from "./auto-update.js";
 import { recordExpectedHooks, reportControlEvent } from "./tamper.js";
-import { monitorStatus, monitorTest, runMonitor } from "./monitor.js";
+import { monitorConfigure, monitorStatus, monitorTest, runMonitor } from "./monitor.js";
 import { CVE_SEVERITIES, runCveCheck, type CveSeverity } from "./cve.js";
 
 // Lets 'BEAM_API_URL=... beam connect' style overrides live in a .env file instead of the
@@ -577,6 +577,7 @@ skills.command("trusted")
   .description("List trusted skills")
   .action(async () => { const l = await readTrustedSkills(); console.log(l.length ? renderColumns(["name", "hash", "trusted"], l.map(t => [t.name, t.hash.slice(0, 12), t.trustedAt])) : "No trusted skills."); });
 
+const LLM_OPTION = "review flagged lines with your own key: openai, anthropic, gemini, groq, openrouter, mistral, deepseek, xai, ollama or custom (key from OPENAI_API_KEY, ANTHROPIC_API_KEY, ...), or beam for Beam's model (default: BEAM_LLM_PROVIDER)";
 const monitor = program.command("monitor").description("Watch a running app's logs and traffic around the clock and alert on suspicious activity (a workspace admin turns App monitoring on in the dashboard first)");
 
 monitor.command("start", { isDefault: true })
@@ -587,17 +588,53 @@ monitor.command("start", { isDefault: true })
   .option("--app <dir>", "also check this app's lockfiles for known vulnerabilities, at start and daily")
   .option("--from-start", "read files from the beginning instead of only new lines")
   .option("--no-wait", "exit instead of waiting when App monitoring is off for the workspace")
-  .action(async (options: { file?: string[]; stdin?: boolean; echo: boolean; app?: string; fromStart?: boolean; wait: boolean }) => {
-    await runMonitor({ files: options.file, stdin: options.stdin, echo: options.echo, app: options.app, fromStart: options.fromStart, wait: options.wait });
+  .option("--llm <provider>", LLM_OPTION)
+  .option("--max-cpu <percent>", "the most of one CPU core detection may use (1-100, default 25); past it, lines are skipped until the next minute")
+  .action(async (options: { file?: string[]; stdin?: boolean; echo: boolean; app?: string; fromStart?: boolean; wait: boolean; llm?: string; maxCpu?: string }) => {
+    await runMonitor({ files: options.file, stdin: options.stdin, echo: options.echo, app: options.app, fromStart: options.fromStart, wait: options.wait, llm: options.llm, maxCpu: options.maxCpu === undefined ? undefined : Number(options.maxCpu) });
+  });
+
+monitor.command("configure")
+  .description("Save settings to ~/.beam/monitor.json (0600) so 'beam monitor' needs no flags; prints them with no options")
+  .option("--llm <provider>", LLM_OPTION)
+  .option("--model <model>", "model for that provider (required for gemini, xai, ollama and custom)")
+  .option("--base-url <url>", "endpoint, for custom gateways or a proxy in front of the provider")
+  .option("--key-env <name>", "the environment variable that holds the key where beam monitor runs (default: the provider's usual one)")
+  .option("--key-stdin", "store a key piped on stdin in monitor.json (never pass keys as arguments)")
+  .option("--forget-key", "remove a stored key")
+  .option("-f, --file <path...>", "log files to watch by default (replaces the saved list)")
+  .option("--no-files", "clear the saved log files")
+  .option("--app <dir>", "app directory for daily dependency checks")
+  .option("--no-app", "clear the saved app directory")
+  .option("--max-cpu <percent>", "the most of one CPU core detection may use, 1-100 (default 25)")
+  .action(async (options: { llm?: string; model?: string; baseUrl?: string; keyEnv?: string; keyStdin?: boolean; forgetKey?: boolean; file?: string[]; files: boolean; app?: string | false; maxCpu?: string }) => {
+    let key: string | undefined;
+    if (options.keyStdin) {
+      if (process.stdin.isTTY) throw new Error("Pipe your key from a secret manager, e.g. 'op read op://vault/openai/key | beam monitor configure --llm openai --key-stdin'.");
+      let input = "";
+      for await (const chunk of process.stdin) {
+        input += chunk.toString();
+        if (Buffer.byteLength(input) > 4096) throw new Error("API key input exceeds 4 KB.");
+      }
+      key = input.trim();
+      if (!key) throw new Error("No API key received on stdin.");
+    }
+    process.exitCode = await monitorConfigure({
+      llm: options.llm, model: options.model, baseUrl: options.baseUrl, keyEnv: options.keyEnv, key, forgetKey: options.forgetKey,
+      files: options.file, noFiles: options.files === false, app: typeof options.app === "string" ? options.app : undefined, noApp: options.app === false,
+      maxCpu: options.maxCpu === undefined ? undefined : Number(options.maxCpu),
+    });
   });
 
 monitor.command("test")
   .description("Send one test finding to prove the integration: it appears on the dashboard and at the app's webhooks")
-  .action(async () => { process.exitCode = await monitorTest(); });
+  .option("--llm <provider>", `${LLM_OPTION}; also makes one LLM check to prove the key works`)
+  .action(async (options: { llm?: string }) => { process.exitCode = await monitorTest(console.log, options.llm); });
 
 monitor.command("status")
   .description("Show whether App monitoring is on for this workspace, its level, and this month's usage")
-  .action(async () => { process.exitCode = await monitorStatus(); });
+  .option("--llm <provider>", LLM_OPTION)
+  .action(async (options: { llm?: string }) => { process.exitCode = await monitorStatus(console.log, options.llm); });
 
 const cve = program.command("cve").description("Check an app's dependencies against Beam's vulnerability database");
 

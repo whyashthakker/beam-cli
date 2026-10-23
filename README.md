@@ -289,22 +289,51 @@ const valid = signature.length === expected.length && timingSafeEqual(Buffer.fro
 
 You choose whose model runs:
 
-- **Your own LLM, from the CLI.** Set these where `beam monitor` runs, in the environment or in `~/.beam/.env`. Any OpenAI-compatible chat completions endpoint works, including a local one, so excerpts never have to leave your network. The check runs on your machine before the finding is sent, and it doesn't count toward the workspace's LLM allowance.
+- **Your own key, from the CLI.** Pick a provider and `beam monitor` uses the key you already have for it. The key goes only to that provider and is never sent to Beam; findings arrive with the verdict attached, and these checks don't count toward the workspace's LLM allowance. A key in the environment is never used until you pick a provider.
+
+  | `--llm` | Key read from | Default model |
+  |---|---|---|
+  | `openai` | `OPENAI_API_KEY` | `gpt-4.1-nano` |
+  | `anthropic` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or an `ant auth login` profile | `claude-opus-5-5` |
+  | `gemini` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | set `BEAM_LLM_MODEL` |
+  | `groq` | `GROQ_API_KEY` | `openai/gpt-oss-20b` |
+  | `openrouter` | `OPENROUTER_API_KEY` | `openai/gpt-4.1-nano` |
+  | `mistral` | `MISTRAL_API_KEY` | `mistral-small-latest` |
+  | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-chat` |
+  | `xai` | `XAI_API_KEY` | set `BEAM_LLM_MODEL` |
+  | `ollama` | none | set `BEAM_LLM_MODEL` |
+  | `custom` | `BEAM_LLM_API_KEY` | any OpenAI-compatible endpoint at `BEAM_LLM_BASE_URL` (LiteLLM, vLLM) |
 
   ```bash
-  # OpenAI: the model defaults to gpt-4.1-nano
-  BEAM_LLM_API_KEY=sk-... beam monitor --file /var/log/nginx/access.log
-
-  # A local Ollama or vLLM server: no key needed
-  BEAM_LLM_BASE_URL=http://localhost:11434/v1 BEAM_LLM_MODEL=llama3.2 beam monitor --file /var/log/app/app.log
-
-  # Any other compatible gateway (OpenRouter, LiteLLM, ...)
-  BEAM_LLM_BASE_URL=https://openrouter.ai/api/v1 BEAM_LLM_MODEL=openai/gpt-4.1-nano BEAM_LLM_API_KEY=... beam monitor --stdin
+  beam monitor --llm openai --file /var/log/nginx/access.log      # uses your OPENAI_API_KEY
+  BEAM_LLM_MODEL=claude-haiku-5-5 beam monitor --llm anthropic --stdin
+  beam monitor test --llm openai                                  # also makes one LLM check to prove the key works
   ```
 
-- **Beam's model, from the dashboard.** If no `BEAM_LLM_*` variables are set, a workspace admin can turn on LLM checks on the App monitoring page. Beam reviews the findings after they arrive, and those reviews count toward the workspace's monthly LLM allowance.
+  `BEAM_LLM_PROVIDER`, `BEAM_LLM_MODEL`, `BEAM_LLM_BASE_URL` and `BEAM_LLM_API_KEY` set the same things from the environment (or `~/.beam/.env`). Anthropic is called through Anthropic's SDK with structured output; the rest through OpenAI-compatible chat completions. A key is never sent over plain HTTP to a public host.
 
-`beam monitor status` shows which model is in use.
+- **Beam's model, from the dashboard.** With no provider chosen (or `--llm beam`), a workspace admin can turn on LLM checks on the App monitoring page. Beam reviews the findings after they arrive, and those reviews count toward the workspace's monthly LLM allowance.
+
+`beam monitor status` shows which model is in use and where its key comes from, never the key itself.
+
+**Settings file.** `beam monitor configure` saves settings to `~/.beam/monitor.json` (mode 0600) so a plain `beam monitor`, in a systemd unit or a container, needs no flags. Flags win over environment variables, which win over the file. The first monitor command after upgrading creates the file, carrying over older `BEAM_LLM_*` settings; it records which variable holds a key, never the key's value.
+
+```bash
+beam monitor configure --llm openai --file /var/log/nginx/access.log --file /var/log/app/app.log --app /srv/app
+beam monitor configure --llm anthropic --key-env TEAM_ANTHROPIC_KEY    # read the key from another variable
+op read op://vault/openai/key | beam monitor configure --llm openai --key-stdin   # or store it in the file
+beam monitor configure                                                 # print the settings (a stored key shows as "(stored)")
+```
+
+**Built to stay out of your app's way.**
+
+- **Hostile input can't stall it.** Every rule is linear in its input; the slowest of 41 attack shapes built to trigger regex backtracking takes about 10 ms on 16 KB.
+- **A hard CPU cap.** Detection uses at most `--max-cpu` percent of one core (default 25 for `beam monitor`) and, in the SDK, `maxCpuPercent` (default 2, plus as much again for `prompt()` and `output()`). Past it, lines are skipped and counted until the next minute; `prompt()` and `output()` return `skipped: true` so your app decides.
+- **Memory stays flat.** Counters are fixed-size per client, dedupe entries expire, and at most 1,000 findings wait to be sent. About 10 MB for `beam monitor` after 3 million lines, and no growth in the SDK over a million requests with AgentBeam down.
+- **When AgentBeam is down or slow,** sends time out after 5 seconds, off the request path, and retries back off (with jitter, up to 5 minutes). A rejected token pauses reporting and is checked again every 15 minutes instead of stopping it. The SDK's timers never keep your process alive.
+- **With `--stdin`,** your app's output passes straight through with normal backpressure. Detection works from a bounded backlog and skips lines rather than slowing the pipe.
+
+Each release runs a stress test of all of this (`npm run stress`) and publishes the report with the release, at [agentbeam.com/releases](https://agentbeam.com/releases). A release that breaks a limit isn't published.
 
 **Dependency checks** read `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lock`, `requirements*.txt` (pinned `==` lines), `poetry.lock`, `uv.lock`, `Pipfile.lock`, `go.mod`, `Cargo.lock`, `composer.lock`, `Gemfile.lock`, NuGet `packages.lock.json`, `gradle.lockfile`, `mix.lock`, `Package.resolved` and GitHub Actions workflow files. The search goes four directory levels deep and skips `node_modules`, `vendor` and virtual environments. Manifests without pinned versions, such as `package.json` ranges or `pom.xml`, are not checked.
 

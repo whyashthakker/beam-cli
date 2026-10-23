@@ -23,11 +23,26 @@ export interface MonitorRule {
 const END = String.raw`(?=$|[\s;'"&|)\x60])`;
 const commandInjection = new RegExp(String.raw`(?:[;|\x60]|\$\(|&&)\s*(?:id|whoami|uname\s+-a|cat\s+/etc/(?:passwd|shadow)|(?:curl|wget)\s+\S+|nc\s+-\w|bash\s+-[ic]|sh\s+-c|ping\s+-c\s*\d+)${END}`, "i");
 // A URL-like parameter pointing the server at itself, its network or its cloud metadata, or a
-// scheme only an attacker wants fetched. LLM agents with browsing or fetch tools are a common way in.
-const ssrf = new RegExp([
-  String.raw`[?&][^=&\s]*=\s*(?:gopher|dict|ldap|tftp|jar|netdoc)://`,
-  String.raw`[?&][^=&\s]*(?:url|uri|link|src|dest|target|redirect|callback|webhook|feed|host|endpoint|proxy|image|fetch|next|return)[^=&\s]*=\s*(?:(?:https?|ftp)://(?:localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|0x7f\w*|2130706433|\[::(?:1|ffff:[^\]]*)?\]|10\.\d+\.\d+\.\d+|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|169\.254\.|100\.100\.100\.200|metadata\.google\.internal)|file:/)`,
-].join("|"), "i");
+// scheme only an attacker wants fetched. LLM agents with browsing or fetch tools are a common way
+// in. Parameters are split and checked one by one: as one regex this backtracked quadratically on
+// long hostile query strings, and it runs inside customer apps.
+const SSRF_NAME = /url|uri|link|src|dest|target|redirect|callback|webhook|feed|host|endpoint|proxy|image|fetch|next|return/i;
+const SSRF_SCHEME = /^(?:gopher|dict|ldap|tftp|jar|netdoc):\/\//i;
+const SSRF_INTERNAL = /^(?:(?:https?|ftp):\/\/(?:localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|0x7f\w*|2130706433|\[::(?:1|ffff:[^\]]{0,40})?\]|10\.\d+\.\d+\.\d+|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|169\.254\.|100\.100\.100\.200|metadata\.google\.internal)|file:\/)/i;
+function ssrf(s: string): boolean {
+  const query = s.indexOf("?");
+  if (query < 0) return false;
+  let seen = 0;
+  for (const param of s.slice(query + 1).split(/[&?\s"]/)) {
+    const eq = param.indexOf("=");
+    if (eq < 0) continue;
+    if (++seen > 100) break;
+    const name = param.slice(0, eq);
+    const value = param.slice(eq + 1);
+    if (SSRF_SCHEME.test(value) || (name.length <= 64 && SSRF_NAME.test(name) && SSRF_INTERNAL.test(value))) return true;
+  }
+  return false;
+}
 // Credentials, by format. LLM provider keys are worth the most to an attacker right now.
 const SECRET = /-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk-(?:proj-|ant-|or-v1-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|AIza[0-9A-Za-z_-]{35}|gsk_[A-Za-z0-9]{40,}|hf_[A-Za-z0-9]{30,}|r8_[A-Za-z0-9]{30,}|xai-[A-Za-z0-9]{40,}|pplx-[A-Za-z0-9]{40,}|beam_app_[\w-]{20,})\b|\bauthorization:\s*bearer\s+[A-Za-z0-9._~+/-]{20,}/i;
 const XSS = /<script[\s>]|javascript:\s*[a-z(]|<(?:img|svg|body|iframe)\b[^>]{0,200}\son(?:error|load)\s*=|\bdocument\.cookie\b/i;
@@ -56,7 +71,7 @@ const appRules: MonitorRule[] = [
   { id: "web.deserialization", title: "Serialized object payload", severity: "high", category: "exploit",
     match: s => /\brO0AB[A-Za-z0-9+/=]{8,}|\bO:\d+:"[A-Za-z_\\]+":\d+:\{/.test(s) },
   { id: "web.ssrf", title: "Server-side request forgery attempt", severity: "high", category: "exploit", sources: ["http"],
-    match: s => ssrf.test(s) },
+    match: s => ssrf(s) },
   { id: "app.secret_in_log", title: "Credential written to logs", severity: "high", category: "secrets",
     match: (_s, raw) => SECRET.test(raw) },
   { id: "web.xss", title: "Cross-site scripting attempt", severity: "medium", category: "exploit",

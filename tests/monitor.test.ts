@@ -206,7 +206,7 @@ describe("runMonitor", () => {
 
   it("refuses to start before 'beam connect'", async () => {
     await rm(join(home, "data", "identity.json"));
-    await expect(runMonitor({ stdin: true })).rejects.toThrow("beam connect");
+    await expect(runMonitor({ stdin: true }, () => {})).rejects.toThrow("beam connect");
   });
   it("sends nothing while the workspace has it turned off", async () => {
     configStatus = 403;
@@ -227,6 +227,36 @@ describe("runMonitor", () => {
     expect(finding).toMatchObject({ ruleId: "web.sql_injection", severity: "high", source: "http", file: "stdin" });
     expect(finding!.evidence).not.toContain("s3cr3t");
   });
+  it("keeps the app's piped output flowing and exits cleanly when AgentBeam is erroring", async () => {
+    const lines = Array.from({ length: 3000 }, (_, i) => `${access(`/item?id=${i}%20UNION%20SELECT%201`, `198.51.${i % 200}.${i % 250}`)}\n`);
+    Object.defineProperty(process, "stdin", { value: Readable.from(lines), configurable: true });
+    const realFetch = global.fetch;
+    let attempts = 0;
+    global.fetch = jest.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/monitor/findings")) { attempts++; return new Response("upstream down", { status: 503 }); }
+      return realFetch(input, init);
+    }) as typeof fetch;
+    const written: string[] = [];
+    const write = jest.spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => { written.push(String(chunk)); return true; });
+    try {
+      await runMonitor({ stdin: true }, () => {});
+    } finally {
+      write.mockRestore();
+    }
+    expect(written).toHaveLength(3000); // every line passed through to the app's usual destination
+    expect(attempts).toBeLessThanOrEqual(2); // one try, plus the bounded try on shutdown: no hammering
+  });
+  it("pauses, rather than exits, when AgentBeam rejects the server mid-run", async () => {
+    Object.defineProperty(process, "stdin", { value: Readable.from([`${access("/?id=1 UNION SELECT 1")}\n`]), configurable: true });
+    const realFetch = global.fetch;
+    global.fetch = jest.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/monitor/findings")) return Response.json({ error: "Unknown or revoked device." }, { status: 401 });
+      return realFetch(input, init);
+    }) as typeof fetch;
+    const logs: string[] = [];
+    await expect(runMonitor({ stdin: true, echo: false }, m => logs.push(m))).resolves.toBeUndefined();
+    expect(logs.join("\n")).toContain("Capture paused; checking again every 15 minutes");
+  });
   it("runs on an app token alone, with no 'beam connect', and reports as that app", async () => {
     await rm(join(home, "data", "identity.json"));
     process.env.BEAM_APP_TOKEN = "beam_app_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
@@ -242,14 +272,14 @@ describe("runMonitor", () => {
     Object.defineProperty(process, "stdin", { value: Readable.from([`${access("/?id=1 UNION SELECT 1")}\n`]), configurable: true });
     const logs: string[] = [];
     await runMonitor({ stdin: true, echo: false }, m => logs.push(m));
-    expect(logs[0]).toContain("App monitoring is on for bgremover");
+    expect(logs.join("\n")).toContain("App monitoring is on for bgremover");
     expect(seen.map(r => r.url)).toEqual(["https://dash.test/v1/monitor/config", "https://dash.test/v1/monitor/findings"]);
     expect(seen.every(r => r.auth === "Bearer beam_app_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG")).toBe(true);
     process.env.BEAM_APP_TOKEN = "not-a-token";
-    await expect(runMonitor({ stdin: true })).rejects.toThrow("doesn't look like an app token");
+    await expect(runMonitor({ stdin: true }, () => {})).rejects.toThrow("doesn't look like an app token");
     process.env.BEAM_APP_TOKEN = "beam_app_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
     global.fetch = jest.fn(async () => Response.json({ error: "Unknown or revoked device." }, { status: 401 })) as typeof fetch;
-    await expect(runMonitor({ stdin: true })).rejects.toThrow("app token was rotated or removed");
+    await expect(runMonitor({ stdin: true }, () => {})).rejects.toThrow("app token was rotated or removed");
   });
   it("attaches the verdict from the user's own LLM before sending", async () => {
     process.env.BEAM_LLM_BASE_URL = "http://127.0.0.1:11434/v1";
@@ -257,7 +287,7 @@ describe("runMonitor", () => {
     Object.defineProperty(process, "stdin", { value: Readable.from([`${access("/?id=1 UNION SELECT 1")}\n`]), configurable: true });
     const logs: string[] = [];
     await runMonitor({ stdin: true, echo: false }, m => logs.push(m));
-    expect(logs.join("\n")).toContain("your own model, llama3.2 at 127.0.0.1:11434");
+    expect(logs.join("\n")).toContain("your own model: llama3.2 at 127.0.0.1:11434");
     const [finding] = (posted[0]!.body as { findings: MonitorFinding[] }).findings;
     expect(finding!.llm).toEqual({ verdict: "malicious", reason: "classic UNION-based injection", model: "llama3.2" });
   });
@@ -272,7 +302,7 @@ describe("own LLM (BEAM_LLM_*)", () => {
   it("is off unless configured, defaults to a small OpenAI model, and rejects half-finished settings", async () => {
     const { ownLlmConfig, DEFAULT_LLM_MODEL } = await import("../src/monitor-llm.js");
     expect(ownLlmConfig({})).toBeNull();
-    expect(ownLlmConfig({ BEAM_LLM_API_KEY: "sk-test" })).toEqual({ baseUrl: "https://api.openai.com/v1", model: DEFAULT_LLM_MODEL, apiKey: "sk-test" });
+    expect(ownLlmConfig({ BEAM_LLM_API_KEY: "sk-test" })).toEqual({ baseUrl: "https://api.openai.com/v1", model: DEFAULT_LLM_MODEL, apiKey: "sk-test", keySource: "BEAM_LLM_API_KEY" });
     expect(ownLlmConfig({ BEAM_LLM_BASE_URL: "http://localhost:11434/v1/", BEAM_LLM_MODEL: "llama3.2" })).toEqual({ baseUrl: "http://localhost:11434/v1", model: "llama3.2", apiKey: undefined });
     expect(() => ownLlmConfig({ BEAM_LLM_BASE_URL: "http://localhost:11434/v1" })).toThrow("BEAM_LLM_MODEL");
     expect(() => ownLlmConfig({ BEAM_LLM_MODEL: "gpt-4.1-nano" })).toThrow("BEAM_LLM_API_KEY");

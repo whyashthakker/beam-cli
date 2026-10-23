@@ -127,6 +127,7 @@ The test finding should appear within seconds on https://app.agentbeam.com/dashb
 ## Optional extras
 
 - **LLM features outside Node.js:** if the app logs its prompts or model replies, point `beam monitor --file` at that log. The same prompt injection rules read it.
-- **Review flagged lines with the user's own LLM:** set the `BEAM_LLM_*` variables (endpoint, model and, if the endpoint needs one, its key) where `beam monitor` runs.
+- **Review flagged lines with the user's own key:** `beam monitor configure --llm openai` (or anthropic, gemini, groq, openrouter, mistral, deepseek, xai, ollama, custom) uses the provider key the user already keeps in that server's environment. The key stays on that server; never read or print it. `beam monitor test --llm <provider>` proves it works.
+- **Save the setup:** `beam monitor configure --file <log> --app <dir>` writes `~/.beam/monitor.json`, so the service can run a plain `beam monitor`.
 - **Separate alert channels:** add webhooks on the dashboard and limit each one to particular apps.
 - **Full guide:** https://docs.agentbeam.com/agent-cli/app-monitoring

@@ -1,6 +1,6 @@
 {
   "name": "@agent-beam/beam",
-  "version": "0.2.28",
+  "version": "0.2.29",
   "description": "Local-first observation and heuristic risk scanning for AI coding agents (Claude Code, Codex, Cursor, Copilot CLI, Gemini). Redacts secrets, flags risky tool calls, scans skills and MCP configs offline.",
   "keywords": [
     "ai agent security",
@@ -62,7 +62,8 @@
     "prepublishOnly": "npm run validate:skills && npm run typecheck && npm test && npm run build",
     "setup": "npm run build && node dist/cli.js setup",
     "setup:global": "bash scripts/setup-global.sh",
-    "validate:skills": "node Skills/scripts/validate-skills.mjs"
+    "validate:skills": "node Skills/scripts/validate-skills.mjs",
+    "stress": "npm run build && node --expose-gc scripts/stress-report.mjs"
   },
   "publishConfig": {
     "access": "public"
@@ -71,6 +72,7 @@
     "node": ">=20.17.0"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.2.0",
     "commander": "^13.0.0"
   },
   "devDependencies": {

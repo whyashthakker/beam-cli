@@ -60,6 +60,12 @@ jobs:
         if: steps.version.outputs.tagged == 'false'
         run: npm run build:binaries
 
+      # Hostile input, memory, outages and the CPU cap, measured on the built package. A broken
+      # limit fails the release; the report is attached to it and shown on agentbeam.com/releases.
+      - name: Stress test
+        if: steps.version.outputs.tagged == 'false'
+        run: node --expose-gc scripts/stress-report.mjs --out release-binaries/stress-report.json
+
       - name: Create GitHub Release
         if: steps.version.outputs.tagged == 'false'
         env:

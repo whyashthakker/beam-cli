@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getBeamHome, getCollectorUrl, getDataDirectory } from "./config.js";
@@ -192,15 +192,73 @@ async function findClaudeCodeUsage(home: string, sessionId: string, toolUseId: s
   return {};
 }
 
-async function walkJsonlFiles(dir: string, out: string[]): Promise<void> {
-  let entries;
-  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
-  for (const entry of entries) {
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) await walkJsonlFiles(full, out);
-    else if (entry.isFile() && entry.name.endsWith(".jsonl")) out.push(full);
+// Codex rollouts live in ~/.codex/sessions/YYYY/MM/DD/rollout-<start time>-<id>.jsonl, and heavy
+// users have gigabytes of them. Hooks run on every tool call, so lookups never walk the whole
+// tree or read whole files: only the newest date directories are listed, and only a file's head
+// (where session_meta is) and tail (the latest turn_context and token_count) are read.
+const CODEX_CANDIDATES = 50;
+const HEAD_BYTES = 64 * 1024;
+const TAIL_BYTES = 512 * 1024;
+
+async function newestRollouts(home: string): Promise<string[]> {
+  const out: string[] = [];
+  const descend = async (dir: string, depth: number): Promise<void> => {
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+    entries.sort((a, b) => b.name.localeCompare(a.name)); // dates and start times: newest first
+    for (const entry of entries) {
+      if (out.length >= CODEX_CANDIDATES) return;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory() && depth < 3) await descend(full, depth + 1);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl")) out.push(full);
+    }
+  };
+  await descend(join(home, ".codex", "sessions"), 0);
+  await descend(join(home, ".codex", "archived_sessions"), 3);
+  // A long session started days ago is still the most recently written: order by write time.
+  const stamped = await Promise.all(out.map(async path => ({ path, mtimeMs: await stat(path).then(s => s.mtimeMs, () => 0) })));
+  return stamped.sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, CODEX_MODEL_LOOKUP_MAX_FILES).map(f => f.path);
+}
+
+/** The start and end of a file, without reading the middle of a large transcript. */
+async function headAndTail(path: string): Promise<{ head: string; tail: string }> {
+  const file = await open(path, "r");
+  try {
+    const { size } = await file.stat();
+    const read = async (position: number, length: number) => {
+      const buffer = Buffer.alloc(Math.max(0, length));
+      const { bytesRead } = await file.read(buffer, 0, buffer.length, position);
+      return buffer.subarray(0, bytesRead).toString("utf8");
+    };
+    if (size <= HEAD_BYTES + TAIL_BYTES) { const all = await read(0, size); return { head: all, tail: all }; }
+    // Drop the first, partial line of the tail.
+    const tail = await read(size - TAIL_BYTES, TAIL_BYTES);
+    return { head: await read(0, HEAD_BYTES), tail: tail.slice(tail.indexOf("\n") + 1) };
+  } finally {
+    await file.close();
   }
 }
+
+/** transcript_path from the hook payload, accepted only inside ~/.codex since it's untrusted input. */
+function codexTranscript(home: string, transcriptPath: string | undefined): string | undefined {
+  if (!transcriptPath) return undefined;
+  const root = resolve(join(home, ".codex"));
+  const resolved = resolve(transcriptPath);
+  return resolved !== root && resolved.startsWith(`${root}${sep}`) ? resolved : undefined;
+}
+
+const codexRows = (text: string) => text.split("\n").flatMap(line => {
+  const trimmed = line.trim();
+  if (!trimmed) return [];
+  try {
+    const row = JSON.parse(trimmed) as Record<string, unknown>;
+    return [{ type: row.type, payload: row.payload && typeof row.payload === "object" ? row.payload as Record<string, unknown> : {} }];
+  } catch { return []; }
+});
+const isSession = (text: string, sessionId: string) =>
+  codexRows(text).some(r => r.type === "session_meta" && (r.payload.session_id === sessionId || r.payload.id === sessionId));
+const latestModel = (text: string) =>
+  codexRows(text).reduce((model, r) => (r.type === "turn_context" && typeof r.payload.model === "string" && r.payload.model ? r.payload.model : model), "");
 
 // Codex's PreToolUse payload has no model field (same verified shape as Claude Code's), and
 // unlike Claude Code's session file, a rollout file isn't named after the session id -- it's
@@ -210,29 +268,17 @@ async function walkJsonlFiles(dir: string, out: string[]): Promise<void> {
 // forwarding a bogus value.
 const CODEX_MODEL_LOOKUP_MAX_FILES = 10;
 
-async function findCodexModel(home: string, sessionId: string): Promise<string> {
+async function findCodexModel(home: string, sessionId: string, transcriptPath?: string): Promise<string> {
   if (!sessionId) return "";
-  const files: { path: string; mtimeMs: number }[] = [];
-  for (const root of [join(home, ".codex", "sessions"), join(home, ".codex", "archived_sessions")]) {
-    const found: string[] = [];
-    await walkJsonlFiles(root, found);
-    for (const path of found) { try { files.push({ path, mtimeMs: (await stat(path)).mtimeMs }); } catch { /* skip */ } }
+  const own = codexTranscript(home, transcriptPath);
+  if (own) {
+    try { const model = latestModel((await headAndTail(own)).tail); if (model) return model; } catch { /* fall back to the scan */ }
   }
-  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  for (const { path } of files.slice(0, CODEX_MODEL_LOOKUP_MAX_FILES)) {
-    let content: string;
-    try { content = await readFile(path, "utf8"); } catch { continue; }
-    let matchesSession = false; let model = "";
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let row: Record<string, unknown>;
-      try { row = JSON.parse(trimmed) as Record<string, unknown>; } catch { continue; }
-      const payload = row.payload && typeof row.payload === "object" ? row.payload as Record<string, unknown> : {};
-      if (row.type === "session_meta" && (payload.session_id === sessionId || payload.id === sessionId)) matchesSession = true;
-      if (row.type === "turn_context" && typeof payload.model === "string" && payload.model) model = payload.model;
-    }
-    if (matchesSession && model) return model;
+  for (const path of await newestRollouts(home)) {
+    let parts;
+    try { parts = await headAndTail(path); } catch { continue; }
+    if (!isSession(parts.head, sessionId)) continue;
+    return latestModel(parts.tail);
   }
   return "";
 }
@@ -268,25 +314,17 @@ async function findCodexUsage(home: string, sessionId: string, transcriptPath: s
   // hook input. Falls back to the mtime-scan below when a payload doesn't carry it (older Codex
   // builds, or tests).
   let total: { input_tokens: number; output_tokens: number } | undefined;
-  if (transcriptPath) {
-    const root = resolve(join(home, ".codex"));
-    const resolved = resolve(transcriptPath);
-    if (resolved === root || resolved.startsWith(`${root}${sep}`)) {
-      let content: string | undefined; try { content = await readFile(resolved, "utf8"); } catch { /* fall through to scan */ }
-      if (content !== undefined) total = totalTokenUsageFromTokenCountLines(content).total;
-    }
+  const own = codexTranscript(home, transcriptPath);
+  if (own) {
+    try { total = totalTokenUsageFromTokenCountLines((await headAndTail(own)).tail).total; } catch { /* fall through to scan */ }
   }
   if (!total && sessionId) {
-    const files: { path: string; mtimeMs: number }[] = [];
-    for (const root of [join(home, ".codex", "sessions"), join(home, ".codex", "archived_sessions")]) {
-      const found: string[] = []; await walkJsonlFiles(root, found);
-      for (const path of found) { try { files.push({ path, mtimeMs: (await stat(path)).mtimeMs }); } catch { /* skip */ } }
-    }
-    files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    for (const { path } of files.slice(0, CODEX_MODEL_LOOKUP_MAX_FILES)) {
-      let content: string; try { content = await readFile(path, "utf8"); } catch { continue; }
-      const { matchesSession, total: found } = totalTokenUsageFromTokenCountLines(content, sessionId);
-      if (matchesSession && found) { total = found; break; }
+    for (const path of await newestRollouts(home)) {
+      let parts;
+      try { parts = await headAndTail(path); } catch { continue; }
+      if (!isSession(parts.head, sessionId)) continue;
+      total = totalTokenUsageFromTokenCountLines(parts.tail).total;
+      break;
     }
   }
   if (!total || !sessionId) return {};
@@ -343,9 +381,9 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
             if (usage.output_tokens !== undefined) data.output_tokens = usage.output_tokens;
           }
         } else if (sourceAgent === "codex") {
-          if (!data.model) data.model = await findCodexModel(home, sessionId);
+          const transcriptPath = typeof data.transcript_path === "string" ? data.transcript_path : undefined;
+          if (!data.model) data.model = await findCodexModel(home, sessionId, transcriptPath);
           if (cursor) {
-            const transcriptPath = typeof data.transcript_path === "string" ? data.transcript_path : undefined;
             const usage = await findCodexUsage(home, sessionId, transcriptPath, cursor);
             if (usage.input_tokens !== undefined) data.input_tokens = usage.input_tokens;
             if (usage.output_tokens !== undefined) data.output_tokens = usage.output_tokens;

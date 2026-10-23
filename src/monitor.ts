@@ -18,7 +18,8 @@ import {
   checkPackages, fetchMonitorConfig, monitorAuth, sendFindings,
   type MonitorConfig, type MonitorFinding, type MonitorLevel, type MonitorSeverity, type Vulnerability,
 } from "./monitor-client.js";
-import { judgeWithOwnLlm, ownLlmConfig } from "./monitor-llm.js";
+import { LLM_PROVIDERS, describeOwnLlm, detectedLlmKeys, judgeWithOwnLlm, ownLlmConfig, type OwnLlmConfig } from "./monitor-llm.js";
+import { describeMonitorConfig, ensureMonitorConfig, monitorConfigPath, writeMonitorConfig, type MonitorFileConfig } from "./monitor-config.js";
 import type { CustomDetector } from "./data-detectors.js";
 
 export { BRUTE_FORCE_THRESHOLD, DEDUPE_WINDOW_MS, MAX_NEW_FINDINGS_PER_10_MIN, MonitorPipeline, meetsLevel, type PipelineOptions, type SendOutcome } from "./monitor-pipeline.js";
@@ -123,39 +124,69 @@ export interface MonitorOptions {
   fromStart?: boolean;
   /** Keep waiting while App monitoring is off in the dashboard (default) instead of exiting. */
   wait?: boolean;
+  /** LLM provider for the second opinion (--llm), with this server's own key; "beam" for Beam's model. */
+  llm?: string;
+  /** The most of one CPU core detection may use, in percent (--max-cpu). Default: monitor.json, else 25. */
+  maxCpu?: number;
+}
+
+const MAX_BACKOFF_MS = 5 * 60_000;
+const backoff = (failures: number) => Math.min(MAX_BACKOFF_MS, 5_000 * 2 ** Math.min(failures, 10)) * (0.5 + Math.random() / 2);
+/** A server-provided resume time, sanity-checked: never in the past, never more than a day away. */
+function pauseUntil(resetAt: string | undefined, fallbackMs: number): number {
+  const at = resetAt ? Date.parse(resetAt) : Number.NaN;
+  const now = Date.now();
+  return Number.isFinite(at) && at > now ? Math.min(at, now + 24 * 60 * 60_000) : now + fallbackMs;
+}
+
+/** Points at a key that's already here when no provider was chosen; it is never used without --llm. */
+function llmKeyHint(own: OwnLlmConfig | null): string {
+  if (own) return "";
+  const [found] = detectedLlmKeys();
+  return found ? ` ${found.variable} is set here: add --llm ${found.provider} to review findings with your own key instead (Beam never sees it).` : "";
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 export async function runMonitor(options: MonitorOptions, log: (message: string) => void = m => console.error(`[beam monitor] ${m}`)): Promise<void> {
-  const files = (options.files ?? []).map(f => resolve(f));
-  const appDir = options.app ? resolve(options.app) : undefined;
+  const { config: saved, created } = await ensureMonitorConfig();
+  if (created) log(`Created ${monitorConfigPath()} for App monitoring settings. Edit it, or run 'beam monitor configure'.`);
+  // Sources on the command line replace the file's; with none, the file says what to watch.
+  const fromCli = Boolean(options.files?.length || options.stdin || options.app);
+  const files = (fromCli ? options.files ?? [] : saved.files).map(f => resolve(f));
+  const app = fromCli ? options.app : saved.app ?? undefined;
+  const appDir = app ? resolve(app) : undefined;
   if (!files.length && !options.stdin && !appDir)
-    throw new Error("Tell beam monitor what to watch: --file <path> (repeatable) for log files, --stdin to read piped output, and/or --app <dir> for dependency checks.");
+    throw new Error(`Tell beam monitor what to watch: --file <path> (repeatable) for log files, --stdin to read piped output, and/or --app <dir> for dependency checks. Or save them with 'beam monitor configure --file <path>' (${monitorConfigPath()}).`);
   const identity = await monitorAuth();
   if (!identity) throw new Error("Set BEAM_APP_TOKEN to the app's token from the dashboard's App monitoring page, or connect this machine with 'beam connect'.");
   const custom = (await readPolicy())?.rules.customDetectors ?? [];
-  const ownLlm = ownLlmConfig();
+  const ownLlm = ownLlmConfig(process.env, options.llm, saved.llm);
 
   let config: MonitorConfig | null = null;
   let lastRefresh = 0;
   let pausedUntil = 0;
   let offNotice = false;
+  // A rejected token or a missing API while running pauses capture and is checked again every 15
+  // minutes, rather than exiting: during an AgentBeam incident those can be transient.
+  let rejected = false;
   let fatal: Error | null = null;
 
-  const refresh = async (): Promise<void> => {
+  const refresh = async (startup = false): Promise<void> => {
     lastRefresh = Date.now();
     const result = await fetchMonitorConfig(identity);
     if (result.ok) {
       if (!config) {
         log(`App monitoring is on${result.config.app ? ` for ${result.config.app}` : ""} (${result.config.level} level). Findings go to your workspace${result.config.webhooks ? ` and ${result.config.webhooks} webhook${result.config.webhooks === 1 ? "" : "s"}` : ""}.`);
         log(ownLlm
-          ? `LLM checks: your own model, ${ownLlm.model} at ${new URL(ownLlm.baseUrl).host}.`
-          : `LLM checks: ${result.config.llm ? "Beam's model (set in the dashboard)" : "off"}.`);
+          ? `LLM checks: ${describeOwnLlm(ownLlm)}. Only redacted excerpts go there, and the key never leaves this server.`
+          : `LLM checks: ${result.config.llm ? "Beam's model (set in the dashboard)" : "off"}.${llmKeyHint(ownLlm)}`);
       }
       else if (config.level !== result.config.level) log(`Level changed to ${result.config.level}.`);
+      if (rejected) log("AgentBeam accepted this server again. Capture resumed.");
       config = result.config;
       offNotice = false;
+      rejected = false;
       return;
     }
     if (result.status === "disabled") {
@@ -164,20 +195,28 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
       config = null;
       return;
     }
-    if (result.status === "revoked" || result.status === "unsupported") throw new Error(result.message);
+    if (result.status === "revoked" || result.status === "unsupported") {
+      if (startup) throw new Error(result.message);
+      if (!rejected) log(`${result.message} Capture paused; checking again every 15 minutes.`);
+      rejected = true;
+      config = null;
+      return;
+    }
     log(`${result.message} Retrying.`); // unreachable: keep the last known settings
   };
 
-  await refresh();
+  await refresh(true);
   while (!config) {
     if (options.wait === false) throw new Error("App monitoring is not on for this workspace.");
     await sleep(60_000);
-    await refresh();
+    await refresh(true);
   }
 
+  const maxCpu = Math.min(100, Math.max(1, Number(options.maxCpu ?? saved.maxCpuPercent) || 25));
   const pipeline = new MonitorPipeline({
     level: () => (config && Date.now() >= pausedUntil ? config.level : null),
     customDetectors: () => custom,
+    cpuBudgetMsPerMinute: 600 * maxCpu, // 1% of a core = 600 ms per minute
   });
   const send = async (batch: MonitorFinding[]): Promise<SendOutcome> => {
     if (ownLlm && config) await judgeWithOwnLlm(batch, config.level, ownLlm);
@@ -190,12 +229,14 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
       return "drop";
     }
     if (result.status === "quota") {
-      pausedUntil = result.resetAt ? Date.parse(result.resetAt) : Date.now() + 60 * 60_000;
+      pausedUntil = pauseUntil(result.resetAt, 60 * 60_000);
       log(`${result.message} Capture paused until then.`);
       return "drop";
     }
     if (result.status === "revoked" || result.status === "unsupported") {
-      fatal = new Error(result.message);
+      if (!rejected) log(`${result.message} Capture paused; checking again every 15 minutes.`);
+      rejected = true;
+      config = null;
       return "drop";
     }
     return "retry";
@@ -216,28 +257,75 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
   for (const tailer of tailers) tailer.start();
   if (files.length) log(`Watching ${files.join(", ")}.`);
 
+  // When AgentBeam is unreachable or erroring, sends back off (with jitter, up to 5 minutes) instead
+  // of retrying every few seconds; findings wait in a queue capped at 1,000.
   let flushing = false;
-  const flush = async () => {
-    if (flushing) return;
+  let sendFailures = 0;
+  let nextSendAt = 0;
+  const flush = async (force = false) => {
+    if (flushing || (!force && Date.now() < nextSendAt)) return;
     flushing = true;
-    try { await pipeline.flush(send); } finally { flushing = false; }
+    let retry = false;
+    try {
+      await pipeline.flush(async batch => {
+        const outcome = await send(batch);
+        retry = outcome === "retry";
+        return outcome;
+      });
+    } finally {
+      flushing = false;
+      if (retry) nextSendAt = Date.now() + backoff(++sendFailures);
+      else sendFailures = 0;
+    }
   };
+
+  // Piped output: the app's lines go straight through (honoring backpressure, as without Beam),
+  // and detection works through a bounded backlog in short slices. If detection can't keep up,
+  // lines are skipped for detection, never held back from the app's output.
+  const MAX_BACKLOG = 10_000;
+  const backlog: string[] = [];
+  let backlogHead = 0;
+  let pipedSkipped = 0;
+  let draining = false;
+  const drain = () => {
+    const until = performance.now() + 20;
+    while (backlogHead < backlog.length && performance.now() < until) pipeline.ingestLine(backlog[backlogHead++]!, "stdin");
+    if (backlogHead > 1000) { backlog.splice(0, backlogHead); backlogHead = 0; }
+    if (backlogHead < backlog.length) setImmediate(drain);
+    else draining = false;
+  };
+
   const timers = [
     setInterval(() => void flush(), 5_000),
     setInterval(() => {
-      if (Date.now() - lastRefresh >= (config ? 5 * 60_000 : 60_000)) void refresh().catch(e => { fatal = e as Error; });
+      const every = config ? 5 * 60_000 : rejected ? 15 * 60_000 : 60_000;
+      if (Date.now() - lastRefresh >= every) void refresh().catch(e => { fatal = e as Error; });
     }, 15_000),
+    setInterval(() => {
+      const skipped = (pipeline.budget?.takeSkipped() ?? 0) + pipedSkipped;
+      pipedSkipped = 0;
+      if (skipped) log(`Skipped ${skipped} lines in the last minute to stay under ${maxCpu}% of a CPU (--max-cpu).`);
+    }, 60_000),
     setInterval(() => void checkDependencies(), 24 * 60 * 60_000),
   ];
+  for (const timer of timers) timer.unref?.();
   void checkDependencies();
 
   let stdinDone = !options.stdin;
   if (options.stdin) {
-    if (options.echo !== false) process.stdout.on("error", () => { /* downstream closed; keep monitoring */ });
+    const echo = options.echo !== false;
+    if (echo) process.stdout.on("error", () => { /* downstream closed; keep monitoring */ });
     const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+    let paused = false;
     lines.on("line", line => {
-      if (options.echo !== false) process.stdout.write(`${line}\n`);
-      pipeline.ingestLine(line, "stdin");
+      if (echo && !process.stdout.write(`${line}\n`) && !paused) {
+        paused = true;
+        lines.pause();
+        process.stdout.once("drain", () => { paused = false; lines.resume(); });
+      }
+      if (backlog.length - backlogHead >= MAX_BACKLOG) { pipedSkipped++; return; }
+      backlog.push(line);
+      if (!draining) { draining = true; setImmediate(drain); }
     });
     lines.on("close", () => { stdinDone = true; });
   }
@@ -253,16 +341,17 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
   for (const tailer of tailers) tailer.stop();
   process.removeListener("SIGINT", stop);
   process.removeListener("SIGTERM", stop);
-  // Last flush, bounded so a dead network can't hold up shutdown.
+  // What's left of the piped backlog, then a last flush, bounded so a dead network can't hold up shutdown.
+  while (backlogHead < backlog.length) pipeline.ingestLine(backlog[backlogHead++]!, "stdin");
   let giveUp: NodeJS.Timeout | undefined;
-  await Promise.race([flush(), new Promise(r => { giveUp = setTimeout(r, 5_000); })]);
+  await Promise.race([flush(true), new Promise(r => { giveUp = setTimeout(r, 5_000); })]);
   clearTimeout(giveUp);
   if (fatal) throw fatal;
 }
 
 const fmt = (n: number) => (n >= 2_147_483_647 ? "unlimited" : n.toLocaleString("en-US"));
 
-export async function monitorStatus(write: (line: string) => void = console.log): Promise<number> {
+export async function monitorStatus(write: (line: string) => void = console.log, llm?: string): Promise<number> {
   let identity;
   try { identity = await monitorAuth(); } catch (error) { write((error as Error).message); return 1; }
   if (!identity) { write("Set BEAM_APP_TOKEN to the app's token from the dashboard's App monitoring page, or connect this machine with 'beam connect'."); return 1; }
@@ -271,24 +360,28 @@ export async function monitorStatus(write: (line: string) => void = console.log)
     write(result.status === "disabled" ? `App monitoring: off\n${result.message}` : result.message);
     return result.status === "disabled" ? 0 : 1;
   }
-  const { app, level, llm, webhooks, usage, limits, resetAt, settingsUrl } = result.config;
+  const { app, level, llm: beamLlm, webhooks, usage, limits, resetAt, settingsUrl } = result.config;
   let own: ReturnType<typeof ownLlmConfig> = null;
   let ownError = "";
-  try { own = ownLlmConfig(); } catch (error) { ownError = (error as Error).message; }
+  try { own = ownLlmConfig(process.env, llm, (await ensureMonitorConfig()).config.llm); } catch (error) { ownError = (error as Error).message; }
   write([
     "App monitoring: on",
     ...(app ? [`App:            ${app}`] : []),
     `Level:          ${level}`,
-    `LLM checks:     ${own ? `your own model, ${own.model} at ${new URL(own.baseUrl).host}` : ownError ? `misconfigured: ${ownError}` : llm ? "Beam's model" : "off"}`,
+    `LLM checks:     ${own ? describeOwnLlm(own) : ownError ? `misconfigured: ${ownError}` : `${beamLlm ? "Beam's model" : "off"}${llmKeyHint(own)}`}`,
     `Webhooks:       ${webhooks}`,
     `This month:     ${fmt(usage.findings)} / ${fmt(limits.findings)} findings · ${fmt(usage.cveChecks)} / ${fmt(limits.cveChecks)} dependency checks · ${fmt(usage.llmChecks)} / ${fmt(limits.llmChecks)} LLM checks (resets ${resetAt.slice(0, 10)})`,
     `Settings:       ${settingsUrl}`,
+    `This server:    ${monitorConfigPath()}`,
   ].join("\n"));
   return 0;
 }
 
-/** `beam monitor test`: one test finding through the real path, to prove an integration end to end. */
-export async function monitorTest(write: (line: string) => void = console.log): Promise<number> {
+/**
+ * `beam monitor test`: one test finding through the real path, to prove an integration end to end.
+ * With an own LLM (--llm), also one LLM check on a harmless sample, to prove the key works.
+ */
+export async function monitorTest(write: (line: string) => void = console.log, llm?: string): Promise<number> {
   let identity;
   try { identity = await monitorAuth(); } catch (error) { write(`✖ ${(error as Error).message}`); return 1; }
   if (!identity) { write("✖ Set BEAM_APP_TOKEN to the app's token from the dashboard's App monitoring page, or connect this machine with 'beam connect'."); return 1; }
@@ -304,5 +397,65 @@ export async function monitorTest(write: (line: string) => void = console.log): 
   }]);
   if (!result.ok) { write(`✖ ${result.message}`); return 1; }
   write(`✔ Test finding sent for ${where}. Check the dashboard's App monitoring page${config.config.webhooks ? ` and your ${config.config.webhooks} webhook${config.config.webhooks === 1 ? "" : "s"}` : ""}.`);
+  let own: OwnLlmConfig | null;
+  try { own = ownLlmConfig(process.env, llm, (await ensureMonitorConfig()).config.llm); } catch (error) { write(`✖ LLM check: ${(error as Error).message}`); return 1; }
+  if (!own) return 0;
+  // A harmless sample, judged separately: its verdict isn't attached to the test finding, which must reach the webhooks.
+  const sample: MonitorFinding = {
+    id: "llm-test", ruleId: "web.sql_injection", title: "SQL injection attempt from 203.0.113.9", severity: "high", category: "exploit",
+    source: "http", count: 1, firstSeen: now, evidence: '203.0.113.9 - - "GET /items?id=1 UNION SELECT password FROM users-- HTTP/1.1" 200 "sqlmap/1.8"',
+  };
+  await judgeWithOwnLlm([sample], "strict", own);
+  const verdict = sample.llm;
+  if (!verdict || verdict.verdict === "error") { write(`✖ LLM check with ${describeOwnLlm(own)} failed: ${verdict?.reason ?? "no answer"}`); return 1; }
+  write(`✔ LLM check works: ${describeOwnLlm(own)} judged a sample attack "${verdict.verdict}".`);
+  return 0;
+}
+
+export interface ConfigureOptions {
+  llm?: string; model?: string; baseUrl?: string; keyEnv?: string; key?: string; forgetKey?: boolean;
+  files?: string[]; noFiles?: boolean; app?: string; noApp?: boolean; maxCpu?: number;
+}
+
+/**
+ * `beam monitor configure`: saves settings to monitor.json so `beam monitor` needs no flags. With
+ * no options, prints the current settings. A key is only ever stored from stdin (`key`), and a
+ * provider's key that isn't set in this shell is a warning, not an error: it may be set only where
+ * beam monitor runs (a systemd EnvironmentFile, a container's secrets).
+ */
+export async function monitorConfigure(options: ConfigureOptions, write: (line: string) => void = console.log): Promise<number> {
+  const { config: current } = await ensureMonitorConfig();
+  const changing = Object.values(options).some(v => v !== undefined && v !== false);
+  if (!changing) {
+    write(`${monitorConfigPath()}\n${JSON.stringify(describeMonitorConfig(current), null, 2)}`);
+    return 0;
+  }
+  const provider = options.llm?.trim().toLowerCase();
+  if (provider && provider !== "beam" && !(provider in LLM_PROVIDERS))
+    throw new Error(`Unknown LLM provider "${provider}". Use one of ${Object.keys(LLM_PROVIDERS).join(", ")}, or beam for Beam's model.`);
+  const switching = provider !== undefined && provider !== current.llm.provider;
+  const next: MonitorFileConfig = {
+    ...current,
+    files: options.noFiles ? [] : options.files?.length ? options.files.map(f => resolve(f)) : current.files,
+    app: options.noApp ? null : options.app ? resolve(options.app) : current.app,
+    maxCpuPercent: options.maxCpu ?? current.maxCpuPercent,
+    llm: {
+      provider: provider ?? current.llm.provider,
+      // A new provider starts from its own defaults rather than the old provider's model and endpoint.
+      model: options.model ?? (switching ? null : current.llm.model),
+      baseUrl: options.baseUrl ?? (switching ? null : current.llm.baseUrl),
+      apiKeyEnv: options.keyEnv ?? (switching ? null : current.llm.apiKeyEnv),
+      ...(options.key ? { apiKey: options.key } : !options.forgetKey && !switching && current.llm.apiKey ? { apiKey: current.llm.apiKey } : {}),
+    },
+  };
+  await writeMonitorConfig(next);
+  write(`Saved ${monitorConfigPath()} (0600).`);
+  try {
+    const own = ownLlmConfig(process.env, undefined, next.llm);
+    write(own ? `LLM checks: ${describeOwnLlm(own)}. The key stays on this server and is never sent to Beam.` : "LLM checks: Beam's model, when an admin turns it on in the dashboard.");
+  } catch (error) {
+    write(`⚠ ${(error as Error).message} (Saved anyway: that may be set only where beam monitor runs.)`);
+  }
+  if (next.files.length || next.app) write(`Watches: ${[...next.files, ...(next.app ? [`dependencies in ${next.app}`] : [])].join(", ")}. Start with 'beam monitor'.`);
   return 0;
 }

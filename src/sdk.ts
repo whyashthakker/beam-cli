@@ -8,12 +8,15 @@
 //
 // It never throws, never blocks or alters a request, and never makes a request wait on the
 // network: findings are sent in the background (pass flush() to event.waitUntil in middleware).
+// It's built to stay out of the way when things go wrong: detection has a hard CPU budget
+// (maxCpuPercent), every rule is linear in the input, memory is bounded, and when AgentBeam is
+// slow or down it backs off (up to 5 minutes between tries) and holds at most 1,000 findings.
 // prompt() and output() return what they found, so the app can decide to refuse or withhold.
 // If AgentBeam is unreachable, App monitoring is off for the workspace, or the monthly allowance
 // is spent, findings are dropped and the app doesn't notice. No dependencies and no Node.js
 // built-ins, so it runs in edge runtimes too.
 import type { MonitorFinding, MonitorLevel, MonitorSeverity } from "./monitor-client.js";
-import { MonitorPipeline, type SendOutcome } from "./monitor-pipeline.js";
+import { CpuBudget, MonitorPipeline, type SendOutcome } from "./monitor-pipeline.js";
 import { matchLine, type MonitorRule } from "./monitor-rules.js";
 import { containsCanary } from "./prompt-attacks.js";
 
@@ -33,6 +36,13 @@ export interface AppMonitorOptions {
   canaries?: string[];
   /** False: findings from prompt() and output() carry the rule and sender but no text excerpt. Default true. */
   excerpts?: boolean;
+  /**
+   * The most of one CPU core detection may use, in percent (0.1 to 50): that much for request()
+   * and log(), and as much again for prompt() and output(). Past it, checks are skipped until the
+   * next minute: request() and log() quietly, prompt() and output() with `skipped: true` so the
+   * app can decide. Default 2.
+   */
+  maxCpuPercent?: number;
 }
 
 export interface RequestInfo {
@@ -55,6 +65,8 @@ export interface PromptInfo {
 /** What a local check found. Matches count whatever the dashboard's level; reporting follows the level. */
 export interface TextCheck {
   flagged: boolean;
+  /** True when the check didn't run because the CPU budget for this minute was spent. */
+  skipped?: boolean;
   /** The most severe match, or null when nothing matched. */
   severity: MonitorSeverity | null;
   matches: { ruleId: string; title: string; severity: MonitorSeverity }[];
@@ -99,7 +111,22 @@ function env(name: string): string | undefined {
 function withTimeout(ms: number): { signal: AbortSignal; done: () => void } {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
+  // Never keep the app's process alive for a report (Node returns a Timeout with unref; edge runtimes a number).
+  (timer as { unref?: () => void }).unref?.();
   return { signal: controller.signal, done: () => clearTimeout(timer) };
+}
+
+const REQUEST_TIMEOUT_MS = 5_000;
+const MAX_BACKOFF_MS = 5 * 60_000;
+const REVOKED_RECHECK_MS = 15 * 60_000;
+const MAX_PAUSE_MS = 24 * 60 * 60_000;
+/** Doubling delays with jitter, so many app instances don't retry an outage in lockstep. */
+const backoff = (base: number, failures: number) => Math.min(MAX_BACKOFF_MS, base * 2 ** Math.min(failures, 10)) * (0.5 + Math.random() / 2);
+/** A server-provided resume time, sanity-checked: never in the past, never more than a day away. */
+function pauseUntil(resetAt: unknown): number {
+  const at = typeof resetAt === "string" ? Date.parse(resetAt) : Number.NaN;
+  const now = Date.now();
+  return Number.isFinite(at) && at > now ? Math.min(at, now + MAX_PAUSE_MS) : now + 60_000;
 }
 
 const SEVERITY_RANK: Record<MonitorSeverity, number> = { critical: 3, high: 2, medium: 1, low: 0 };
@@ -158,12 +185,32 @@ const noop: AppMonitor = {
 };
 
 export function createAppMonitor(options: AppMonitorOptions = {}): AppMonitor {
+  try {
+    return start(options ?? {});
+  } catch {
+    // A bad option or an unusual runtime: monitoring is off, and the app carries on.
+    return noop;
+  }
+}
+
+function start(options: AppMonitorOptions): AppMonitor {
   const report = (message: string) => { try { options.onError?.(message); } catch { /* never throw */ } };
-  const token = options.token?.trim() || env("BEAM_APP_TOKEN");
+  const token = (typeof options.token === "string" ? options.token.trim() : "") || env("BEAM_APP_TOKEN");
   const canaries = canaryRule(Array.isArray(options.canaries) ? options.canaries : []);
-  const local: AppMonitor = { ...noop, output: text => check(text, "output", canaries) };
+  const percent = Math.min(50, Math.max(0.1, Number(options.maxCpuPercent) || 2));
+  // 1% of a core = 600 ms per minute. Traffic and logs get one budget; prompt() and output() get
+  // their own, so a flood of requests can't switch off the checks an app may block on.
+  const budget = new CpuBudget(600 * percent);
+  const localBudget = new CpuBudget(600 * percent);
+  const budgeted = (text: unknown, source: "prompt" | "output", extra: MonitorRule[] = []) =>
+    localBudget.run(() => scan(text, source, extra)) ?? { result: { ...clean(), skipped: true }, window: "" };
+  const local: AppMonitor = { ...noop, prompt: text => budgeted(text, "prompt").result, output: text => budgeted(text, "output", canaries).result };
   if (!token || !TOKEN.test(token)) {
     report("AgentBeam App monitoring is off: set BEAM_APP_TOKEN to the app's token (beam_app_…) from the dashboard.");
+    return local;
+  }
+  if (typeof fetch !== "function" || typeof AbortController !== "function") {
+    report("AgentBeam App monitoring is off: this runtime has no fetch.");
     return local;
   }
   const base = (options.dashboardUrl || env("BEAM_DASHBOARD_URL") || "https://app.agentbeam.com").replace(/\/+$/, "");
@@ -174,30 +221,41 @@ export function createAppMonitor(options: AppMonitorOptions = {}): AppMonitor {
     return local;
   }
 
-  const flushEvery = Math.max(1000, options.flushIntervalMs ?? 5000);
+  const flushEvery = Math.max(1000, Number(options.flushIntervalMs) || 5000);
   const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
   let level: MonitorLevel | null = null;
-  let revoked = false;
+  // A 401 pauses reporting and is checked again later: during an AgentBeam incident a working token
+  // can be rejected for a while, and the app shouldn't need a restart to resume.
+  let revokedUntil = 0;
   let pausedUntil = 0;
   let configAt = 0;
+  let configFailures = 0;
   let configInFlight = false;
   let lastFlush = 0;
+  let sendFailures = 0;
+  let nextSendAt = 0;
   let flushing: Promise<void> | null = null;
+  let budgetReportedAt = 0;
+  const revoked = () => Date.now() < revokedUntil;
 
-  const pipeline = new MonitorPipeline({ level: () => (!revoked && Date.now() >= pausedUntil ? level : null) });
+  const pipeline = new MonitorPipeline({ level: () => (!revoked() && Date.now() >= pausedUntil ? level : null), budget });
 
   const refreshConfig = async () => {
     configInFlight = true;
-    const t = withTimeout(10_000);
+    const t = withTimeout(REQUEST_TIMEOUT_MS);
     try {
       const response = await fetch(`${base}/v1/monitor/config`, { headers, signal: t.signal });
       const body = (await response.json().catch(() => ({}))) as { level?: MonitorLevel; error?: string; resetAt?: string };
-      if (response.ok) level = body.level ?? "standard";
-      else if (response.status === 401) { revoked = true; report("AgentBeam App monitoring stopped: this app token was rotated or removed."); }
-      else if (response.status === 403) { level = null; report(body.error ?? "AgentBeam App monitoring is turned off for this workspace."); }
-      else if (response.status === 429) pausedUntil = body.resetAt ? Date.parse(body.resetAt) : Date.now() + 60_000;
+      configFailures = response.status >= 500 ? configFailures + 1 : 0;
+      if (response.ok) { level = body.level ?? "standard"; revokedUntil = 0; }
+      else if (response.status === 401) {
+        if (!revoked()) report("AgentBeam App monitoring paused: this app token was rejected (rotated or removed). Checking again in 15 minutes.");
+        revokedUntil = Date.now() + REVOKED_RECHECK_MS;
+      }
+      else if (response.status === 403) { level = null; report(typeof body.error === "string" ? body.error : "AgentBeam App monitoring is turned off for this workspace."); }
+      else if (response.status === 429) pausedUntil = pauseUntil(body.resetAt);
     } catch {
-      /* unreachable: keep the last known level and try again later */
+      configFailures++; // unreachable or slow: keep the last known level and back off
     } finally {
       t.done();
       configAt = Date.now();
@@ -206,41 +264,59 @@ export function createAppMonitor(options: AppMonitorOptions = {}): AppMonitor {
   };
 
   const ensureConfig = () => {
-    if (revoked || configInFlight) return;
-    const every = level ? CONFIG_EVERY_MS : CONFIG_RETRY_MS;
+    if (configInFlight || revoked()) return;
+    const every = level && !configFailures ? CONFIG_EVERY_MS : backoff(CONFIG_RETRY_MS, configFailures);
     if (!configAt || Date.now() - configAt >= every) void refreshConfig();
   };
 
   const send = async (batch: MonitorFinding[]): Promise<SendOutcome> => {
-    const t = withTimeout(10_000);
-    try {
-      const response = await fetch(`${base}/v1/monitor/findings`, { method: "POST", headers, body: JSON.stringify({ findings: batch }), signal: t.signal });
-      if (response.ok) return "sent";
-      const body = (await response.json().catch(() => ({}))) as { error?: string; resetAt?: string };
-      if (response.status === 401) { revoked = true; report("AgentBeam App monitoring stopped: this app token was rotated or removed."); return "drop"; }
-      if (response.status === 403) { level = null; return "drop"; }
-      if (response.status === 429) { pausedUntil = body.resetAt ? Date.parse(body.resetAt) : Date.now() + 60_000; return "drop"; }
-      return response.status >= 500 ? "retry" : "drop";
-    } catch {
-      return "retry";
-    } finally {
-      t.done();
-    }
+    const t = withTimeout(REQUEST_TIMEOUT_MS);
+    const outcome = await (async (): Promise<SendOutcome> => {
+      try {
+        const response = await fetch(`${base}/v1/monitor/findings`, { method: "POST", headers, body: JSON.stringify({ findings: batch }), signal: t.signal });
+        if (response.ok) return "sent";
+        const body = (await response.json().catch(() => ({}))) as { error?: string; resetAt?: string };
+        if (response.status === 401) {
+          if (!revoked()) report("AgentBeam App monitoring paused: this app token was rejected (rotated or removed). Checking again in 15 minutes.");
+          revokedUntil = Date.now() + REVOKED_RECHECK_MS;
+          return "drop";
+        }
+        if (response.status === 403) { level = null; return "drop"; }
+        if (response.status === 429) { pausedUntil = pauseUntil(body.resetAt); return "drop"; }
+        return response.status >= 500 ? "retry" : "drop";
+      } catch {
+        return "retry";
+      } finally {
+        t.done();
+      }
+    })();
+    if (outcome === "retry") nextSendAt = Date.now() + backoff(flushEvery, ++sendFailures);
+    else sendFailures = 0;
+    return outcome;
   };
 
   const flush = (force = false): Promise<void> => {
     if (flushing) return flushing;
     if (!pipeline.pending.length) return Promise.resolve();
-    if (!force && Date.now() - lastFlush < flushEvery) return Promise.resolve();
-    lastFlush = Date.now();
+    const now = Date.now();
+    if (!force && (now - lastFlush < flushEvery || now < nextSendAt)) return Promise.resolve();
+    lastFlush = now;
     flushing = pipeline.flush(send).catch(() => {}).finally(() => { flushing = null; });
     return flushing;
+  };
+
+  const noteBudget = () => {
+    if (Date.now() - budgetReportedAt < 60_000) return;
+    const skipped = budget.takeSkipped() + localBudget.takeSkipped();
+    budgetReportedAt = Date.now();
+    if (skipped) report(`AgentBeam App monitoring skipped ${skipped} checks in the last minute to stay under ${percent}% of a CPU (maxCpuPercent).`);
   };
 
   const ingest = (line: string, file: string, ingestOptions?: Parameters<MonitorPipeline["ingestLine"]>[2]) => {
     try {
       ensureConfig();
-      if (!level || revoked) return;
+      noteBudget();
+      if (!level || revoked()) return;
       pipeline.ingestLine(line, file, ingestOptions);
       if (Date.now() - lastFlush >= flushEvery) void flush();
     } catch {
@@ -249,7 +325,7 @@ export function createAppMonitor(options: AppMonitorOptions = {}): AppMonitor {
   };
 
   const llmText = (text: string, source: "prompt" | "output", info: PromptInfo | undefined): TextCheck => {
-    const { result, window } = scan(text, source, source === "output" ? canaries : []);
+    const { result, window } = budgeted(text, source, source === "output" ? canaries : []);
     try {
       if (!window.trim()) return result;
       const client = String(info?.ip ?? info?.user ?? "").trim().slice(0, 80) || undefined;
@@ -267,21 +343,26 @@ export function createAppMonitor(options: AppMonitorOptions = {}): AppMonitor {
   return {
     enabled: true,
     request(info) {
-      if (!info || typeof info.url !== "string") return;
-      // Same JSON shape as an access-log line, so the rules see method, path+query, client and agent.
-      ingest(JSON.stringify({
-        method: String(info.method || "GET").toUpperCase().slice(0, 16),
-        path: info.url.slice(0, 8192),
-        httpStatus: info.status ?? undefined,
-        srcIp: info.ip ?? undefined,
-        clientUa: info.userAgent?.slice(0, 512) ?? undefined,
-      }), "requests");
+      try {
+        if (!info || typeof info.url !== "string") return;
+        const text = (v: unknown, max: number) => (v === null || v === undefined ? undefined : String(v).slice(0, max));
+        // Same JSON shape as an access-log line, so the rules see method, path+query, client and agent.
+        ingest(JSON.stringify({
+          method: String(info.method || "GET").toUpperCase().slice(0, 16),
+          path: info.url.slice(0, 8192),
+          httpStatus: typeof info.status === "number" ? info.status : undefined,
+          srcIp: text(info.ip, 64),
+          clientUa: text(info.userAgent, 512),
+        }), "requests");
+      } catch {
+        /* never let monitoring affect the app */
+      }
     },
     log(line) {
       if (typeof line === "string" && line.trim()) ingest(line.slice(0, 16_384), "app log");
     },
     prompt: (text, info) => llmText(text, "prompt", info),
     output: (text, info) => llmText(text, "output", info),
-    flush: (options) => flush(Boolean(options?.force)).catch(() => {}),
+    flush: (opts) => flush(Boolean(opts?.force)).catch(() => {}),
   };
 }

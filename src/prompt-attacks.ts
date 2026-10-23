@@ -156,9 +156,44 @@ const SECRET_COMMAND = /\b(?:cat|type|less|more|head|tail|strings|base64)\s+(?:\
 const ENV_SECRET = /\b[A-Z][A-Z0-9_]*(?:API_KEY|SECRET(?:_KEY)?|ACCESS_KEY|AUTH_TOKEN|PASSWORD|PRIVATE_KEY)\s*[=:]\s*["']?[A-Za-z0-9/+_\-.]{12,}/;
 
 // A markdown image (or HTML img) whose URL carries a long value: rendering it sends that value to
-// the URL's server without a click (the EchoLeak family of zero-click exfiltration).
-const MARKDOWN_EXFIL = /!\[[^\]\n]{0,200}\]\(\s*<?https?:\/\/[^)\s>]+?[?&#][^)\s>]*=[^)\s>&]{16,}/i;
-const IMG_EXFIL = /<img\b[^>]{0,200}\bsrc\s*=\s*["']?https?:\/\/[^"'\s>]+[?&][^"'\s>]*=[^"'\s>&]{16,}/i;
+// the URL's server without a click (the EchoLeak family of zero-click exfiltration). Found with
+// bounded indexOf scans, because model output is attacker-influenced and a regex here backtracked
+// quadratically on long runs of "![" or "?".
+const MAX_TAGS = 200;
+function carriesData(url: string): boolean {
+  if (!/^https?:\/\//i.test(url)) return false;
+  const q = url.search(/[?#]/);
+  if (q < 0) return false;
+  return url.slice(q + 1).split(/[&;?#]/).some(part => { const eq = part.indexOf("="); return eq >= 0 && part.length - eq - 1 >= 16; });
+}
+/** The URL starting at `from`, up to the first character in `stop` (at most 4 KB). */
+function urlAt(s: string, from: number, stop: RegExp): string {
+  const rest = s.slice(from, from + 4096);
+  const end = rest.search(stop);
+  return end < 0 ? rest : rest.slice(0, end);
+}
+function markdownExfil(s: string): boolean {
+  let tags = 0;
+  for (let i = s.indexOf("!["); i >= 0 && tags++ < MAX_TAGS; i = s.indexOf("![", i + 2)) {
+    const alt = s.slice(i + 2, i + 203);
+    const close = alt.indexOf("]");
+    if (close < 0 || alt.slice(0, close).includes("\n") || alt[close + 1] !== "(") continue;
+    let from = i + 2 + close + 2;
+    while (s[from] === " " || s[from] === "\t") from++;
+    if (s[from] === "<") from++;
+    if (carriesData(urlAt(s, from, /[)\s>]/))) return true;
+  }
+  return false;
+}
+function imgExfil(s: string): boolean {
+  const tag = /<img\b/gi;
+  let tags = 0;
+  for (let m = tag.exec(s); m && tags++ < MAX_TAGS; m = tag.exec(s)) {
+    const src = /\bsrc\s*=\s*["']?/i.exec(s.slice(m.index, m.index + 220));
+    if (src && carriesData(urlAt(s, m.index + src.index + src[0].length, /["'\s>]/))) return true;
+  }
+  return false;
+}
 
 /** Instructions aimed at a model: override phrases, forged chat markers, hidden text, or appeals to a reviewer. */
 export function looksLikeInjection(text: string): boolean {
@@ -177,8 +212,8 @@ export const promptAttack = {
   // Not for app logs: "value of OPENAI_API_KEY is empty" is an ordinary config error there.
   secretCommand: (s: string) => { const v = view(s); return SECRET_COMMAND.test(v) || SECRET_BY_NAME.test(v); },
   envSecret: (s: string) => ENV_SECRET.test(s),
-  markdownExfil: (s: string) => MARKDOWN_EXFIL.test(s),
-  htmlExfil: (s: string) => MARKDOWN_EXFIL.test(s) || IMG_EXFIL.test(s),
+  markdownExfil: (s: string) => markdownExfil(s),
+  htmlExfil: (s: string) => markdownExfil(s) || imgExfil(s),
 };
 
 /** A canary planted in a system prompt, found in text: compared without case, spacing or punctuation, so light reformatting doesn't hide it. */

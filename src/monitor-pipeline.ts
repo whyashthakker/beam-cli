@@ -71,26 +71,112 @@ export interface PipelineOptions {
   level: () => MonitorLevel | null;
   customDetectors?: () => CustomDetector[];
   now?: () => number;
+  /** Detection time allowed per minute; past it, lines are skipped (and counted) until the next minute. */
+  cpuBudgetMsPerMinute?: number;
+  /** Or a budget shared with other work (the SDK's prompt and output checks). */
+  budget?: CpuBudget;
+}
+
+const clock = () => (globalThis.performance?.now?.() ?? Date.now());
+
+/**
+ * A hard cap on detection time per minute, so monitoring can never take more than a fixed share of
+ * a CPU, whatever the traffic or input. Work over the cap is skipped and counted, not queued.
+ */
+export class CpuBudget {
+  private minute = -1;
+  private spent = 0;
+  private skippedSince = 0;
+  constructor(private readonly msPerMinute: number) {}
+  /** Runs `work` if this minute's budget isn't spent; otherwise skips it and returns undefined. */
+  run<T>(work: () => T): T | undefined {
+    const minute = Math.floor(Date.now() / 60_000);
+    if (minute !== this.minute) { this.minute = minute; this.spent = 0; }
+    if (this.spent >= this.msPerMinute) { this.skippedSince++; return undefined; }
+    const start = clock();
+    try { return work(); } finally { this.spent += clock() - start; }
+  }
+  /** How many were skipped since the last call (for a diagnostic). */
+  takeSkipped(): number { const n = this.skippedSince; this.skippedSince = 0; return n; }
+}
+
+/**
+ * Events per key over the last few minutes, in one-minute buckets: a fixed few numbers per key
+ * however busy the key is, and at most `maxKeys` keys (the least recently active go first).
+ */
+export class WindowCounter {
+  private keys = new Map<string, { minutes: number[]; counts: number[] }>();
+  constructor(private readonly windowMinutes: number, private readonly maxKeys = 10_000) {}
+  get size(): number { return this.keys.size; }
+  /** Records one event and returns the count over the window, this one included. */
+  add(key: string, now: number): number {
+    const minute = Math.floor(now / 60_000);
+    let entry = this.keys.get(key);
+    if (entry) this.keys.delete(key); // re-inserted below: Map order is then least recently active first
+    else entry = { minutes: new Array<number>(this.windowMinutes).fill(-1), counts: new Array<number>(this.windowMinutes).fill(0) };
+    const slot = minute % this.windowMinutes;
+    if (entry.minutes[slot] !== minute) { entry.minutes[slot] = minute; entry.counts[slot] = 0; }
+    entry.counts[slot]!++;
+    this.keys.set(key, entry);
+    if (this.keys.size > this.maxKeys) this.keys.delete(this.keys.keys().next().value!);
+    let total = 0;
+    for (let i = 0; i < this.windowMinutes; i++) if (minute - entry.minutes[i]! < this.windowMinutes) total += entry.counts[i]!;
+    return total;
+  }
+  /** Drops keys with nothing in the window. */
+  prune(now: number): void {
+    const minute = Math.floor(now / 60_000);
+    for (const [key, entry] of this.keys) if (Math.max(...entry.minutes) <= minute - this.windowMinutes) this.keys.delete(key);
+  }
 }
 
 export class MonitorPipeline {
   private seen = new Map<string, { bucket: number; finding: MonitorFinding; at: number }>();
   private queue: MonitorFinding[] = [];
   private queued = new Set<string>();
-  private authFailures = new Map<string, number[]>();
-  private llmCalls = new Map<string, number[]>();
+  private authFailures = new WindowCounter(BRUTE_FORCE_WINDOW_MS / 60_000);
+  private llmCalls = new WindowCounter(LLM_FLOOD_WINDOW_MS / 60_000);
   private floodBucket = -1;
   private floodCount = 0;
   private suppressed: { count: number; severity: MonitorSeverity } | null = null;
+  private maintainedMinute = -1;
+  readonly budget: CpuBudget | null;
 
-  constructor(private readonly opts: PipelineOptions) {}
+  constructor(private readonly opts: PipelineOptions) {
+    this.budget = opts.budget ?? (opts.cpuBudgetMsPerMinute ? new CpuBudget(opts.cpuBudgetMsPerMinute) : null);
+  }
 
   private now(): number { return this.opts.now?.() ?? Date.now(); }
 
   get pending(): MonitorFinding[] { return [...this.queue]; }
 
-  /** Matches one line and queues any findings at or above the level. Returns the rule ids raised. */
+  /** Sizes of everything the pipeline keeps, for tests and diagnostics: all of them are bounded. */
+  get footprint(): { seen: number; queue: number; queued: number; authFailures: number; llmCalls: number } {
+    return { seen: this.seen.size, queue: this.queue.length, queued: this.queued.size, authFailures: this.authFailures.size, llmCalls: this.llmCalls.size };
+  }
+
+  /** Once a minute: forget dedupe entries and counters that can no longer matter. */
+  private maintain(now: number): void {
+    const minute = Math.floor(now / 60_000);
+    if (minute === this.maintainedMinute) return;
+    this.maintainedMinute = minute;
+    const cutoff = now - 2 * DEDUPE_WINDOW_MS.light;
+    for (const [fp, entry] of this.seen) if (entry.at < cutoff) this.seen.delete(fp);
+    this.authFailures.prune(now);
+    this.llmCalls.prune(now);
+    if (this.queued.size > 5000) this.queued.clear(); // dependency ids; a repeat is deduped by the server too
+  }
+
+  /**
+   * Matches one line and queues any findings at or above the level. Returns the rule ids raised.
+   * Over the CPU budget, the line is skipped (see budget.takeSkipped()).
+   */
   ingestLine(line: string, file?: string, options: IngestOptions = {}): string[] {
+    if (!this.budget) return this.ingest(line, file, options);
+    return this.budget.run(() => this.ingest(line, file, options)) ?? [];
+  }
+
+  private ingest(line: string, file: string | undefined, options: IngestOptions): string[] {
     const level = this.opts.level();
     if (!level || !line.trim()) return [];
     const custom = this.opts.customDetectors?.() ?? [];
@@ -98,6 +184,7 @@ export class MonitorPipeline {
     // Prompts and model output travel as "log" findings, which every workspace version accepts.
     const wire = source === "http" ? "http" : "log";
     const ip = options.client ? redactLine(options.client, custom).slice(0, 80) : source === "http" ? clientIp(line) : undefined;
+    this.maintain(this.now());
     const excerpt = options.excerpt === false ? "(the app withheld the text)" : redactLine(line, custom);
     const raised: string[] = [];
     const seenRules = new Set<string>();
@@ -113,7 +200,7 @@ export class MonitorPipeline {
     }
     if (isAuthFailure(line, source) && meetsLevel("high", level)) {
       const key = clientIp(line) ?? "unknown address";
-      const recent = this.recent(this.authFailures, key, BRUTE_FORCE_WINDOW_MS, BRUTE_FORCE_THRESHOLD[level]);
+      const recent = this.authFailures.add(key, this.now());
       if (recent >= BRUTE_FORCE_THRESHOLD[level]) {
         this.raise(level, key, {
           ruleId: "app.auth_bruteforce", title: `Repeated failed sign-ins from ${key}`, severity: "high", category: "recon",
@@ -124,7 +211,7 @@ export class MonitorPipeline {
     }
     // Only a known sender counts: behind a proxy that hides addresses, all traffic would look like one client.
     if (ip && meetsLevel("high", level) && (source === "prompt" || (source === "http" && isLlmRequest(line)))) {
-      const recent = this.recent(this.llmCalls, `${source}\0${ip}`, LLM_FLOOD_WINDOW_MS, LLM_FLOOD_THRESHOLD[level]);
+      const recent = this.llmCalls.add(`${source}\0${ip}`, this.now());
       if (recent >= LLM_FLOOD_THRESHOLD[level]) {
         this.raise(level, ip, {
           ruleId: "llm.denial_of_wallet", title: `Unusual volume of LLM requests from ${ip}`, severity: "high", category: "llm",
@@ -136,21 +223,11 @@ export class MonitorPipeline {
     return raised;
   }
 
-  /** Records one event for `key` and returns how many fell within the window (at most `cap`, all that's needed). */
-  private recent(events: Map<string, number[]>, key: string, windowMs: number, cap: number): number {
-    const now = this.now();
-    const recent = (events.get(key) ?? []).filter(t => now - t < windowMs);
-    recent.push(now);
-    if (recent.length > cap) recent.splice(0, recent.length - cap);
-    events.set(key, recent);
-    if (events.size > 10_000) events.delete(events.keys().next().value!);
-    return recent.length;
-  }
-
   /** Queues a finding produced elsewhere (dependency checks) under its own stable id, once. */
   addFinding(finding: MonitorFinding): boolean {
     const level = this.opts.level();
     if (!level || !meetsLevel(finding.severity, level) || this.queued.has(finding.id)) return false;
+    this.maintain(this.now());
     this.queued.add(finding.id);
     this.enqueue(finding);
     return true;
@@ -214,7 +291,6 @@ export class MonitorPipeline {
         break;
       }
     }
-    const cutoff = this.now() - 2 * DEDUPE_WINDOW_MS.light;
-    for (const [fp, entry] of this.seen) if (entry.at < cutoff) this.seen.delete(fp);
+    this.maintain(this.now());
   }
 }
