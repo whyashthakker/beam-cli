@@ -50,15 +50,24 @@ Exit code 2 means known vulnerabilities were found. For each one, tell the user 
 
 Look at the repository: a Dockerfile, docker-compose file, Railway config, fly.toml, vercel.json, Procfile, systemd units, nginx or Apache config. Then pick the matching step below. Monitoring needs a stream of the app's logs; for serverless platforms without one (such as Vercel functions), stop after the dependency check and tell the user.
 
-### 4a. Railway
+### 4a. A Node.js or Next.js app (preferred when you can change the code)
 
-Use the Beam monitor service from https://github.com/whyashthakker/beam-cli/tree/main/deploy/railway-monitor. It's a separate service in the same Railway project, which streams the app's HTTP and app logs into `beam monitor`. Walk the user through its README:
+Add the in-app SDK. It needs only the app token, no extra service or platform credentials. `npm i @agent-beam/beam`, then call it once per request, keeping the app's existing middleware logic unchanged:
+
+- Next.js `middleware.ts`: `const beam = createAppMonitor()` from `@agent-beam/beam/monitor` at module level. In `middleware(request, event)`, call `beam.request({ method: request.method, url: request.nextUrl.pathname + request.nextUrl.search, ip, userAgent })`, with `ip` from the first value of the `x-forwarded-for` header and `userAgent` from the `user-agent` header. Then call `event.waitUntil(beam.flush())`. Add the `event: NextFetchEvent` parameter if the function doesn't have it.
+- Express: an `app.use` middleware that calls `beam.request({ method: req.method, url: req.originalUrl, ip: req.ip, userAgent: req.get("user-agent") })` and then `next()`.
+
+The SDK never throws or blocks requests. The user sets `BEAM_APP_TOKEN` in the app's environment on their platform.
+
+### 4b. Railway, when the app can't be changed
+
+Use the Beam monitor service from https://github.com/whyashthakker/beam-cli/tree/main/deploy/railway-monitor. It's a separate service in the same Railway project, which streams the app's HTTP and app logs into `beam monitor`. It needs a Railway project token, which can also read the project's variables, so tell the user that before they create one. Walk the user through its README:
 
 1. The user creates a Railway project token (project Settings, then Tokens).
 2. Add a service whose source is that repository, with `RAILWAY_DOCKERFILE_PATH=deploy/railway-monitor/Dockerfile`.
 3. The user sets sealed variables `BEAM_APP_TOKEN` and `RAILWAY_TOKEN`, plus `MONITOR_SERVICE` (the app's service name).
 
-### 4b. Docker Compose or Kubernetes
+### 4c. Docker Compose or Kubernetes
 
 Run `beam monitor` as a sidecar that reads the app's log files from a shared volume, read-only. In Compose, pass the token through from the host environment by name, never by value:
 
@@ -75,7 +84,7 @@ Run `beam monitor` as a sidecar that reads the app's log files from a shared vol
 
 If the app only logs to stdout, run `docker logs -f <container> | beam monitor --stdin --no-echo` on the host instead.
 
-### 4c. A server with systemd
+### 4d. A server with systemd
 
 Create a unit that runs next to the app. Put the token in a root-owned EnvironmentFile (for example `/etc/beam/app-monitor.conf`) with mode 600, and make sure the service user can read the log files (for example, membership in the `adm` group). Use the path that `command -v beam` prints in `ExecStart`:
 

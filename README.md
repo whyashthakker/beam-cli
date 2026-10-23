@@ -193,7 +193,35 @@ beam cve check . --fail-on high --json        # in CI: fail only on high and cri
 - Each app has a per-minute request limit.
 - Rotating or removing a token takes effect immediately.
 
-Run it under whatever keeps your app running: a systemd unit, a sidecar container that shares the log volume, or pm2. For an app on Railway, deploy the [Beam monitor service](deploy/railway-monitor/README.md) next to it. It streams the app's HTTP and app logs from Railway without changing the app.
+Run it under whatever keeps your app running: a systemd unit, a sidecar container that shares the log volume, or pm2.
+
+**Inside a Node.js or Next.js app (SDK).** Where the app doesn't write request logs (for example `next start` behind a platform proxy), monitor in-process instead. Detection runs in your app with the same rules, and only redacted findings leave it, sent in the background with `BEAM_APP_TOKEN`.
+
+- It has no dependencies and works in Next.js middleware, including the Edge runtime.
+- It never throws, never blocks a request, and never makes one wait on the network.
+
+```ts
+// middleware.ts (Next.js); npm i @agent-beam/beam
+import { NextResponse, type NextFetchEvent, type NextRequest } from "next/server";
+import { createAppMonitor } from "@agent-beam/beam/monitor";
+
+const beam = createAppMonitor(); // reads BEAM_APP_TOKEN
+
+export function middleware(request: NextRequest, event: NextFetchEvent) {
+  beam.request({
+    method: request.method,
+    url: request.nextUrl.pathname + request.nextUrl.search,
+    ip: request.headers.get("x-forwarded-for")?.split(",")[0]?.trim(),
+    userAgent: request.headers.get("user-agent"),
+  });
+  event.waitUntil(beam.flush());
+  return NextResponse.next();
+}
+```
+
+For Express, use `app.use((req, _res, next) => { beam.request({ method: req.method, url: req.originalUrl, ip: req.ip, userAgent: req.get("user-agent") }); next(); })`. `beam.log(line)` checks application log lines too.
+
+When you can't change the app or its container, the [Beam monitor service for Railway](deploy/railway-monitor/README.md) streams its logs from Railway instead. It needs a Railway project token, which is broader than an app token.
 
 **Let your coding agent do it:** `npx @agent-beam/beam add skill agentbeam-app-monitoring -g --all-agents`, then ask it to add AgentBeam monitoring to your app. It finds where the app runs, keeps the token out of the repository, and finishes with `beam monitor test`.
 

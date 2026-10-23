@@ -3,7 +3,7 @@
 // are full of words like "env", "token" and "production" that would drown those rules -- but a few
 // built-in rules that mean the same thing anywhere (reverse shells, piped remote code, cloud
 // metadata access, prompt injection) are reused as-is. Heuristic, like everything else in Beam.
-import { builtinRulesById, type RuleCategory } from "./core.js";
+import { builtinRulesById, type RuleCategory } from "./rule-catalog.js";
 import type { CustomDetector } from "./data-detectors.js";
 import type { MonitorSeverity } from "./monitor-client.js";
 

@@ -1,6 +1,6 @@
 {
   "name": "@agent-beam/beam",
-  "version": "0.2.27",
+  "version": "0.2.28",
   "description": "Local-first observation and heuristic risk scanning for AI coding agents (Claude Code, Codex, Cursor, Copilot CLI, Gemini). Redacts secrets, flags risky tool calls, scans skills and MCP configs offline.",
   "keywords": [
     "ai agent security",
@@ -34,6 +34,13 @@
   "type": "module",
   "bin": {
     "beam": "dist/cli.js"
+  },
+  "exports": {
+    "./monitor": {
+      "types": "./dist/sdk.d.ts",
+      "default": "./dist/sdk.js"
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",

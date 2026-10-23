@@ -23,6 +23,7 @@ The service needs no public domain, volume or inbound port. It uses a few tens o
 
 ## Security
 
-- **Least privilege.** The app token works only for App monitoring: sending findings and running dependency checks for that one app. Every other AgentBeam API rejects it. The Railway project token can read the logs of the one project and environment it was created for.
+- **Know what the Railway token can do.** A Railway project token isn't read-only. Besides logs, it can read every variable in its project and environment, which includes other services' credentials, and it can deploy. Keep it sealed. For a Node.js or Next.js app you can change, prefer the in-app SDK (`@agent-beam/beam/monitor`, see the main README): it needs only the app token.
+- **Least privilege for the app token.** It works only for App monitoring: sending findings and running dependency checks for that one app. Every other AgentBeam API rejects it.
 - **Rotation.** Rotate the app token from the dashboard (Apps → Rotate token), then update the variable here. Revoking takes effect immediately.
 - **No root.** The container runs as an unprivileged user and never writes the tokens to disk.
