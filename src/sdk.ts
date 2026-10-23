@@ -38,8 +38,12 @@ export interface AppMonitor {
   request(info: RequestInfo): void;
   /** Check one application log line (errors, auth failures, anything the app prints). */
   log(line: string): void;
-  /** Send pending findings now. Resolves when done; never rejects. */
-  flush(): Promise<void>;
+  /**
+   * Send pending findings when the flush interval is due (or now, with `force`). Returns the
+   * in-flight send, so `event.waitUntil(beam.flush())` keeps it alive past the response; cheap to
+   * call on every request. Never rejects.
+   */
+  flush(options?: { force?: boolean }): Promise<void>;
   /** False when there's no valid token or it was revoked: every call is then a no-op. */
   readonly enabled: boolean;
 }
@@ -130,9 +134,10 @@ export function createAppMonitor(options: AppMonitorOptions = {}): AppMonitor {
     }
   };
 
-  const flush = (): Promise<void> => {
+  const flush = (force = false): Promise<void> => {
     if (flushing) return flushing;
     if (!pipeline.pending.length) return Promise.resolve();
+    if (!force && Date.now() - lastFlush < flushEvery) return Promise.resolve();
     lastFlush = Date.now();
     flushing = pipeline.flush(send).catch(() => {}).finally(() => { flushing = null; });
     return flushing;
@@ -166,6 +171,6 @@ export function createAppMonitor(options: AppMonitorOptions = {}): AppMonitor {
     log(line) {
       if (typeof line === "string" && line.trim()) ingest(line.slice(0, 16_384), "app log");
     },
-    flush: () => flush().catch(() => {}),
+    flush: (options) => flush(Boolean(options?.force)).catch(() => {}),
   };
 }

