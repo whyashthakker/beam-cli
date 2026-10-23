@@ -40,6 +40,8 @@ beam service status        # check the background service
 beam agent list            # see supported agents and hook status
 beam studio                # open the local activity dashboard
 beam sync                  # fetch the latest organization policy
+beam monitor --file <log>  # watch a running app's logs and traffic (see App monitoring)
+beam cve check .           # check an app's dependencies for known vulnerabilities
 ```
 
 Run `beam setup` again when adding an agent or repairing an installation. It preserves existing agent configuration.
@@ -115,6 +117,82 @@ These initial thresholds are conservative defaults, not measured safety guarante
 Hook requests include only agent, tool, tool input and command, with known credential patterns, sensitive field names and policy custom detectors redacted first. Tool arguments can still contain private source or data; redaction cannot guarantee removal of every secret. Hooks do not load transcripts, referenced file contents, the user's task or environment into Jev state. An explicit file may include a short `context` string. Hook enforcement depends on the installed client's support and does not cover uninstrumented actions or every MCP transport. `disable` does not revoke the provider key or unset external environment variables.
 
 Use the bundled [Jev action judging skill](Skills/jev-action-judge/SKILL.md), read the [Beam walkthrough](https://agentbeam.com/blog/beam-cli-jev-action-judging), or explore the [Awesome Jev use-case collection](https://github.com/whyashthakker/awesome-jev-use-cases). API semantics: [Noul](https://docs.typesafe.ai/primitives/noul), [Score](https://docs.typesafe.ai/primitives/score), [HTTP reference](https://docs.typesafe.ai/api).
+
+## App monitoring (optional)
+
+`beam monitor` watches a running application rather than an AI agent. It follows the app's log files and HTTP access logs around the clock and alerts on activity that looks like an attack or a compromise. `beam cve check` checks the app's dependencies for known vulnerabilities.
+
+Both need a connected workspace, and both stay off until a workspace owner or admin turns on App monitoring in the dashboard. Until then, `beam monitor` waits and captures nothing.
+
+```bash
+beam connect                                  # once per server or container
+beam monitor --file /var/log/nginx/access.log --file /var/log/app/app.log
+beam monitor --file /var/log/app/app.log --app /srv/app   # also check dependencies at start and daily
+node server.js 2>&1 | beam monitor --stdin    # or read piped output
+beam monitor status                           # on or off, level, and this month's usage
+beam cve check .                              # one-off check; exits 2 when anything is found
+beam cve check . --fail-on high --json        # in CI: fail only on high and critical
+```
+
+Run it under whatever keeps your app running: a systemd unit, a sidecar container that shares the log volume, or pm2.
+
+**What leaves the machine.** Log lines are matched on the server where `beam monitor` runs, and raw lines are never sent. A finding carries the rule, severity, file, a repeat count and a redacted excerpt of up to 600 characters. Redaction removes credentials, bearer tokens, URL userinfo, email addresses and your policy's custom detector matches. Query strings are kept, because in an access log the query is usually the attack. `beam cve check` sends package names and versions only.
+
+**What it never does.** It doesn't block requests, change the app or sit in the request path. With `--file` it reads logs the way `tail -F` does and follows rotation and truncation. With `--stdin` it echoes every line to stdout, so the app's output still reaches its usual destination; use `--no-echo` to turn that off. Prefer `--file` in production so the app doesn't depend on Beam's pipe.
+
+**Noise control.** Repeats fold into one finding per time window. Traffic is grouped by client address, so a scan from one IP becomes one alert with a count. Above 200 new findings in 10 minutes, the rest are summarized in a single finding.
+
+| Level (set in the dashboard) | Alerts on | Repeats fold for | Optional LLM check |
+|---|---|---|---|
+| Light | Critical | 60 minutes | Never |
+| Standard | High and critical | 15 minutes | High-severity findings |
+| Strict | Medium and above | 5 minutes | Every alert |
+
+What it looks for:
+
+- **Injection attempts in requests:** SQL, command, server-side template, JNDI lookups (Log4Shell-style), path traversal, serialized objects, prototype pollution and cross-site scripting. URL and double URL encoding are decoded first.
+- **Signs of compromise in app logs:** reverse shells, downloaded code piped into a shell, encoded execution and cloud metadata access.
+- **Prompt injection** in logged prompts.
+- **Credentials written to logs:** private keys, provider API keys and bearer tokens.
+- **Reconnaissance:** attack-tool user agents, probes for `.env`, `.git` and credential files, and repeated failed sign-ins from one address.
+- **Known vulnerable dependencies,** with `--app` or `beam cve check`. Advisories listed in CISA's Known Exploited Vulnerabilities catalog are raised to critical.
+
+Detection is heuristic. It will miss attacks it has no rule for, and some legitimate traffic will match. Use it alongside a web application firewall and regular patching, not instead of them.
+
+**Alerts.** Findings appear on the dashboard's App monitoring and Risks pages and go to the webhooks a workspace admin adds there. Each webhook can be limited to critical, high and critical, or everything. Slack and Discord URLs get their native message format; any other URL gets JSON with a `findings` array. Every request is signed. To verify one:
+
+```js
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+const expected = `sha256=${createHmac("sha256", webhookSecret).update(`${req.headers["x-beam-timestamp"]}.${rawBody}`).digest("hex")}`;
+const signature = String(req.headers["x-beam-signature"] ?? "");
+const valid = signature.length === expected.length && timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+```
+
+**LLM second opinion (optional).** A model can review flagged lines before they alert. It sees only the redacted excerpt, and lines go in chunks of up to 10 per request, to a small model by default, to keep cost down. A "benign" verdict keeps the finding in the dashboard but out of the webhooks. If the model refuses or fails, the alert still goes out. Which findings are reviewed depends on the level (see the table above), and dependency findings are never sent.
+
+You choose whose model runs:
+
+- **Your own LLM, from the CLI.** Set these where `beam monitor` runs, in the environment or in `~/.beam/.env`. Any OpenAI-compatible chat completions endpoint works, including a local one, so excerpts never have to leave your network. The check runs on your machine before the finding is sent, and it doesn't count toward the workspace's LLM allowance.
+
+  ```bash
+  # OpenAI: the model defaults to gpt-4.1-nano
+  BEAM_LLM_API_KEY=sk-... beam monitor --file /var/log/nginx/access.log
+
+  # A local Ollama or vLLM server: no key needed
+  BEAM_LLM_BASE_URL=http://localhost:11434/v1 BEAM_LLM_MODEL=llama3.2 beam monitor --file /var/log/app/app.log
+
+  # Any other compatible gateway (OpenRouter, LiteLLM, ...)
+  BEAM_LLM_BASE_URL=https://openrouter.ai/api/v1 BEAM_LLM_MODEL=openai/gpt-4.1-nano BEAM_LLM_API_KEY=... beam monitor --stdin
+  ```
+
+- **Beam's model, from the dashboard.** If no `BEAM_LLM_*` variables are set, a workspace admin can turn on LLM checks on the App monitoring page. Beam reviews the findings after they arrive, and those reviews count toward the workspace's monthly LLM allowance.
+
+`beam monitor status` shows which model is in use.
+
+**Dependency checks** read `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lock`, `requirements*.txt` (pinned `==` lines), `poetry.lock`, `uv.lock`, `Pipfile.lock`, `go.mod`, `Cargo.lock`, `composer.lock`, `Gemfile.lock`, NuGet `packages.lock.json`, `gradle.lockfile`, `mix.lock`, `Package.resolved` and GitHub Actions workflow files. The search goes four directory levels deep and skips `node_modules`, `vendor` and virtual environments. Manifests without pinned versions, such as `package.json` ranges or `pom.xml`, are not checked.
+
+**Usage.** Findings, dependency checks and LLM checks count toward the workspace's monthly App monitoring allowance, shown in `beam monitor status` and in the dashboard. When the allowance runs out, capture pauses until the reset date. The app itself is never affected.
 
 ## Dashboard
 

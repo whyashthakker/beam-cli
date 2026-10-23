@@ -37,6 +37,8 @@ import { addTrustedPath, readTrustedPaths, removeTrustedPath, trustedPathsFile }
 import { blockedTargetsFile, readBlockedTargets, removeBlockedTarget } from "./blocked-targets.js";
 import { checkForUpdate, installUpdate } from "./update.js";
 import { recordExpectedHooks, reportControlEvent } from "./tamper.js";
+import { monitorStatus, runMonitor } from "./monitor.js";
+import { CVE_SEVERITIES, runCveCheck, type CveSeverity } from "./cve.js";
 
 // Lets 'BEAM_API_URL=... beam connect' style overrides live in a .env file instead of the
 // shell profile. Checked in cwd first (handy when developing from the repo), then in
@@ -558,6 +560,39 @@ skills.command("untrust")
 skills.command("trusted")
   .description("List trusted skills")
   .action(async () => { const l = await readTrustedSkills(); console.log(l.length ? renderColumns(["name", "hash", "trusted"], l.map(t => [t.name, t.hash.slice(0, 12), t.trustedAt])) : "No trusted skills."); });
+
+const monitor = program.command("monitor").description("Watch a running app's logs and traffic around the clock and alert on suspicious activity (a workspace admin turns App monitoring on in the dashboard first)");
+
+monitor.command("start", { isDefault: true })
+  .description("Start watching (the default). Reads log files or piped output only; never blocks or changes the app")
+  .option("-f, --file <path...>", "log file to follow like tail -F, including access logs (repeatable)")
+  .option("--stdin", "read piped output, e.g. 'node server.js 2>&1 | beam monitor --stdin'")
+  .option("--no-echo", "with --stdin, don't pass lines through to stdout")
+  .option("--app <dir>", "also check this app's lockfiles for known vulnerabilities, at start and daily")
+  .option("--from-start", "read files from the beginning instead of only new lines")
+  .option("--no-wait", "exit instead of waiting when App monitoring is off for the workspace")
+  .action(async (options: { file?: string[]; stdin?: boolean; echo: boolean; app?: string; fromStart?: boolean; wait: boolean }) => {
+    await runMonitor({ files: options.file, stdin: options.stdin, echo: options.echo, app: options.app, fromStart: options.fromStart, wait: options.wait });
+  });
+
+monitor.command("status")
+  .description("Show whether App monitoring is on for this workspace, its level, and this month's usage")
+  .action(async () => { process.exitCode = await monitorStatus(); });
+
+const cve = program.command("cve").description("Check an app's dependencies against Beam's vulnerability database");
+
+cve.command("check")
+  .description("Read lockfiles under a directory and report known vulnerabilities; exits 2 when any meet --fail-on (for CI)")
+  .argument("[dir]", "app directory", ".")
+  .option("--fail-on <severity>", "lowest severity that fails the check: critical, high, medium or low", "low")
+  .option("--depth <n>", "directory levels to search for lockfiles", "4")
+  .option("--json", "print the result as JSON")
+  .action(async (dir: string, options: { failOn: string; depth: string; json?: boolean }) => {
+    if (!(CVE_SEVERITIES as readonly string[]).includes(options.failOn)) throw new Error("--fail-on must be critical, high, medium or low.");
+    const depth = Number(options.depth);
+    if (!Number.isInteger(depth) || depth < 0 || depth > 10) throw new Error("--depth must be a whole number from 0 to 10.");
+    process.exitCode = await runCveCheck(dir, { json: options.json, failOn: options.failOn as CveSeverity, depth });
+  });
 
 const mcp = program.command("mcp").description("Run and protect local MCP integrations");
 mcp.command("proxy")

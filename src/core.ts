@@ -55,6 +55,10 @@ let customRules: Rule[] = [];
 export function setCustomRules(rules: Rule[]): void { customRules = rules; }
 function activeRules(): Rule[] { return [...builtinRules, ...customRules]; }
 
+/** Built-in rules by id, for callers (like `beam monitor`) that reuse a subset of the catalog. */
+export function builtinRulesById(ids: string[]): Rule[] {
+  return ids.map(id => builtinRules.find(r => r.id === id)).filter((r): r is Rule => Boolean(r));
+}
 export function ruleCatalog(): Omit<Rule, "match">[] {
   return activeRules().map(({ match: _, ...rule }) => rule);
 }
