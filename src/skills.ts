@@ -3,6 +3,7 @@ import { cp, lstat, mkdir, mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { severityRank } from "./core.js";
 import { scanSkillDir, type SkillScan } from "./skill-scan.js";
 
@@ -36,6 +37,14 @@ const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 async function isDir(path: string) { try { return (await stat(path)).isDirectory(); } catch { return false; } }
 async function hasSkillMd(dir: string) { try { return (await stat(join(dir, "SKILL.md"))).isFile(); } catch { return false; } }
+// Skills shipped in this package's Skills/ folder (e.g. agentbeam-setup), addressable by bare name:
+// `npx @agent-beam/beam add skill agentbeam-setup -g --all-agents`.
+export const BUNDLED_SKILLS_DIR = fileURLToPath(new URL("../Skills/", import.meta.url));
+async function bundledSkill(source: string): Promise<string | undefined> {
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(source)) return undefined;
+  const dir = join(BUNDLED_SKILLS_DIR, source);
+  return (await hasSkillMd(dir)) ? dir : undefined;
+}
 
 function cloneUrl(source: string): string | null {
   const short = source.match(SHORTHAND);
@@ -68,7 +77,9 @@ export async function addSkill(source: string, options: AddSkillOptions = {}): P
   try {
     let root: string;
     const local = resolve(cwd, source);
+    const bundled = await bundledSkill(source);
     if (await isDir(local)) root = local;
+    else if (bundled) root = bundled;
     else {
       const url = cloneUrl(source);
       if (!url) throw new Error(`"${source}" is neither a local folder nor an owner/repo or https GitHub/GitLab URL.`);

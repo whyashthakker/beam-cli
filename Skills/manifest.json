@@ -4,6 +4,10 @@
   "website": "https://agentbeam.com",
   "skills": [
     {
+      "name": "agentbeam-setup",
+      "group": "Deployment and operations"
+    },
+    {
       "name": "security-assessment",
       "group": "Coordination and reporting"
     },

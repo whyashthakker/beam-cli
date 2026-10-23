@@ -1,0 +1,84 @@
+# Bump "version" in package.json and push to main; this does the rest:
+#   1. typecheck, test, and build the standalone binaries
+#   2. create the vX.Y.Z tag and a GitHub Release with the binaries and generated notes
+#      (agentbeam.com's changelog and install scripts read these releases, so the site follows)
+#   3. publish to npm, once npm trusted publishing is set up for this workflow and the
+#      repository variable NPM_TRUSTED_PUBLISHING is "true"; until then, publish by hand
+# A version that already has a tag is skipped, so re-runs and unrelated package.json edits are safe.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [package.json, .github/workflows/release.yml]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write # tag + GitHub Release
+  id-token: write # npm trusted publishing (OIDC); no npm token is stored
+
+jobs:
+  release:
+    # macOS so the darwin-arm64 binary gets the ad-hoc signature it needs to run.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Read version
+        id: version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "Unexpected version: $version"; exit 1; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+            echo "v$version is already released; nothing to do."
+          else
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install, typecheck and test
+        if: steps.version.outputs.tagged == 'false'
+        run: |
+          npm ci
+          npm run validate:skills
+          npm run typecheck
+          npm test
+
+      - name: Build binaries
+        if: steps.version.outputs.tagged == 'false'
+        run: npm run build:binaries
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.tagged == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" release-binaries/* \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --generate-notes
+
+      - name: Publish to npm
+        if: steps.version.outputs.tagged == 'false' && vars.NPM_TRUSTED_PUBLISHING == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if npm view "@agent-beam/beam@$VERSION" version >/dev/null 2>&1; then
+            echo "@agent-beam/beam@$VERSION is already on npm."
+          else
+            npm install -g npm@11.20.0
+            npm publish --ignore-scripts
+          fi

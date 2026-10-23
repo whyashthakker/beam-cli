@@ -53,3 +53,21 @@ describe("beam add skill", () => {
     expect((await addSkill(src, { cwd: proj, scanOnly: true })).installed).toEqual([]);
   });
 });
+
+describe("bundled skills", () => {
+  it("installs agentbeam-setup by name for every agent, and it scans clean", async () => {
+    const home = await mkdtemp(join(tmpdir(), "beam-bundled-"));
+    const cwd = await mkdtemp(join(tmpdir(), "beam-bundled-cwd-"));
+    const result = await addSkill("agentbeam-setup", { global: true, allAgents: true, home, cwd });
+    expect(result.blocked).toEqual([]);
+    expect(result.scans[0]).toMatchObject({ name: "agentbeam-setup", findings: [] });
+    expect(result.installed.map(i => i.path.slice(home.length)).sort()).toEqual([
+      "/.agents/skills/agentbeam-setup", "/.claude/skills/agentbeam-setup", "/.copilot/skills/agentbeam-setup",
+    ]);
+    expect(await readFile(join(home, ".claude/skills/agentbeam-setup/SKILL.md"), "utf8")).toContain("name: agentbeam-setup");
+  });
+  it("still treats owner/repo and unknown names as remote sources", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "beam-bundled-cwd-"));
+    await expect(addSkill("not-a-bundled-skill", { cwd, scanOnly: true })).rejects.toThrow("neither a local folder");
+  });
+});

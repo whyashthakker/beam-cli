@@ -446,7 +446,7 @@ function printSkillScan(scan: SkillScan): void {
 const add = program.command("add").description("Add reusable AI assets, scanned before they are installed");
 add.command("skill")
   .description("Download a skill, scan it for prompt injection and risky instructions, then install it only if it passes")
-  .argument("<source>", "owner/repo, a GitHub/GitLab https URL, or a local folder")
+  .argument("<source>", "owner/repo, a GitHub/GitLab https URL, a local folder, or a skill bundled with beam (e.g. agentbeam-setup)")
   .option("--skill <name>", "pick one skill when the source contains several")
   .option("--agent <agent...>", `target agent(s): ${ALL_SKILL_AGENTS.join(", ")} (default: claude-code)`)
   .option("--all-agents", "install for every supported agent")

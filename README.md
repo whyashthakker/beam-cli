@@ -32,6 +32,14 @@ beam setup
 
 After setup, selected agents are protected automatically. You do not need to run `beam run` or manually start a collector.
 
+### Or let your coding agent set it up
+
+```bash
+npx @agent-beam/beam add skill agentbeam-setup -g --all-agents
+```
+
+That installs the AgentBeam setup skill for Claude Code, Codex, Cursor, Gemini CLI, OpenCode and GitHub Copilot CLI. Then ask your agent to "set up AgentBeam". It installs the CLI, hands you `beam setup` for the parts that need a browser sign-in, and checks that everything is running.
+
 ## Useful commands
 
 ```bash
@@ -245,6 +253,22 @@ npm test
 npm run typecheck
 npm run build
 ```
+
+### Releasing
+
+Bump `version` in `package.json` and push to `main`. The [Release workflow](.github/workflows/release.yml) then:
+
+1. Runs the type check and tests.
+2. Builds the standalone binaries.
+3. Creates the `vX.Y.Z` tag and a GitHub Release with generated notes.
+4. Publishes to npm, once npm trusted publishing is configured. Until then, run `npm publish` yourself.
+
+A version that's already tagged is skipped. agentbeam.com's changelog and install scripts read these GitHub Releases, so the site follows within the hour.
+
+To turn on automatic npm publishing:
+
+1. On npmjs.com, open the package settings and add a trusted publisher: GitHub Actions, repository `whyashthakker/beam-cli`, workflow `release.yml`.
+2. Set the repository variable `NPM_TRUSTED_PUBLISHING` to `true`.
 
 ## License
 
