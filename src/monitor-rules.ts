@@ -96,16 +96,23 @@ export function redactLine(line: string, custom: CustomDetector[] = []): string 
   return out.slice(0, 600);
 }
 
-const IPV4 = /\b(?:\d{1,3}\.){3}\d{1,3}\b/;
-/** The client address in an access-log line: the first IPv4 address, which is where nginx, Apache and Caddy put it. */
+// JSON access logs (Railway, Vercel, Caddy, ALB/CloudFront exports, app loggers) name the client field.
+const JSON_CLIENT_IP = /"(?:srcIp|src_ip|clientIp|client_ip|remoteAddr|remote_addr|remoteIp|remote_ip|ip|client|x_forwarded_for|xForwardedFor|http_x_forwarded_for)"\s*:\s*"\[?([0-9a-fA-F:.]{3,45})/;
+const LEADING_IP = /^\[?((?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]*:[0-9a-fA-F:]+)\]?\s/;
+// Not preceded by a word character, "/" or "." so version strings like "Chrome/120.0.0.0" aren't read as addresses.
+const BARE_IPV4 = /(?<![\w/.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])/;
+/**
+ * The client address in an access-log line: a named field in JSON logs, the first token in
+ * nginx/Apache/Caddy common log format, otherwise the first standalone IPv4 address.
+ */
 export function clientIp(line: string): string | undefined {
-  return line.match(IPV4)?.[0];
+  return line.match(JSON_CLIENT_IP)?.[1] ?? line.match(LEADING_IP)?.[1] ?? line.match(BARE_IPV4)?.[0];
 }
 
 const AUTH_PATH = /\/(?:login|signin|sign-in|auth|oauth|token|session|api\/v\d+\/auth|wp-login\.php|admin)\b/i;
 const AUTH_FAIL_TEXT = /\b(?:login|authentication|auth|sign[- ]?in)\s+(?:failed|failure|denied)|\binvalid\s+(?:password|credentials|username or password|api key|token)|\bfailed\s+password\b|\bincorrect\s+password\b|\bunauthori[sz]ed\b/i;
 /** A failed sign-in: a 401/403 on an auth path in an access log, or an app's own "login failed" line. */
 export function isAuthFailure(line: string, source: LineSource): boolean {
-  if (source === "http") return /"\s(?:401|403)\s/.test(line) && AUTH_PATH.test(line);
+  if (source === "http") return (/"\s(?:401|403)\s/.test(line) || /"(?:status|httpStatus|status_code|statusCode|response_status)"\s*:\s*"?(?:401|403)\b/.test(line)) && AUTH_PATH.test(line);
   return AUTH_FAIL_TEXT.test(line);
 }

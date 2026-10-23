@@ -286,3 +286,18 @@ describe("own LLM (BEAM_LLM_*)", () => {
     expect(await judgeWithOwnLlm([finding("l", "critical")], "light", config)).toBe(0);
   });
 });
+
+describe("client addresses and JSON access logs", () => {
+  it("reads the client field, never a browser version", async () => {
+    const { clientIp, isAuthFailure, lineSource } = await import("../src/monitor-rules.js");
+    const railway = '{"timestamp":"2026-10-23T10:08:58Z","method":"POST","path":"/login","httpStatus":401,"clientUa":"Mozilla/5.0 Chrome/155.0.0.0 Safari/537.36","srcIp":"66.249.74.225","upstreamAddress":"http://[fd12::1]:8080"}';
+    expect(clientIp(railway)).toBe("66.249.74.225");
+    expect(lineSource(railway)).toBe("http");
+    expect(isAuthFailure(railway, "http")).toBe(true);
+    expect(isAuthFailure(railway.replace("401", "200"), "http")).toBe(false);
+    expect(clientIp('{"remote_addr":"2001:db8::7","request":"GET /"}')).toBe("2001:db8::7");
+    expect(clientIp(access("/", "198.51.100.4"))).toBe("198.51.100.4");
+    expect(clientIp("UA Chrome/120.0.0.0 from upstream")).toBeUndefined();
+    expect(clientIp("worker connected to 10.0.0.5 ok")).toBe("10.0.0.5");
+  });
+});
