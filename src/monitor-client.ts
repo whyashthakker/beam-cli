@@ -9,13 +9,13 @@ import type { InstalledPackage } from "./lockfiles.js";
 export type MonitorAuth = Pick<Identity, "apiBase" | "deviceSecret">;
 
 /**
- * An app token (BEAM_APP_TOKEN, created per app on the dashboard's App monitoring page) for
+ * An app token (BEAM_APP_TOKEN, created per app under App monitoring > Settings, apps and alerts) for
  * servers, containers and CI; otherwise this machine's own connection from 'beam connect'.
  */
 export async function monitorAuth(env: NodeJS.ProcessEnv = process.env): Promise<MonitorAuth | null> {
   const token = env.BEAM_APP_TOKEN?.trim();
   if (token) {
-    if (!/^beam_app_[\w-]{40,}$/.test(token)) throw new Error("BEAM_APP_TOKEN doesn't look like an app token (beam_app_…). Copy it again from the dashboard's App monitoring page.");
+    if (!/^beam_app_[\w-]{40,}$/.test(token)) throw new Error("BEAM_APP_TOKEN doesn't look like an app token (beam_app_…). Copy it again from App monitoring > Settings, apps and alerts in the dashboard.");
     const apiBase = getDashboardUrl();
     // A bearer token over plain HTTP can be read on the wire; only loopback (local testing) is exempt.
     const url = new URL(apiBase);
@@ -79,7 +79,7 @@ async function call(identity: MonitorAuth, path: string, init: RequestInit = {})
       ok: false,
       status: "revoked",
       message: identity.deviceSecret.startsWith("beam_app_")
-        ? `This app token was rotated or removed, or its app was deleted. Copy the current token from ${getDashboardUrl()}/dashboard/monitoring (Apps) into BEAM_APP_TOKEN.`
+        ? `This app token was rotated or removed, or its app was deleted. Copy the current token from ${getDashboardUrl()}/dashboard/monitoring/settings#apps into BEAM_APP_TOKEN.`
         : "This device was revoked or is unknown to the workspace. Run 'beam connect' again.",
     };
   if (response.status === 404 || response.status === 405)

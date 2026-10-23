@@ -26,7 +26,7 @@ export function formatVulnerability(v: Vulnerability): string {
 
 export async function runCveCheck(dir: string, options: CveCheckOptions = {}, write: (line: string) => void = console.log): Promise<number> {
   const identity = await monitorAuth();
-  if (!identity) throw new Error("Set BEAM_APP_TOKEN to the app's token from the dashboard's App monitoring page, or connect this machine with 'beam connect'.");
+  if (!identity) throw new Error("Set BEAM_APP_TOKEN to the app's token from App monitoring > Settings, apps and alerts in the dashboard, or connect this machine with 'beam connect'.");
   const root = resolve(dir);
   const scan = await readInstalledPackages(root, options.depth);
   if (!scan.files.length) {

@@ -49,6 +49,7 @@ beam agent list            # see supported agents and hook status
 beam studio                # open the local activity dashboard
 beam sync                  # fetch the latest organization policy
 beam monitor --file <log>  # watch a running app's logs and traffic (see App monitoring)
+beam monitor configure     # save what to watch and which LLM key to use; shows where each setting comes from
 beam cve check .           # check an app's dependencies for known vulnerabilities
 ```
 
@@ -175,17 +176,19 @@ Jev and `beam judge` can run together. Each adds its own wait to every eligible 
 Both need a connected workspace, and both stay off until a workspace owner or admin turns on App monitoring in the dashboard. Until then, `beam monitor` waits and captures nothing.
 
 ```bash
-export BEAM_APP_TOKEN=beam_app_...            # the app's token, from the dashboard (App monitoring > Apps)
+export BEAM_APP_TOKEN=beam_app_...            # the app's token, from the dashboard (App monitoring > Settings, apps and alerts)
 beam monitor --file /var/log/nginx/access.log --file /var/log/app/app.log
+beam monitor --llm openai --file /var/log/app/app.log     # review flagged lines with your own OPENAI_API_KEY
+beam monitor configure --file /var/log/app/app.log --llm openai   # save it; then a plain 'beam monitor' runs it
 beam monitor --file /var/log/app/app.log --app /srv/app   # also check dependencies at start and daily
 node server.js 2>&1 | beam monitor --stdin    # or read piped output
 beam monitor test                             # send one test finding to prove the setup
-beam monitor status                           # app, on or off, level, and this month's usage
+beam monitor status                           # app, on or off, level, LLM in use, usage, and where each setting came from
 beam cve check .                              # one-off check; exits 2 when anything is found
 beam cve check . --fail-on high --json        # in CI: fail only on high and critical
 ```
 
-**Apps and tokens.** Add each app (bgremover, explainx, ...) on the dashboard's App monitoring page to get its own token, shown once. With `BEAM_APP_TOKEN` set, `beam monitor` and `beam cve check` report as that app, and its findings, filters and webhook routing stay separate from your other apps. A laptop connected with `beam connect` works without a token. Tokens are least-privilege:
+**Apps and tokens.** Add each app (bgremover, explainx, ...) in the dashboard under App monitoring > Settings, apps and alerts to get its own token, shown once. With `BEAM_APP_TOKEN` set, `beam monitor` and `beam cve check` report as that app, and its findings, filters and webhook routing stay separate from your other apps. A laptop connected with `beam connect` works without a token. Tokens are least-privilege:
 
 - They work only for App monitoring. Every other AgentBeam API rejects them.
 - Only a hash is stored, and the CLI refuses to send one over plain HTTP.
@@ -248,6 +251,8 @@ When you can't change the app or its container, the [Beam monitor service for Ra
 **What it never does.** It doesn't block requests, change the app or sit in the request path. With `--file` it reads logs the way `tail -F` does and follows rotation and truncation. With `--stdin` it echoes every line to stdout, so the app's output still reaches its usual destination; use `--no-echo` to turn that off. Prefer `--file` in production so the app doesn't depend on Beam's pipe.
 
 **Noise control.** Repeats fold into one finding per time window. Traffic is grouped by client address, so a scan from one IP becomes one alert with a count. Above 200 new findings in 10 minutes, the rest are summarized in a single finding.
+
+**False positives and rules.** On the dashboard, **Create rule** on any finding (owners and admins) either ignores findings like it (dropped before they're stored, metered or alerted on) or keeps them on the dashboard without alerting. A rule matches the detection rule and an exact request path, a path prefix such as `/blog/`, or the rule anywhere, in one app or all of them. AgentBeam applies rules when findings arrive, so every CLI and SDK version follows them, including ones already deployed.
 
 | Level (set in the dashboard) | Alerts on | Repeats fold for | Optional LLM check |
 |---|---|---|---|

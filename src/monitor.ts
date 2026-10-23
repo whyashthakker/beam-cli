@@ -180,7 +180,7 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
   // Settings first, so a misconfiguration is reported before anything else.
   const ownLlm = llmFrom(resolved, options.llm, log);
   const identity = await monitorAuth();
-  if (!identity) throw new Error("Set BEAM_APP_TOKEN to the app's token from the dashboard's App monitoring page, or connect this machine with 'beam connect'.");
+  if (!identity) throw new Error("Set BEAM_APP_TOKEN to the app's token from App monitoring > Settings, apps and alerts in the dashboard, or connect this machine with 'beam connect'.");
   const custom = (await readPolicy())?.rules.customDetectors ?? [];
 
   let config: MonitorConfig | null = null;
@@ -374,7 +374,7 @@ const fmt = (n: number) => (n >= 2_147_483_647 ? "unlimited" : n.toLocaleString(
 export async function monitorStatus(write: (line: string) => void = console.log, llm?: string): Promise<number> {
   let identity;
   try { identity = await monitorAuth(); } catch (error) { write((error as Error).message); return 1; }
-  if (!identity) { write("Set BEAM_APP_TOKEN to the app's token from the dashboard's App monitoring page, or connect this machine with 'beam connect'."); return 1; }
+  if (!identity) { write("Set BEAM_APP_TOKEN to the app's token from App monitoring > Settings, apps and alerts in the dashboard, or connect this machine with 'beam connect'."); return 1; }
   const result = await fetchMonitorConfig(identity);
   if (!result.ok) {
     write(result.status === "disabled" ? `App monitoring: off\n${result.message}` : result.message);
@@ -405,7 +405,7 @@ export async function monitorStatus(write: (line: string) => void = console.log,
 export async function monitorTest(write: (line: string) => void = console.log, llm?: string): Promise<number> {
   let identity;
   try { identity = await monitorAuth(); } catch (error) { write(`✖ ${(error as Error).message}`); return 1; }
-  if (!identity) { write("✖ Set BEAM_APP_TOKEN to the app's token from the dashboard's App monitoring page, or connect this machine with 'beam connect'."); return 1; }
+  if (!identity) { write("✖ Set BEAM_APP_TOKEN to the app's token from App monitoring > Settings, apps and alerts in the dashboard, or connect this machine with 'beam connect'."); return 1; }
   const config = await fetchMonitorConfig(identity);
   if (!config.ok) { write(`✖ ${config.message}`); return 1; }
   const where = config.config.app ?? hostname();

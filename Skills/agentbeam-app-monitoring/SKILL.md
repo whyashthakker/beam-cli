@@ -4,7 +4,7 @@ description: Add AgentBeam app monitoring to an application - check its dependen
 license: AGPL-3.0-only
 metadata:
   author: Beam
-  version: "1.1.0"
+  version: "1.2.0"
   website: https://agentbeam.com
 ---
 
@@ -24,8 +24,8 @@ You'll set up two things for the user's app:
 
 ## 1. Check the prerequisites with the user
 
-- App monitoring is turned on for their workspace at https://app.agentbeam.com/dashboard/monitoring (an owner or admin does this).
-- The app has been added there under Apps (named after the app, for example `bgremover`), and its token is in the environment where you'll run commands. `beam monitor status` confirms the token works without printing it.
+- App monitoring is turned on for their workspace at https://app.agentbeam.com/dashboard/monitoring/settings (an owner or admin does this).
+- The app has been added on that page under Apps (named after the app, for example `bgremover`), and its token is in the environment where you'll run commands. `beam monitor status` confirms the token works without printing it.
 
 ## 2. Install the CLI
 
@@ -129,5 +129,6 @@ The test finding should appear within seconds on https://app.agentbeam.com/dashb
 - **LLM features outside Node.js:** if the app logs its prompts or model replies, point `beam monitor --file` at that log. The same prompt injection rules read it.
 - **Review flagged lines with the user's own key:** `beam monitor configure --llm openai` (or anthropic, gemini, groq, openrouter, mistral, deepseek, xai, ollama, custom) uses the provider key the user already keeps in that server's environment. The key stays on that server; never read or print it. `beam monitor test --llm <provider>` proves it works.
 - **Save the setup:** `beam monitor configure --file <log> --app <dir>` writes `~/.beam/monitor.json`, so the service can run a plain `beam monitor`.
-- **Separate alert channels:** add webhooks on the dashboard and limit each one to particular apps.
+- **Separate alert channels:** add webhooks in App monitoring settings and limit each one to particular apps.
+- **False positives:** tell the user they can use **Create rule** on a finding in the dashboard to ignore findings like it, or keep them without alerting. Don't change the app or the rules to hide findings yourself.
 - **Full guide:** https://docs.agentbeam.com/agent-cli/app-monitoring

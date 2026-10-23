@@ -22,7 +22,7 @@ import { containsCanary } from "./prompt-attacks.js";
 import { judgeWithOwnLlm, ownLlmConfig, type OwnLlmConfig } from "./monitor-llm.js";
 
 export interface AppMonitorOptions {
-  /** The app's token from the dashboard (App monitoring > Apps). Default: BEAM_APP_TOKEN. */
+  /** The app's token from the dashboard (App monitoring > Settings, apps and alerts). Default: BEAM_APP_TOKEN. */
   token?: string;
   /** Default: BEAM_DASHBOARD_URL, else https://app.agentbeam.com. Must be https (localhost excepted). */
   dashboardUrl?: string;
