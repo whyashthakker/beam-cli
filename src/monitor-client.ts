@@ -74,7 +74,14 @@ async function call(identity: MonitorAuth, path: string, init: RequestInit = {})
   const message = typeof body.error === "string" ? body.error : `${identity.apiBase} responded with HTTP ${response.status}.`;
   if (response.status === 403) return { ok: false, status: "disabled", message };
   if (response.status === 429) return { ok: false, status: "quota", message, resetAt: typeof body.resetAt === "string" ? body.resetAt : undefined };
-  if (response.status === 401) return { ok: false, status: "revoked", message: "This device was revoked or is unknown to the workspace. Run 'beam connect' again." };
+  if (response.status === 401)
+    return {
+      ok: false,
+      status: "revoked",
+      message: identity.deviceSecret.startsWith("beam_app_")
+        ? `This app token was rotated or removed, or its app was deleted. Copy the current token from ${getDashboardUrl()}/dashboard/monitoring (Apps) into BEAM_APP_TOKEN.`
+        : "This device was revoked or is unknown to the workspace. Run 'beam connect' again.",
+    };
   if (response.status === 404 || response.status === 405)
     return { ok: false, status: "unsupported", message: `${identity.apiBase} doesn't support App monitoring yet.` };
   return { ok: false, status: "unreachable", message };

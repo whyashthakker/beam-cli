@@ -247,6 +247,9 @@ describe("runMonitor", () => {
     expect(seen.every(r => r.auth === "Bearer beam_app_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG")).toBe(true);
     process.env.BEAM_APP_TOKEN = "not-a-token";
     await expect(runMonitor({ stdin: true })).rejects.toThrow("doesn't look like an app token");
+    process.env.BEAM_APP_TOKEN = "beam_app_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
+    global.fetch = jest.fn(async () => Response.json({ error: "Unknown or revoked device." }, { status: 401 })) as typeof fetch;
+    await expect(runMonitor({ stdin: true })).rejects.toThrow("app token was rotated or removed");
   });
   it("attaches the verdict from the user's own LLM before sending", async () => {
     process.env.BEAM_LLM_BASE_URL = "http://127.0.0.1:11434/v1";
