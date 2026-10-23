@@ -54,6 +54,12 @@ beam cve check .           # check an app's dependencies for known vulnerabiliti
 
 Run `beam setup` again when adding an agent or repairing an installation. It preserves existing agent configuration.
 
+**Updates.** Like Claude Code, Beam keeps itself current. At most once a day, an interactive `beam` command checks for a new release and installs it in the background, so the command you ran never waits. The next command tells you it's done and what to restart.
+
+- It never runs inside agent hooks, `beam run`, `beam monitor`, CI or non-interactive shells, and never asks for sudo. If the install needs elevated rights, it tells you to run `beam update`.
+- Turn it off per user with `beam update --auto off`, or fleet-wide with `BEAM_DISABLE_AUTOUPDATE=1` (for example through MDM).
+- Standalone binaries show a download link instead.
+
 ## What AgentBeam protects
 
 Depending on organization policy, AgentBeam can ask for approval, block, redact, or log:

@@ -37,6 +37,7 @@ import { registerJudgeCommands } from "./judge-cli.js";
 import { addTrustedPath, readTrustedPaths, removeTrustedPath, trustedPathsFile } from "./trusted-paths.js";
 import { blockedTargetsFile, readBlockedTargets, removeBlockedTarget } from "./blocked-targets.js";
 import { checkForUpdate, installUpdate } from "./update.js";
+import { WORKER_COMMAND, autoUpdateAllowed, autoUpdateTick, readUpdateState, runAutoUpdateWorker, writeUpdateState } from "./auto-update.js";
 import { recordExpectedHooks, reportControlEvent } from "./tamper.js";
 import { monitorStatus, monitorTest, runMonitor } from "./monitor.js";
 import { CVE_SEVERITIES, runCveCheck, type CveSeverity } from "./cve.js";
@@ -348,7 +349,16 @@ program.command("sync")
 program.command("update")
   .description("Update the globally installed beam CLI to the latest published version")
   .option("--check", "only check for an update, don't install it")
-  .action(async (options: { check?: boolean }) => {
+  .option("--auto <on|off>", "turn background auto-updates on or off for this user (BEAM_DISABLE_AUTOUPDATE=1 also turns them off)")
+  .action(async (options: { check?: boolean; auto?: string }) => {
+    if (options.auto !== undefined) {
+      if (options.auto !== "on" && options.auto !== "off") throw new Error("--auto must be on or off.");
+      await writeUpdateState({ ...(await readUpdateState()), autoUpdate: options.auto === "on" });
+      console.log(options.auto === "on"
+        ? "✔ Background auto-updates are on. Beam checks once a day and installs new versions in the background."
+        : "✔ Background auto-updates are off. Run 'beam update' to update.");
+      return;
+    }
     let check: Awaited<ReturnType<typeof checkForUpdate>>;
     try {
       check = await checkForUpdate(packageJson.version);
@@ -365,6 +375,10 @@ program.command("update")
       throw new Error(`Could not install the update automatically: ${(e as Error).message}\n  Run manually: npm install -g @agent-beam/beam@${check.latest}`);
     }
   });
+
+// The detached background worker started by autoUpdateTick(); not for direct use.
+program.command(WORKER_COMMAND, { hidden: true })
+  .action(async () => { await runAutoUpdateWorker({ current: packageJson.version }); });
 
 const shims = program.command("shims").description("Make agent CLIs (claude, codex, ...) sandboxed automatically, without typing 'beam run'");
 
@@ -763,6 +777,13 @@ block.command("list")
     if (!targets.length) { console.log(`No blocked targets (${blockedTargetsFile()}).`); return; }
     for (const t of targets) console.log(t);
   });
+
+// Background auto-update (see auto-update.ts): a notice from a finished update, or a daily check
+// started in a detached process. Never on hooks, agent wrappers, long-running or non-interactive runs.
+if (autoUpdateAllowed(argv[0])) {
+  const notice = await autoUpdateTick(packageJson.version);
+  if (notice) console.error(cyan(notice));
+}
 
 try {
   await program.parseAsync();
