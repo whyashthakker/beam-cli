@@ -19,10 +19,9 @@ mkdirSync(OUT_DIR, { recursive: true });
 for (const [target, outName] of TARGETS) {
   const outPath = join(OUT_DIR, outName);
   console.log(`Building ${outName} (${target})...`);
-  // Pinned: the maintained pkg fork (Node 22 targets); the original "pkg" stops at Node 18.
   execFileSync(
     "npx",
-    ["--yes", "@yao-pkg/pkg@6.23.0", ".", "--targets", target, "--output", outPath],
+    ["pkg", ".", "--targets", target, "--output", outPath],
     { stdio: "inherit" }
   );
   if (!existsSync(outPath)) {

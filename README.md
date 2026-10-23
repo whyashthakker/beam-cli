@@ -169,16 +169,27 @@ Jev and `beam judge` can run together. Each adds its own wait to every eligible 
 Both need a connected workspace, and both stay off until a workspace owner or admin turns on App monitoring in the dashboard. Until then, `beam monitor` waits and captures nothing.
 
 ```bash
-beam connect                                  # once per server or container
+export BEAM_APP_TOKEN=beam_app_...            # the app's token, from the dashboard (App monitoring > Apps)
 beam monitor --file /var/log/nginx/access.log --file /var/log/app/app.log
 beam monitor --file /var/log/app/app.log --app /srv/app   # also check dependencies at start and daily
 node server.js 2>&1 | beam monitor --stdin    # or read piped output
-beam monitor status                           # on or off, level, and this month's usage
+beam monitor test                             # send one test finding to prove the setup
+beam monitor status                           # app, on or off, level, and this month's usage
 beam cve check .                              # one-off check; exits 2 when anything is found
 beam cve check . --fail-on high --json        # in CI: fail only on high and critical
 ```
 
-Run it under whatever keeps your app running: a systemd unit, a sidecar container that shares the log volume, or pm2.
+**Apps and tokens.** Add each app (bgremover, explainx, ...) on the dashboard's App monitoring page to get its own token, shown once. With `BEAM_APP_TOKEN` set, `beam monitor` and `beam cve check` report as that app, and its findings, filters and webhook routing stay separate from your other apps. A laptop connected with `beam connect` works without a token. Tokens are least-privilege:
+
+- They work only for App monitoring. Every other AgentBeam API rejects them.
+- Only a hash is stored, and the CLI refuses to send one over plain HTTP.
+- Beam redacts its own tokens from logs and evidence.
+- Each app has a per-minute request limit.
+- Rotating or removing a token takes effect immediately.
+
+Run it under whatever keeps your app running: a systemd unit, a sidecar container that shares the log volume, or pm2. For an app on Railway, deploy the [Beam monitor service](deploy/railway-monitor/README.md) next to it. It streams the app's HTTP and app logs from Railway without changing the app.
+
+**Let your coding agent do it:** `npx @agent-beam/beam add skill agentbeam-app-monitoring -g --all-agents`, then ask it to add AgentBeam monitoring to your app. It finds where the app runs, keeps the token out of the repository, and finishes with `beam monitor test`.
 
 **What leaves the machine.** Log lines are matched on the server where `beam monitor` runs, and raw lines are never sent. A finding carries the rule, severity, file, a repeat count and a redacted excerpt of up to 600 characters. Redaction removes credentials, bearer tokens, URL userinfo, email addresses and your policy's custom detector matches. Query strings are kept, because in an access log the query is usually the attack. `beam cve check` sends package names and versions only.
 

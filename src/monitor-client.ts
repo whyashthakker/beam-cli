@@ -1,14 +1,36 @@
 // Calls to the workspace's App monitoring API. Like the rest of the device API these go to the
 // enrolled identity.apiBase, authenticated with the device secret. The server decides whether
 // this workspace has App monitoring turned on; nothing is sent until it says yes.
-import type { Identity } from "./enroll.js";
+import { readIdentity, type Identity } from "./enroll.js";
+import { getDashboardUrl } from "./config.js";
 import type { InstalledPackage } from "./lockfiles.js";
+
+/** What the App monitoring API needs: where to send, and the secret to send with. */
+export type MonitorAuth = Pick<Identity, "apiBase" | "deviceSecret">;
+
+/**
+ * An app token (BEAM_APP_TOKEN, created per app on the dashboard's App monitoring page) for
+ * servers, containers and CI; otherwise this machine's own connection from 'beam connect'.
+ */
+export async function monitorAuth(env: NodeJS.ProcessEnv = process.env): Promise<MonitorAuth | null> {
+  const token = env.BEAM_APP_TOKEN?.trim();
+  if (token) {
+    if (!/^beam_app_[\w-]{40,}$/.test(token)) throw new Error("BEAM_APP_TOKEN doesn't look like an app token (beam_app_…). Copy it again from the dashboard's App monitoring page.");
+    const apiBase = getDashboardUrl();
+    // A bearer token over plain HTTP can be read on the wire; only loopback (local testing) is exempt.
+    const url = new URL(apiBase);
+    if (url.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))
+      throw new Error(`Refusing to send BEAM_APP_TOKEN to ${apiBase} over plain HTTP. Use an https:// BEAM_DASHBOARD_URL.`);
+    return { deviceSecret: token, apiBase };
+  }
+  return readIdentity();
+}
 
 export type MonitorLevel = "light" | "standard" | "strict";
 export type MonitorSeverity = "critical" | "high" | "medium" | "low";
 export interface MonitorUsage { findings: number; cveChecks: number; llmChecks: number }
 export interface MonitorConfig {
-  enabled: true; level: MonitorLevel; llm: boolean; webhooks: number;
+  enabled: true; app: string | null; level: MonitorLevel; llm: boolean; webhooks: number;
   usage: MonitorUsage; limits: MonitorUsage; resetAt: string; settingsUrl: string;
 }
 export interface MonitorFinding {
@@ -35,7 +57,7 @@ export type ApiFailure = { ok: false; message: string } & (
   | { status: "unreachable" } // network/5xx: retry later
 );
 
-async function call(identity: Identity, path: string, init: RequestInit = {}): Promise<{ ok: true; body: unknown } | ApiFailure> {
+async function call(identity: MonitorAuth, path: string, init: RequestInit = {}): Promise<{ ok: true; body: unknown } | ApiFailure> {
   let response: Response;
   try {
     response = await fetch(`${identity.apiBase}${path}`, {
@@ -58,19 +80,19 @@ async function call(identity: Identity, path: string, init: RequestInit = {}): P
   return { ok: false, status: "unreachable", message };
 }
 
-export async function fetchMonitorConfig(identity: Identity): Promise<{ ok: true; config: MonitorConfig } | ApiFailure> {
+export async function fetchMonitorConfig(identity: MonitorAuth): Promise<{ ok: true; config: MonitorConfig } | ApiFailure> {
   const result = await call(identity, "/v1/monitor/config");
   return result.ok ? { ok: true, config: result.body as MonitorConfig } : result;
 }
 
-export async function sendFindings(identity: Identity, findings: MonitorFinding[]): Promise<{ ok: true; accepted: number; dropped: number } | ApiFailure> {
+export async function sendFindings(identity: MonitorAuth, findings: MonitorFinding[]): Promise<{ ok: true; accepted: number; dropped: number } | ApiFailure> {
   const result = await call(identity, "/v1/monitor/findings", { method: "POST", body: JSON.stringify({ findings }) });
   if (!result.ok) return result;
   const body = result.body as { accepted?: number; dropped?: number };
   return { ok: true, accepted: body.accepted ?? 0, dropped: body.dropped ?? 0 };
 }
 
-export async function checkPackages(identity: Identity, packages: InstalledPackage[]): Promise<{ ok: true; result: CveCheckResult } | ApiFailure> {
+export async function checkPackages(identity: MonitorAuth, packages: InstalledPackage[]): Promise<{ ok: true; result: CveCheckResult } | ApiFailure> {
   const result = await call(identity, "/v1/cve/check", { method: "POST", body: JSON.stringify({ packages }) });
   return result.ok ? { ok: true, result: result.body as CveCheckResult } : result;
 }

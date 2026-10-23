@@ -227,6 +227,27 @@ describe("runMonitor", () => {
     expect(finding).toMatchObject({ ruleId: "web.sql_injection", severity: "high", source: "http", file: "stdin" });
     expect(finding!.evidence).not.toContain("s3cr3t");
   });
+  it("runs on an app token alone, with no 'beam connect', and reports as that app", async () => {
+    await rm(join(home, "data", "identity.json"));
+    process.env.BEAM_APP_TOKEN = "beam_app_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
+    process.env.BEAM_DASHBOARD_URL = "https://dash.test";
+    const seen: { url: string; auth: string | null }[] = [];
+    const inner = global.fetch;
+    global.fetch = jest.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      seen.push({ url: String(input), auth: new Headers(init?.headers).get("authorization") });
+      return String(input).endsWith("/v1/monitor/config")
+        ? Response.json({ enabled: true, app: "bgremover", level: "standard", llm: false, webhooks: 0, usage: { findings: 0, cveChecks: 0, llmChecks: 0 }, limits: { findings: 1000, cveChecks: 100, llmChecks: 100 }, resetAt: "2026-11-01T00:00:00.000Z", settingsUrl: "https://dash.test/dashboard/monitoring" })
+        : inner(input, init);
+    }) as typeof fetch;
+    Object.defineProperty(process, "stdin", { value: Readable.from([`${access("/?id=1 UNION SELECT 1")}\n`]), configurable: true });
+    const logs: string[] = [];
+    await runMonitor({ stdin: true, echo: false }, m => logs.push(m));
+    expect(logs[0]).toContain("App monitoring is on for bgremover");
+    expect(seen.map(r => r.url)).toEqual(["https://dash.test/v1/monitor/config", "https://dash.test/v1/monitor/findings"]);
+    expect(seen.every(r => r.auth === "Bearer beam_app_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG")).toBe(true);
+    process.env.BEAM_APP_TOKEN = "not-a-token";
+    await expect(runMonitor({ stdin: true })).rejects.toThrow("doesn't look like an app token");
+  });
   it("attaches the verdict from the user's own LLM before sending", async () => {
     process.env.BEAM_LLM_BASE_URL = "http://127.0.0.1:11434/v1";
     process.env.BEAM_LLM_MODEL = "llama3.2";

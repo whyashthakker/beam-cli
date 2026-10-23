@@ -36,7 +36,7 @@ const appRules: MonitorRule[] = [
   { id: "web.deserialization", title: "Serialized object payload", severity: "high", category: "exploit",
     match: s => /\brO0AB[A-Za-z0-9+/=]{8,}|\bO:\d+:"[A-Za-z_\\]+":\d+:\{/.test(s) },
   { id: "app.secret_in_log", title: "Credential written to logs", severity: "high", category: "secrets",
-    match: (_s, raw) => /-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|AIza[0-9A-Za-z_-]{35})\b|\bauthorization:\s*bearer\s+[A-Za-z0-9._~+/-]{20,}/i.test(raw) },
+    match: (_s, raw) => /-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|AIza[0-9A-Za-z_-]{35}|beam_app_[\w-]{20,})\b|\bauthorization:\s*bearer\s+[A-Za-z0-9._~+/-]{20,}/i.test(raw) },
   { id: "web.xss", title: "Cross-site scripting attempt", severity: "medium", category: "exploit",
     match: s => /<script[\s>]|javascript:\s*[a-z(]|<(?:img|svg|body|iframe)\b[^>]{0,200}\son(?:error|load)\s*=|\bdocument\.cookie\b/i.test(s) },
   { id: "web.prototype_pollution", title: "Prototype pollution attempt", severity: "medium", category: "exploit",
@@ -85,7 +85,7 @@ export function matchLine(line: string, source: LineSource = lineSource(line)): 
 export function redactLine(line: string, custom: CustomDetector[] = []): string {
   let out = line.slice(0, 4000)
     .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-]*PRIVATE KEY-----|$)/g, "[REDACTED PRIVATE KEY]")
-    .replace(/\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|AIza[0-9A-Za-z_-]{35})\b/g, "[REDACTED TOKEN]")
+    .replace(/\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|AIza[0-9A-Za-z_-]{35}|beam_app_[\w-]{20,})\b/g, "[REDACTED TOKEN]")
     .replace(/(bearer\s+)[A-Za-z0-9._~+/-]{8,}/gi, "$1[REDACTED]")
     .replace(/(\b(?:[\w-]*(?:api[_-]?key|token|secret|password|passwd|pwd|authorization|session|cookie)[\w-]*)["']?\s*[:=]\s*)["']?[^\s,"';&}\]]+/gi, "$1[REDACTED]")
     .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[REDACTED]@")

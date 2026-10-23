@@ -7,15 +7,15 @@
 // monitoring on in the dashboard -- before that, and whenever it is turned off again or the
 // monthly allowance runs out, lines are read and discarded.
 import { createHash } from "node:crypto";
+import { hostname } from "node:os";
 import { open, type FileHandle } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { StringDecoder } from "node:string_decoder";
-import { readIdentity } from "./enroll.js";
 import { readPolicy } from "./policy.js";
 import { readInstalledPackages } from "./lockfiles.js";
 import {
-  checkPackages, fetchMonitorConfig, sendFindings,
+  checkPackages, fetchMonitorConfig, monitorAuth, sendFindings,
   type MonitorConfig, type MonitorFinding, type MonitorLevel, type MonitorSeverity, type Vulnerability,
 } from "./monitor-client.js";
 import { clientIp, isAuthFailure, lineSource, matchLine, redactLine } from "./monitor-rules.js";
@@ -289,8 +289,8 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
   const appDir = options.app ? resolve(options.app) : undefined;
   if (!files.length && !options.stdin && !appDir)
     throw new Error("Tell beam monitor what to watch: --file <path> (repeatable) for log files, --stdin to read piped output, and/or --app <dir> for dependency checks.");
-  const identity = await readIdentity();
-  if (!identity) throw new Error("Connect this server to your Beam workspace first: run 'beam connect'. App monitoring is then turned on for the workspace in the dashboard.");
+  const identity = await monitorAuth();
+  if (!identity) throw new Error("Set BEAM_APP_TOKEN to the app's token from the dashboard's App monitoring page, or connect this machine with 'beam connect'.");
   const custom = (await readPolicy())?.rules.customDetectors ?? [];
   const ownLlm = ownLlmConfig();
 
@@ -305,7 +305,7 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
     const result = await fetchMonitorConfig(identity);
     if (result.ok) {
       if (!config) {
-        log(`App monitoring is on (${result.config.level} level). Findings go to your workspace${result.config.webhooks ? ` and ${result.config.webhooks} webhook${result.config.webhooks === 1 ? "" : "s"}` : ""}.`);
+        log(`App monitoring is on${result.config.app ? ` for ${result.config.app}` : ""} (${result.config.level} level). Findings go to your workspace${result.config.webhooks ? ` and ${result.config.webhooks} webhook${result.config.webhooks === 1 ? "" : "s"}` : ""}.`);
         log(ownLlm
           ? `LLM checks: your own model, ${ownLlm.model} at ${new URL(ownLlm.baseUrl).host}.`
           : `LLM checks: ${result.config.llm ? "Beam's model (set in the dashboard)" : "off"}.`);
@@ -420,24 +420,46 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
 const fmt = (n: number) => (n >= 2_147_483_647 ? "unlimited" : n.toLocaleString("en-US"));
 
 export async function monitorStatus(write: (line: string) => void = console.log): Promise<number> {
-  const identity = await readIdentity();
-  if (!identity) { write("Not connected to a Beam workspace. Run 'beam connect' first."); return 1; }
+  let identity;
+  try { identity = await monitorAuth(); } catch (error) { write((error as Error).message); return 1; }
+  if (!identity) { write("Set BEAM_APP_TOKEN to the app's token from the dashboard's App monitoring page, or connect this machine with 'beam connect'."); return 1; }
   const result = await fetchMonitorConfig(identity);
   if (!result.ok) {
     write(result.status === "disabled" ? `App monitoring: off\n${result.message}` : result.message);
     return result.status === "disabled" ? 0 : 1;
   }
-  const { level, llm, webhooks, usage, limits, resetAt, settingsUrl } = result.config;
+  const { app, level, llm, webhooks, usage, limits, resetAt, settingsUrl } = result.config;
   let own: ReturnType<typeof ownLlmConfig> = null;
   let ownError = "";
   try { own = ownLlmConfig(); } catch (error) { ownError = (error as Error).message; }
   write([
     "App monitoring: on",
+    ...(app ? [`App:            ${app}`] : []),
     `Level:          ${level}`,
     `LLM checks:     ${own ? `your own model, ${own.model} at ${new URL(own.baseUrl).host}` : ownError ? `misconfigured: ${ownError}` : llm ? "Beam's model" : "off"}`,
     `Webhooks:       ${webhooks}`,
     `This month:     ${fmt(usage.findings)} / ${fmt(limits.findings)} findings · ${fmt(usage.cveChecks)} / ${fmt(limits.cveChecks)} dependency checks · ${fmt(usage.llmChecks)} / ${fmt(limits.llmChecks)} LLM checks (resets ${resetAt.slice(0, 10)})`,
     `Settings:       ${settingsUrl}`,
   ].join("\n"));
+  return 0;
+}
+
+/** `beam monitor test`: one test finding through the real path, to prove an integration end to end. */
+export async function monitorTest(write: (line: string) => void = console.log): Promise<number> {
+  let identity;
+  try { identity = await monitorAuth(); } catch (error) { write(`✖ ${(error as Error).message}`); return 1; }
+  if (!identity) { write("✖ Set BEAM_APP_TOKEN to the app's token from the dashboard's App monitoring page, or connect this machine with 'beam connect'."); return 1; }
+  const config = await fetchMonitorConfig(identity);
+  if (!config.ok) { write(`✖ ${config.message}`); return 1; }
+  const where = config.config.app ?? hostname();
+  const now = new Date().toISOString();
+  const result = await sendFindings(identity, [{
+    id: `test-${createHash("sha256").update(`${where}\0${now}`).digest("hex").slice(0, 16)}`,
+    ruleId: "beam.monitor.test", title: "Test finding from beam monitor", severity: "high", category: "integrity",
+    source: "log", count: 1, firstSeen: now,
+    evidence: `beam monitor test from ${where}. If you can read this on the dashboard and at your webhooks, the integration works. No action is needed.`,
+  }]);
+  if (!result.ok) { write(`✖ ${result.message}`); return 1; }
+  write(`✔ Test finding sent for ${where}. Check the dashboard's App monitoring page${config.config.webhooks ? ` and your ${config.config.webhooks} webhook${config.config.webhooks === 1 ? "" : "s"}` : ""}.`);
   return 0;
 }

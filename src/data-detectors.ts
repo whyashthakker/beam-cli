@@ -3,7 +3,7 @@ export interface DataFinding { kind: DetectorKind; confidence: number; start: nu
 
 const detectors: Array<{ kind: DetectorKind; pattern: RegExp; replacement: string }> = [
   { kind: "PRIVATE_KEY", pattern: /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-]*PRIVATE KEY-----|$)/g, replacement: "[PRIVATE_KEY_REDACTED]" },
-  { kind: "API_KEY", pattern: /\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,})\b/g, replacement: "[API_KEY_REDACTED]" },
+  { kind: "API_KEY", pattern: /\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|beam_app_[\w-]{20,})\b/g, replacement: "[API_KEY_REDACTED]" },
   { kind: "SECRET", pattern: /((?:api[_-]?key|access[_-]?token|token|secret|authorization)\s*[:=]\s*["']?)([^\s,"';&}\]]+)/gi, replacement: "$1[SECRET_REDACTED]" },
   { kind: "PASSWORD", pattern: /((?:password|passwd|pwd)\s*[:=]\s*["']?)([^\s,"';&}\]]+)/gi, replacement: "$1[PASSWORD_REDACTED]" },
   { kind: "EMAIL", pattern: /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, replacement: "[EMAIL_REDACTED]" },

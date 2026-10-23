@@ -38,7 +38,7 @@ import { addTrustedPath, readTrustedPaths, removeTrustedPath, trustedPathsFile }
 import { blockedTargetsFile, readBlockedTargets, removeBlockedTarget } from "./blocked-targets.js";
 import { checkForUpdate, installUpdate } from "./update.js";
 import { recordExpectedHooks, reportControlEvent } from "./tamper.js";
-import { monitorStatus, runMonitor } from "./monitor.js";
+import { monitorStatus, monitorTest, runMonitor } from "./monitor.js";
 import { CVE_SEVERITIES, runCveCheck, type CveSeverity } from "./cve.js";
 
 // Lets 'BEAM_API_URL=... beam connect' style overrides live in a .env file instead of the
@@ -576,6 +576,10 @@ monitor.command("start", { isDefault: true })
   .action(async (options: { file?: string[]; stdin?: boolean; echo: boolean; app?: string; fromStart?: boolean; wait: boolean }) => {
     await runMonitor({ files: options.file, stdin: options.stdin, echo: options.echo, app: options.app, fromStart: options.fromStart, wait: options.wait });
   });
+
+monitor.command("test")
+  .description("Send one test finding to prove the integration: it appears on the dashboard and at the app's webhooks")
+  .action(async () => { process.exitCode = await monitorTest(); });
 
 monitor.command("status")
   .description("Show whether App monitoring is on for this workspace, its level, and this month's usage")

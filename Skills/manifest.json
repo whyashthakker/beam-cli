@@ -8,6 +8,10 @@
       "group": "Deployment and operations"
     },
     {
+      "name": "agentbeam-app-monitoring",
+      "group": "Deployment and operations"
+    },
+    {
       "name": "security-assessment",
       "group": "Coordination and reporting"
     },

@@ -1,9 +1,8 @@
 // `beam cve check`: read an app's lockfiles and ask the workspace which installed versions have
 // known vulnerabilities. Exit codes suit CI: 0 clean (below --fail-on), 2 vulnerable, 1 error.
 import { resolve } from "node:path";
-import { readIdentity } from "./enroll.js";
 import { readInstalledPackages } from "./lockfiles.js";
-import { checkPackages, type Vulnerability } from "./monitor-client.js";
+import { checkPackages, monitorAuth, type Vulnerability } from "./monitor-client.js";
 import { cyan, dim, green, red } from "./color.js";
 
 export const CVE_SEVERITIES = ["critical", "high", "medium", "low"] as const;
@@ -26,8 +25,8 @@ export function formatVulnerability(v: Vulnerability): string {
 }
 
 export async function runCveCheck(dir: string, options: CveCheckOptions = {}, write: (line: string) => void = console.log): Promise<number> {
-  const identity = await readIdentity();
-  if (!identity) throw new Error("Connect this machine to your Beam workspace first: run 'beam connect'. Dependency checks run against the workspace's vulnerability database.");
+  const identity = await monitorAuth();
+  if (!identity) throw new Error("Set BEAM_APP_TOKEN to the app's token from the dashboard's App monitoring page, or connect this machine with 'beam connect'.");
   const root = resolve(dir);
   const scan = await readInstalledPackages(root, options.depth);
   if (!scan.files.length) {

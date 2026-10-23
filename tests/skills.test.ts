@@ -66,6 +66,11 @@ describe("bundled skills", () => {
     ]);
     expect(await readFile(join(home, ".claude/skills/agentbeam-setup/SKILL.md"), "utf8")).toContain("name: agentbeam-setup");
   });
+  it.each(["agentbeam-setup", "agentbeam-app-monitoring"])("bundled skill %s passes Beam's own scan with no findings", async name => {
+    const cwd = await mkdtemp(join(tmpdir(), "beam-bundled-cwd-"));
+    const result = await addSkill(name, { cwd, scanOnly: true });
+    expect(result.scans[0]).toMatchObject({ name, findings: [] });
+  });
   it("still treats owner/repo and unknown names as remote sources", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "beam-bundled-cwd-"));
     await expect(addSkill("not-a-bundled-skill", { cwd, scanOnly: true })).rejects.toThrow("neither a local folder");
