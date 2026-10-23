@@ -86,3 +86,50 @@ describe("beam monitor configure", () => {
     await expect(runMonitor({}, () => {})).rejects.toThrow("beam monitor configure --file");
   });
 });
+
+describe("config layers: managed, user, project", () => {
+  const managedFile = () => join(home, "managed", "monitor.json");
+  beforeEach(async () => {
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(join(home, "managed"), { recursive: true });
+    await mkdir(join(home, "app"), { recursive: true });
+    process.env.BEAM_MANAGED_CONFIG = managedFile();
+  });
+  it("applies managed, then user, then project, and says where each value came from", async () => {
+    const { resolveMonitorSettings } = await import("../src/monitor-config.js");
+    await writeFile(managedFile(), JSON.stringify({ version: 1, maxCpuPercent: 10 }));
+    await monitorConfigure({ files: ["/var/log/user.log"] }, () => {});
+    await writeFile(join(home, "app", "beam.monitor.json"), JSON.stringify({ version: 1, files: ["/var/log/app.log"], llm: { provider: "openai" } }));
+    const resolved = await resolveMonitorSettings({ cwd: join(home, "app") });
+    expect(resolved.settings).toMatchObject({ maxCpuPercent: 10, files: ["/var/log/app.log"], llm: { provider: "openai" } });
+    expect(resolved.origins).toEqual({ files: "project", app: "default", maxCpuPercent: "managed", llm: "project" });
+  });
+  it("lets IT lock settings that nothing below, flags included, can change", async () => {
+    const { resolveMonitorSettings } = await import("../src/monitor-config.js");
+    await writeFile(managedFile(), JSON.stringify({ version: 1, llm: { provider: "beam" }, maxCpuPercent: 5, locked: ["llm", "maxCpuPercent"] }));
+    await writeFile(join(home, "app", "beam.monitor.json"), JSON.stringify({ version: 1, llm: { provider: "openai" }, maxCpuPercent: 80 }));
+    process.env.OPENAI_API_KEY = "sk-personal";
+    process.env.BEAM_LLM_API_KEY = "sk-legacy";
+    const resolved = await resolveMonitorSettings({ cwd: join(home, "app") });
+    expect(resolved.settings).toMatchObject({ maxCpuPercent: 5, llm: { provider: "beam" } });
+    expect([...resolved.locked].sort()).toEqual(["llm", "maxCpuPercent"]);
+    const out: string[] = [];
+    await monitorConfigure({ llm: "openai" }, l => out.push(l));
+    expect(out.join("\n")).toContain("managed config locks the LLM check");
+    const logs: string[] = [];
+    await expect(runMonitor({ llm: "openai", files: ["/tmp/x.log"] }, m => logs.push(m))).rejects.toThrow(); // stops at auth, after settings
+    expect(logs.join("\n")).toContain("--llm openai doesn't apply");
+  });
+  it("refuses keys in shared files and reports a broken layer clearly", async () => {
+    const { resolveMonitorSettings } = await import("../src/monitor-config.js");
+    await writeFile(join(home, "app", "beam.monitor.json"), JSON.stringify({ version: 1, llm: { provider: "openai", apiKey: "sk-in-the-repo" } }));
+    await expect(resolveMonitorSettings({ cwd: join(home, "app") })).rejects.toThrow("keys don't belong in a shared file");
+    await writeFile(join(home, "app", "beam.monitor.json"), JSON.stringify({ version: 1, locked: ["llm"] }));
+    await expect(resolveMonitorSettings({ cwd: join(home, "app") })).rejects.toThrow("only the managed config can lock");
+    const out: string[] = [];
+    const cwd = process.cwd();
+    process.chdir(join(home, "app"));
+    try { expect(await monitorConfigure({ check: true }, l => out.push(l))).toBe(1); } finally { process.chdir(cwd); }
+    expect(out.join("\n")).toContain("only the managed config can lock");
+  });
+});

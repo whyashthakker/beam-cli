@@ -590,12 +590,13 @@ monitor.command("start", { isDefault: true })
   .option("--no-wait", "exit instead of waiting when App monitoring is off for the workspace")
   .option("--llm <provider>", LLM_OPTION)
   .option("--max-cpu <percent>", "the most of one CPU core detection may use (1-100, default 25); past it, lines are skipped until the next minute")
-  .action(async (options: { file?: string[]; stdin?: boolean; echo: boolean; app?: string; fromStart?: boolean; wait: boolean; llm?: string; maxCpu?: string }) => {
-    await runMonitor({ files: options.file, stdin: options.stdin, echo: options.echo, app: options.app, fromStart: options.fromStart, wait: options.wait, llm: options.llm, maxCpu: options.maxCpu === undefined ? undefined : Number(options.maxCpu) });
+  .option("--config <file>", "a project config file to use instead of ./beam.monitor.json")
+  .action(async (options: { file?: string[]; stdin?: boolean; echo: boolean; app?: string; fromStart?: boolean; wait: boolean; llm?: string; maxCpu?: string; config?: string }) => {
+    await runMonitor({ files: options.file, stdin: options.stdin, echo: options.echo, app: options.app, fromStart: options.fromStart, wait: options.wait, llm: options.llm, maxCpu: options.maxCpu === undefined ? undefined : Number(options.maxCpu), config: options.config });
   });
 
 monitor.command("configure")
-  .description("Save settings to ~/.beam/monitor.json (0600) so 'beam monitor' needs no flags; prints them with no options")
+  .description("Save settings to ~/.beam/monitor.json (0600) so 'beam monitor' needs no flags. With no options, shows the effective settings and where each came from (managed, user or project config)")
   .option("--llm <provider>", LLM_OPTION)
   .option("--model <model>", "model for that provider (required for gemini, xai, ollama and custom)")
   .option("--base-url <url>", "endpoint, for custom gateways or a proxy in front of the provider")
@@ -607,7 +608,8 @@ monitor.command("configure")
   .option("--app <dir>", "app directory for daily dependency checks")
   .option("--no-app", "clear the saved app directory")
   .option("--max-cpu <percent>", "the most of one CPU core detection may use, 1-100 (default 25)")
-  .action(async (options: { llm?: string; model?: string; baseUrl?: string; keyEnv?: string; keyStdin?: boolean; forgetKey?: boolean; file?: string[]; files: boolean; app?: string | false; maxCpu?: string }) => {
+  .option("--check", "validate every config layer (managed, user, project) and exit 1 on a problem")
+  .action(async (options: { llm?: string; model?: string; baseUrl?: string; keyEnv?: string; keyStdin?: boolean; forgetKey?: boolean; file?: string[]; files: boolean; app?: string | false; maxCpu?: string; check?: boolean }) => {
     let key: string | undefined;
     if (options.keyStdin) {
       if (process.stdin.isTTY) throw new Error("Pipe your key from a secret manager, e.g. 'op read op://vault/openai/key | beam monitor configure --llm openai --key-stdin'.");
@@ -623,6 +625,7 @@ monitor.command("configure")
       llm: options.llm, model: options.model, baseUrl: options.baseUrl, keyEnv: options.keyEnv, key, forgetKey: options.forgetKey,
       files: options.file, noFiles: options.files === false, app: typeof options.app === "string" ? options.app : undefined, noApp: options.app === false,
       maxCpu: options.maxCpu === undefined ? undefined : Number(options.maxCpu),
+      check: options.check,
     });
   });
 

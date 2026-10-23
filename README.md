@@ -316,14 +316,26 @@ You choose whose model runs:
 
 `beam monitor status` shows which model is in use and where its key comes from, never the key itself.
 
-**Settings file.** `beam monitor configure` saves settings to `~/.beam/monitor.json` (mode 0600) so a plain `beam monitor`, in a systemd unit or a container, needs no flags. Flags win over environment variables, which win over the file. The first monitor command after upgrading creates the file, carrying over older `BEAM_LLM_*` settings; it records which variable holds a key, never the key's value.
+**Settings files.** `beam monitor` reads layered settings, like git or npm config, so a plain `beam monitor` in a systemd unit or a container needs no flags. Lowest to highest:
+
+| Layer | Where | Set by | Can hold a key |
+|---|---|---|---|
+| Managed | `/etc/beam/monitor.json` (macOS `/Library/Application Support/Beam/`, Windows `%ProgramData%\Beam\`) | IT, through MDM or config management | No: name the variable with `llm.apiKeyEnv` |
+| User | `~/.beam/monitor.json` (mode 0600), written by `beam monitor configure` | the person or service account | Yes (from `--key-stdin`); a warning if others can read the file |
+| Project | `beam.monitor.json` where `beam monitor` starts, or `--config <file>` | the app team, committed with the app | No |
+| Environment | `BEAM_LLM_*` | the deploy platform or secret store | Yes |
+| Flags | `--llm`, `--max-cpu`, `--file`, `--app` | whoever runs it | n/a |
+
+Each setting (`files`, `app`, `maxCpuPercent`, `llm`) comes whole from the highest layer that sets it. The managed file can lock settings with `"locked": ["llm", "maxCpuPercent"]`. Nothing below it, flags and environment variables included, can change a locked setting. For example, `{"version": 1, "llm": {"provider": "beam"}, "locked": ["llm"]}` keeps every server on the workspace's model, with no personal keys.
 
 ```bash
-beam monitor configure --llm openai --file /var/log/nginx/access.log --file /var/log/app/app.log --app /srv/app
-beam monitor configure --llm anthropic --key-env TEAM_ANTHROPIC_KEY    # read the key from another variable
-op read op://vault/openai/key | beam monitor configure --llm openai --key-stdin   # or store it in the file
-beam monitor configure                                                 # print the settings (a stored key shows as "(stored)")
+beam monitor configure --llm openai --file /var/log/nginx/access.log --app /srv/app   # save to the user layer
+beam monitor configure --llm anthropic --key-env TEAM_ANTHROPIC_KEY                   # read the key from another variable
+beam monitor configure                     # effective settings, and which layer each came from
+beam monitor configure --check             # validate every layer; exits 1 on a problem (for CI)
 ```
+
+The first monitor command after upgrading creates the user file, carrying over older `BEAM_LLM_*` settings. It records which variable holds a key, never the key's value. In the SDK, settings come from code and the environment (edge runtimes have no files): `createAppMonitor({ llm: "openai" })` or `BEAM_LLM_PROVIDER=openai` reviews findings with the app's own key during `flush()`, and only the verdict reaches AgentBeam.
 
 **Built to stay out of your app's way.**
 

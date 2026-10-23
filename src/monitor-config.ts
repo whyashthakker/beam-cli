@@ -1,6 +1,17 @@
-// ~/.beam/monitor.json (or $BEAM_HOME/monitor.json): settings for `beam monitor`, so a plain
-// `beam monitor` in a systemd unit or a container needs no flags. Command-line flags win over
-// environment variables, which win over this file.
+// Settings for `beam monitor`, so a plain `beam monitor` in a systemd unit or a container needs no
+// flags. Layered like git or npm config, lowest to highest:
+//
+//   managed   /etc/beam/monitor.json (macOS /Library/Application Support/Beam, Windows %ProgramData%\Beam):
+//             set by IT through MDM or config management. It can lock settings, which nothing
+//             below can then change.
+//   user      ~/.beam/monitor.json (or $BEAM_HOME), 0600. The only file that may store a key.
+//   project   beam.monitor.json in the directory beam monitor starts in (or --config <file>):
+//             committed with the app, so keys are refused there.
+//   environment variables, then command-line flags.
+//
+// Each top-level setting (files, app, maxCpuPercent, llm) comes whole from the highest layer that
+// sets it, so a project can't half-override a managed LLM setup. `beam monitor configure` shows
+// where every effective value came from.
 //
 // It's created the first time a monitor command runs after an upgrade, carrying over older
 // BEAM_LLM_* settings. It never copies a key's value from the environment, only the name of the
@@ -9,7 +20,7 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { mkdir, open, rename, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { getBeamHome } from "./config.js";
 
 export interface MonitorLlmSettings {
@@ -133,4 +144,116 @@ export async function ensureMonitorConfig(env: NodeJS.ProcessEnv = process.env):
 export function describeMonitorConfig(config: MonitorFileConfig): Record<string, unknown> {
   const { apiKey, ...llm } = config.llm;
   return { ...config, llm: { ...llm, ...(apiKey ? { apiKey: "(stored)" } : {}) } };
+}
+
+export type Layer = "default" | "managed" | "user" | "project";
+export type SettingKey = "files" | "app" | "maxCpuPercent" | "llm";
+const SETTING_KEYS: SettingKey[] = ["files", "app", "maxCpuPercent", "llm"];
+export type PartialSettings = Partial<Pick<MonitorFileConfig, SettingKey>>;
+
+export function managedConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.BEAM_MANAGED_CONFIG) return resolve(env.BEAM_MANAGED_CONFIG);
+  if (process.platform === "darwin") return "/Library/Application Support/Beam/monitor.json";
+  if (process.platform === "win32") return join(env.ProgramData || "C:\\ProgramData", "Beam", "monitor.json");
+  return "/etc/beam/monitor.json";
+}
+export const PROJECT_CONFIG_FILE = "beam.monitor.json";
+
+/**
+ * A managed or project file: any subset of the settings. Keys are refused in both (they're shared
+ * files); `locked` is only meaningful, and only allowed, in the managed file.
+ */
+export function validateLayer(value: unknown, kind: "managed" | "project", path: string): { settings: PartialSettings; locked: SettingKey[] } {
+  const bad = (why: string) => new Error(`${path} is invalid (${why}).`);
+  if (!isRecord(value) || (value.version !== undefined && value.version !== 1)) throw bad("unsupported version");
+  if (isRecord(value.llm) && value.llm.apiKey !== undefined)
+    throw bad("keys don't belong in a shared file: name the variable that holds it with llm.apiKeyEnv");
+  const locked = value.locked ?? [];
+  if (!Array.isArray(locked) || !locked.every(k => SETTING_KEYS.includes(k as SettingKey))) throw bad(`locked must list settings: ${SETTING_KEYS.join(", ")}`);
+  if (kind === "project" && locked.length) throw bad("only the managed config can lock settings");
+  // Reuse the full validation for field types, then keep only what this file set.
+  const full = validateMonitorConfig({ ...value, version: 1, ...(isRecord(value.llm) ? {} : { llm: undefined }) });
+  const settings: PartialSettings = {};
+  for (const key of SETTING_KEYS) if (value[key] !== undefined) (settings as Record<string, unknown>)[key] = full[key];
+  return { settings, locked: locked as SettingKey[] };
+}
+
+async function readJsonFile(path: string): Promise<unknown | null> {
+  let file;
+  try {
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new Error(`${path} can't be read.`);
+  }
+  try {
+    const stats = await file.stat();
+    if (!stats.isFile() || stats.size > 64 * 1024) throw new Error(`${path} is invalid (not a small regular file).`);
+    try { return JSON.parse(await file.readFile("utf8")); } catch { throw new Error(`${path} is invalid (not valid JSON).`); }
+  } finally {
+    await file.close();
+  }
+}
+
+export interface ResolvedSettings {
+  settings: MonitorFileConfig;
+  origins: Record<SettingKey, Layer>;
+  /** Locked by the managed file: flags and environment variables don't change these either. */
+  locked: Set<SettingKey>;
+  sources: { layer: Exclude<Layer, "default">; path: string; status: "used" | "not found" | string }[];
+  /** True when this run created the user file (the first monitor command after an upgrade). */
+  created: boolean;
+  /** Warnings worth showing, e.g. a stored key in a file other users can read. */
+  warnings: string[];
+}
+
+/** The effective file settings across the managed, user and project layers. Throws on an invalid file. */
+export async function resolveMonitorSettings(options: { cwd?: string; configPath?: string; env?: NodeJS.ProcessEnv } = {}): Promise<ResolvedSettings> {
+  const env = options.env ?? process.env;
+  const settings: MonitorFileConfig = { ...DEFAULT_MONITOR_CONFIG, llm: { ...DEFAULT_MONITOR_CONFIG.llm } };
+  const origins = Object.fromEntries(SETTING_KEYS.map(k => [k, "default"])) as Record<SettingKey, Layer>;
+  const locked = new Set<SettingKey>();
+  const sources: ResolvedSettings["sources"] = [];
+  const warnings: string[] = [];
+  const apply = (layer: Exclude<Layer, "default">, part: PartialSettings) => {
+    for (const key of SETTING_KEYS) {
+      if (part[key] === undefined || locked.has(key)) continue;
+      (settings as unknown as Record<string, unknown>)[key] = part[key];
+      origins[key] = layer;
+    }
+  };
+
+  const managedPath = managedConfigPath(env);
+  const managed = await readJsonFile(managedPath);
+  if (managed === null) sources.push({ layer: "managed", path: managedPath, status: "not found" });
+  else {
+    const layer = validateLayer(managed, "managed", managedPath);
+    apply("managed", layer.settings);
+    for (const key of layer.locked) if (layer.settings[key] !== undefined) locked.add(key);
+    sources.push({ layer: "managed", path: managedPath, status: "used" });
+  }
+
+  const { config: user, created } = await ensureMonitorConfig(env);
+  const userSet: PartialSettings = {};
+  for (const key of SETTING_KEYS) if (JSON.stringify(user[key]) !== JSON.stringify(DEFAULT_MONITOR_CONFIG[key])) (userSet as Record<string, unknown>)[key] = user[key];
+  apply("user", userSet);
+  sources.push({ layer: "user", path: monitorConfigPath(), status: created ? "used (created now)" : "used" });
+  if (user.llm.apiKey && process.platform !== "win32") {
+    try {
+      const { stat } = await import("node:fs/promises");
+      if (((await stat(monitorConfigPath())).mode & 0o077) !== 0) warnings.push(`${monitorConfigPath()} stores a key but other users can read it. Run: chmod 600 ${monitorConfigPath()}`);
+    } catch { /* not created */ }
+  }
+
+  const projectPath = options.configPath ? resolve(options.configPath) : join(options.cwd ?? process.cwd(), PROJECT_CONFIG_FILE);
+  const project = await readJsonFile(projectPath);
+  if (project === null) {
+    if (options.configPath) throw new Error(`${projectPath} doesn't exist.`);
+    sources.push({ layer: "project", path: projectPath, status: "not found" });
+  } else {
+    apply("project", validateLayer(project, "project", projectPath).settings);
+    sources.push({ layer: "project", path: projectPath, status: "used" });
+  }
+  for (const key of locked) if (origins[key] !== "managed") origins[key] = "managed";
+  return { settings, origins, locked, sources, created, warnings };
 }

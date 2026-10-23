@@ -19,6 +19,7 @@ import type { MonitorFinding, MonitorLevel, MonitorSeverity } from "./monitor-cl
 import { CpuBudget, MonitorPipeline, type SendOutcome } from "./monitor-pipeline.js";
 import { matchLine, type MonitorRule } from "./monitor-rules.js";
 import { containsCanary } from "./prompt-attacks.js";
+import { judgeWithOwnLlm, ownLlmConfig, type OwnLlmConfig } from "./monitor-llm.js";
 
 export interface AppMonitorOptions {
   /** The app's token from the dashboard (App monitoring > Apps). Default: BEAM_APP_TOKEN. */
@@ -43,6 +44,14 @@ export interface AppMonitorOptions {
    * app can decide. Default 2.
    */
   maxCpuPercent?: number;
+  /**
+   * Review flagged findings with your own LLM key before they're sent, like `beam monitor --llm`:
+   * "openai", "anthropic", "gemini", "groq", "openrouter", "mistral", "deepseek", "xai", "ollama"
+   * or "custom", with the key the app already has (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...), or
+   * "beam" to leave it to the workspace's setting. Default: BEAM_LLM_PROVIDER. The key stays in
+   * the app and only the verdict goes to AgentBeam. Runs during flush(), never on a request.
+   */
+  llm?: string;
 }
 
 export interface RequestInfo {
@@ -222,6 +231,15 @@ function start(options: AppMonitorOptions): AppMonitor {
   }
 
   const flushEvery = Math.max(1000, Number(options.flushIntervalMs) || 5000);
+  let ownLlm: OwnLlmConfig | null = null;
+  try {
+    const processEnv = (globalThis as { process?: { env?: NodeJS.ProcessEnv } }).process?.env ?? {};
+    const llm = ownLlmConfig(processEnv, typeof options.llm === "string" ? options.llm : undefined, null);
+    // Short timeouts: this runs inside the app's background work (event.waitUntil on serverless).
+    ownLlm = llm ? { ...llm, timeoutMs: 8_000 } : null;
+  } catch (error) {
+    report(`AgentBeam App monitoring: your own LLM check is off: ${(error as Error).message}`);
+  }
   const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
   let level: MonitorLevel | null = null;
   // A 401 pauses reporting and is checked again later: during an AgentBeam incident a working token
@@ -270,6 +288,8 @@ function start(options: AppMonitorOptions): AppMonitor {
   };
 
   const send = async (batch: MonitorFinding[]): Promise<SendOutcome> => {
+    // The app's own model, with the app's own key: only the verdict travels with the finding.
+    if (ownLlm && level) await judgeWithOwnLlm(batch, level, ownLlm).catch(() => 0);
     const t = withTimeout(REQUEST_TIMEOUT_MS);
     const outcome = await (async (): Promise<SendOutcome> => {
       try {

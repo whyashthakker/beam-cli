@@ -19,7 +19,7 @@ import {
   type MonitorConfig, type MonitorFinding, type MonitorLevel, type MonitorSeverity, type Vulnerability,
 } from "./monitor-client.js";
 import { LLM_PROVIDERS, describeOwnLlm, detectedLlmKeys, judgeWithOwnLlm, ownLlmConfig, type OwnLlmConfig } from "./monitor-llm.js";
-import { describeMonitorConfig, ensureMonitorConfig, monitorConfigPath, writeMonitorConfig, type MonitorFileConfig } from "./monitor-config.js";
+import { ensureMonitorConfig, monitorConfigPath, resolveMonitorSettings, writeMonitorConfig, type MonitorFileConfig, type ResolvedSettings, type SettingKey } from "./monitor-config.js";
 import type { CustomDetector } from "./data-detectors.js";
 
 export { BRUTE_FORCE_THRESHOLD, DEDUPE_WINDOW_MS, MAX_NEW_FINDINGS_PER_10_MIN, MonitorPipeline, meetsLevel, type PipelineOptions, type SendOutcome } from "./monitor-pipeline.js";
@@ -128,6 +128,8 @@ export interface MonitorOptions {
   llm?: string;
   /** The most of one CPU core detection may use, in percent (--max-cpu). Default: monitor.json, else 25. */
   maxCpu?: number;
+  /** A project config file to use instead of ./beam.monitor.json (--config). */
+  config?: string;
 }
 
 const MAX_BACKOFF_MS = 5 * 60_000;
@@ -137,6 +139,18 @@ function pauseUntil(resetAt: string | undefined, fallbackMs: number): number {
   const at = resetAt ? Date.parse(resetAt) : Number.NaN;
   const now = Date.now();
   return Number.isFinite(at) && at > now ? Math.min(at, now + 24 * 60 * 60_000) : now + fallbackMs;
+}
+
+/**
+ * The LLM check after the config layers. A managed lock wins over --llm and BEAM_LLM_* as well,
+ * and a lock to "beam" (the workspace's setting, no personal keys) can't be bypassed by any of them.
+ */
+function llmFrom(resolved: ResolvedSettings, flag: string | undefined, log?: (message: string) => void): OwnLlmConfig | null {
+  if (!resolved.locked.has("llm")) return ownLlmConfig(process.env, flag, resolved.settings.llm);
+  if (flag && log) log(`Your organization's managed config sets the LLM check; --llm ${flag} doesn't apply.`);
+  if (resolved.settings.llm.provider === "beam") return null;
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^BEAM_LLM_(?:PROVIDER|MODEL|BASE_URL)$/.test(k)));
+  return ownLlmConfig(env, undefined, resolved.settings.llm);
 }
 
 /** Points at a key that's already here when no provider was chosen; it is never used without --llm. */
@@ -149,19 +163,25 @@ function llmKeyHint(own: OwnLlmConfig | null): string {
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 export async function runMonitor(options: MonitorOptions, log: (message: string) => void = m => console.error(`[beam monitor] ${m}`)): Promise<void> {
-  const { config: saved, created } = await ensureMonitorConfig();
-  if (created) log(`Created ${monitorConfigPath()} for App monitoring settings. Edit it, or run 'beam monitor configure'.`);
-  // Sources on the command line replace the file's; with none, the file says what to watch.
-  const fromCli = Boolean(options.files?.length || options.stdin || options.app);
+  const resolved = await resolveMonitorSettings({ configPath: options.config });
+  const saved = resolved.settings;
+  if (resolved.created) log(`Created ${monitorConfigPath()} for App monitoring settings. Edit it, or run 'beam monitor configure'.`);
+  for (const warning of resolved.warnings) log(`⚠ ${warning}`);
+  // Sources on the command line replace the config's; with none, the config says what to watch.
+  // Sources locked by the managed config can't be replaced.
+  const sourcesLocked = resolved.locked.has("files") || resolved.locked.has("app");
+  if (sourcesLocked && (options.files?.length || options.app)) log("Your organization's managed config sets what this server watches; --file and --app don't apply.");
+  const fromCli = !sourcesLocked && Boolean(options.files?.length || options.stdin || options.app);
   const files = (fromCli ? options.files ?? [] : saved.files).map(f => resolve(f));
   const app = fromCli ? options.app : saved.app ?? undefined;
   const appDir = app ? resolve(app) : undefined;
   if (!files.length && !options.stdin && !appDir)
     throw new Error(`Tell beam monitor what to watch: --file <path> (repeatable) for log files, --stdin to read piped output, and/or --app <dir> for dependency checks. Or save them with 'beam monitor configure --file <path>' (${monitorConfigPath()}).`);
+  // Settings first, so a misconfiguration is reported before anything else.
+  const ownLlm = llmFrom(resolved, options.llm, log);
   const identity = await monitorAuth();
   if (!identity) throw new Error("Set BEAM_APP_TOKEN to the app's token from the dashboard's App monitoring page, or connect this machine with 'beam connect'.");
   const custom = (await readPolicy())?.rules.customDetectors ?? [];
-  const ownLlm = ownLlmConfig(process.env, options.llm, saved.llm);
 
   let config: MonitorConfig | null = null;
   let lastRefresh = 0;
@@ -212,7 +232,7 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
     await refresh(true);
   }
 
-  const maxCpu = Math.min(100, Math.max(1, Number(options.maxCpu ?? saved.maxCpuPercent) || 25));
+  const maxCpu = Math.min(100, Math.max(1, Number(resolved.locked.has("maxCpuPercent") ? saved.maxCpuPercent : options.maxCpu ?? saved.maxCpuPercent) || 25));
   const pipeline = new MonitorPipeline({
     level: () => (config && Date.now() >= pausedUntil ? config.level : null),
     customDetectors: () => custom,
@@ -363,7 +383,8 @@ export async function monitorStatus(write: (line: string) => void = console.log,
   const { app, level, llm: beamLlm, webhooks, usage, limits, resetAt, settingsUrl } = result.config;
   let own: ReturnType<typeof ownLlmConfig> = null;
   let ownError = "";
-  try { own = ownLlmConfig(process.env, llm, (await ensureMonitorConfig()).config.llm); } catch (error) { ownError = (error as Error).message; }
+  let resolved: ResolvedSettings | null = null;
+  try { resolved = await resolveMonitorSettings(); own = llmFrom(resolved, llm); } catch (error) { ownError = (error as Error).message; }
   write([
     "App monitoring: on",
     ...(app ? [`App:            ${app}`] : []),
@@ -372,7 +393,7 @@ export async function monitorStatus(write: (line: string) => void = console.log,
     `Webhooks:       ${webhooks}`,
     `This month:     ${fmt(usage.findings)} / ${fmt(limits.findings)} findings · ${fmt(usage.cveChecks)} / ${fmt(limits.cveChecks)} dependency checks · ${fmt(usage.llmChecks)} / ${fmt(limits.llmChecks)} LLM checks (resets ${resetAt.slice(0, 10)})`,
     `Settings:       ${settingsUrl}`,
-    `This server:    ${monitorConfigPath()}`,
+    `This server:    ${resolved ? originSummary(resolved) : monitorConfigPath()}`,
   ].join("\n"));
   return 0;
 }
@@ -398,7 +419,7 @@ export async function monitorTest(write: (line: string) => void = console.log, l
   if (!result.ok) { write(`✖ ${result.message}`); return 1; }
   write(`✔ Test finding sent for ${where}. Check the dashboard's App monitoring page${config.config.webhooks ? ` and your ${config.config.webhooks} webhook${config.config.webhooks === 1 ? "" : "s"}` : ""}.`);
   let own: OwnLlmConfig | null;
-  try { own = ownLlmConfig(process.env, llm, (await ensureMonitorConfig()).config.llm); } catch (error) { write(`✖ LLM check: ${(error as Error).message}`); return 1; }
+  try { own = llmFrom(await resolveMonitorSettings(), llm, write); } catch (error) { write(`✖ LLM check: ${(error as Error).message}`); return 1; }
   if (!own) return 0;
   // A harmless sample, judged separately: its verdict isn't attached to the test finding, which must reach the webhooks.
   const sample: MonitorFinding = {
@@ -412,24 +433,58 @@ export async function monitorTest(write: (line: string) => void = console.log, l
   return 0;
 }
 
+const SETTING_LABELS: Record<SettingKey, string> = { files: "log files", app: "app directory", maxCpuPercent: "CPU cap", llm: "LLM check" };
+/** Where each setting came from, for status and configure output. */
+function originSummary(resolved: ResolvedSettings): string {
+  return (Object.keys(SETTING_LABELS) as SettingKey[])
+    .map(key => `${SETTING_LABELS[key]} from ${resolved.origins[key]}${resolved.locked.has(key) ? " (locked)" : ""}`)
+    .join(", ");
+}
+
 export interface ConfigureOptions {
   llm?: string; model?: string; baseUrl?: string; keyEnv?: string; key?: string; forgetKey?: boolean;
   files?: string[]; noFiles?: boolean; app?: string; noApp?: boolean; maxCpu?: number;
+  /** Validate every config layer and exit 1 on a problem (for CI). */
+  check?: boolean;
 }
 
 /**
- * `beam monitor configure`: saves settings to monitor.json so `beam monitor` needs no flags. With
- * no options, prints the current settings. A key is only ever stored from stdin (`key`), and a
- * provider's key that isn't set in this shell is a warning, not an error: it may be set only where
- * beam monitor runs (a systemd EnvironmentFile, a container's secrets).
+ * `beam monitor configure`: saves settings to the user's monitor.json so `beam monitor` needs no
+ * flags. With no options, prints the effective settings and which layer each came from (managed,
+ * user, project, default); with --check, validates every layer for CI. A key is only ever stored
+ * from stdin (`key`), and a provider's key that isn't set in this shell is a warning, not an
+ * error: it may be set only where beam monitor runs (a systemd EnvironmentFile, a container's secrets).
  */
 export async function monitorConfigure(options: ConfigureOptions, write: (line: string) => void = console.log): Promise<number> {
-  const { config: current } = await ensureMonitorConfig();
-  const changing = Object.values(options).some(v => v !== undefined && v !== false);
-  if (!changing) {
-    write(`${monitorConfigPath()}\n${JSON.stringify(describeMonitorConfig(current), null, 2)}`);
+  let resolved: ResolvedSettings;
+  try {
+    resolved = await resolveMonitorSettings();
+  } catch (error) {
+    write(`✖ ${(error as Error).message}`);
+    return 1;
+  }
+  if (options.check) {
+    write(`✔ Monitor config is valid: ${originSummary(resolved)}.`);
+    for (const warning of resolved.warnings) write(`⚠ ${warning}`);
     return 0;
   }
+  const current = (await ensureMonitorConfig()).config;
+  const { check: _check, ...edits } = options;
+  const changing = Object.values(edits).some(v => v !== undefined && v !== false);
+  if (!changing) {
+    const { apiKey, ...llm } = resolved.settings.llm;
+    write(JSON.stringify({ ...resolved.settings, llm: { ...llm, ...(apiKey ? { apiKey: "(stored)" } : {}) } }, null, 2));
+    write(`\nFrom: ${originSummary(resolved)}.`);
+    for (const source of resolved.sources) write(`  ${source.layer.padEnd(8)} ${source.path} (${source.status})`);
+    for (const warning of resolved.warnings) write(`⚠ ${warning}`);
+    return 0;
+  }
+  const lockedEdits = (Object.keys(SETTING_LABELS) as SettingKey[]).filter(key => resolved.locked.has(key) && (
+    key === "llm" ? Boolean(options.llm || options.model || options.baseUrl || options.keyEnv || options.key)
+      : key === "files" ? Boolean(options.files?.length || options.noFiles)
+      : key === "app" ? Boolean(options.app || options.noApp)
+      : options.maxCpu !== undefined));
+  if (lockedEdits.length) write(`⚠ Your organization's managed config locks the ${lockedEdits.map(k => SETTING_LABELS[k]).join(" and ")}; saved values for ${lockedEdits.length === 1 ? "it" : "them"} won't apply.`);
   const provider = options.llm?.trim().toLowerCase();
   if (provider && provider !== "beam" && !(provider in LLM_PROVIDERS))
     throw new Error(`Unknown LLM provider "${provider}". Use one of ${Object.keys(LLM_PROVIDERS).join(", ")}, or beam for Beam's model.`);

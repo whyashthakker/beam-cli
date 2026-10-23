@@ -132,6 +132,44 @@ describe("LLM features: prompt() and output()", () => {
   });
 });
 
+describe("your own LLM key, inside the app", () => {
+  const originalEnv = process.env;
+  afterEach(() => { process.env = originalEnv; });
+  it("reviews findings with the app's own key and sends only the verdict", async () => {
+    process.env = { ...originalEnv, OPENAI_API_KEY: "sk-app-own-key" };
+    const llmCalls: { url: string; auth: string | null }[] = [];
+    const base = global.fetch;
+    global.fetch = jest.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/chat/completions")) {
+        llmCalls.push({ url, auth: new Headers(init?.headers).get("authorization") });
+        const system = JSON.parse(String(init?.body)).messages[0].content as string;
+        const check = system.match(/"check": "(\w+)"/)?.[1];
+        return Response.json({ choices: [{ message: { content: JSON.stringify({ check, results: [{ i: 0, verdict: "malicious", reason: "UNION-based injection" }] }) } }] });
+      }
+      return base(input, init);
+    }) as typeof fetch;
+    const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test", llm: "openai" });
+    await tick();
+    monitor.request(attack);
+    await monitor.flush({ force: true });
+    expect(llmCalls).toEqual([{ url: "https://api.openai.com/v1/chat/completions", auth: "Bearer sk-app-own-key" }]);
+    const [finding] = posted[0]!.body.findings as { llm?: { verdict: string; model: string } }[];
+    expect(finding!.llm).toMatchObject({ verdict: "malicious", model: "gpt-4.1-nano" });
+    expect(JSON.stringify(posted[0]!.body)).not.toContain("sk-app-own-key");
+  });
+  it("explains a missing key instead of failing, and still reports", async () => {
+    process.env = { ...originalEnv, OPENAI_API_KEY: "" };
+    const errors: string[] = [];
+    const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test", llm: "openai", onError: m => errors.push(m) });
+    await tick();
+    monitor.request(attack);
+    await monitor.flush({ force: true });
+    expect(errors.join("\n")).toContain("set OPENAI_API_KEY");
+    expect(posted).toHaveLength(1);
+  });
+});
+
 describe("edge runtime safety", () => {
   it("the SDK's runtime imports use no Node.js built-ins or packages", () => {
     const seen = new Set<string>();
@@ -148,6 +186,6 @@ describe("edge runtime safety", () => {
     };
     walk(resolve("src/sdk.ts"));
     expect(bad).toEqual([]);
-    expect([...seen].map(f => f.split("/").pop()).sort()).toEqual(["monitor-pipeline.ts", "monitor-rules.ts", "prompt-attacks.ts", "rule-catalog.ts", "sdk.ts"]);
+    expect([...seen].map(f => f.split("/").pop()).sort()).toEqual(["monitor-llm.ts", "monitor-pipeline.ts", "monitor-rules.ts", "prompt-attacks.ts", "rule-catalog.ts", "sdk.ts"]);
   });
 });

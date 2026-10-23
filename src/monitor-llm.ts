@@ -28,6 +28,8 @@ export interface OwnLlmConfig {
   api?: "openai" | "anthropic";
   /** Ask for JSON mode (response_format). Off for endpoints that reject it; the prompt still asks for JSON. */
   json?: boolean;
+  /** Per-request timeout. Default 30 s; the in-app SDK uses less. */
+  timeoutMs?: number;
 }
 export type LlmVerdict = NonNullable<MonitorFinding["llm"]>;
 
@@ -247,7 +249,7 @@ async function judgeChunkOpenAi(chunk: MonitorFinding[], config: OwnLlmConfig, c
           { role: "user", content: linesFor(chunk) },
         ],
       }),
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(config.timeoutMs ?? 30_000),
     });
   } catch (error) {
     return failed(`Could not reach ${config.baseUrl}: ${error instanceof Error ? error.message : String(error)}`);
@@ -267,7 +269,7 @@ async function judgeChunkAnthropic(chunk: MonitorFinding[], config: OwnLlmConfig
   // Loaded only when Anthropic is the chosen provider, so other commands (and agent hooks) don't pay for it.
   const { default: Anthropic } = await import("@anthropic-ai/sdk");
   const official = config.baseUrl === LLM_PROVIDERS.anthropic.baseUrl;
-  const client = new Anthropic({ ...(config.apiKey ? { apiKey: config.apiKey } : {}), ...(official ? {} : { baseURL: config.baseUrl }), timeout: 30_000, maxRetries: 1 });
+  const client = new Anthropic({ ...(config.apiKey ? { apiKey: config.apiKey } : {}), ...(official ? {} : { baseURL: config.baseUrl }), timeout: config.timeoutMs ?? 30_000, maxRetries: 1 });
   // Older models reject `effort`; current ones take it, and a classification like this needs little.
   const effort = /^claude-(?:opus|sonnet|haiku|fable|mythos)-(?:5|4-[6-9])/.test(config.model) ? { effort: "low" as const } : {};
   try {

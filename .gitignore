@@ -13,3 +13,5 @@ npm-debug.log*
 .build-watch.pid
 # Generated at publish time (prepublishOnly / release workflow) and shipped in the package
 /stress-report.json
+# Local reference copies of third-party benchmarks; not distributed (see safety-bench/THIRD_PARTY.md)
+/safety-bench/vendor/
