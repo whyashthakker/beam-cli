@@ -10,6 +10,7 @@ import { extractAgent } from "./extract.js";
 import { loadCustomRules } from "./custom-rules.js";
 import { redactSensitive } from "./data-detectors.js";
 import { applyJevHook } from "./jev.js";
+import { applyJudgeHook } from "./judge.js";
 import { isPathTrusted, readTrustedPaths } from "./trusted-paths.js";
 import { addBlockedTarget, isTargetBlocked, readBlockedTargets } from "./blocked-targets.js";
 import { promptTty } from "./tty-prompt.js";
@@ -430,6 +431,9 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     const jev = await applyJevHook(decision, data);
     decision = jev.decision;
     if (jev.judgment) process.stderr.write(`Beam Jev: ${JSON.stringify(jev.judgment)}\n`);
+    const judged = await applyJudgeHook(decision, data);
+    decision = judged.decision;
+    if (judged.judgment) process.stderr.write(`Beam judge: ${JSON.stringify(judged.judgment)}\n`);
 
     // "warn" only ever comes out of evaluate() when the policy's mode is neither "enforce" nor
     // "advisory" (see policy.ts) -- a manager's explicit ASK/BLOCK rule under either of those
@@ -596,7 +600,7 @@ function isBeamSelfProtectionTarget(tool: string, command: string, target: strin
   const text = `${tool} ${command} ${target}`;
   const targetPath = target ? resolve(target) : "";
   const touchesBeamFiles = Boolean(targetPath && (targetPath === beamHome || targetPath.startsWith(`${beamHome}${sep}`) || targetPath === beamData || targetPath.startsWith(`${beamData}${sep}`))) || /(?:^|[\s"'\/])\.beam(?:[\/\s"']|$)|beam[\\/]data[\\/]policy\.json/i.test(text);
-  const stopsBeam = /\b(?:beam\s+(?:service\s+(?:stop|uninstall)|jev\s+(?:configure|disable)|uninstall)|(?:launchctl|systemctl|pkill|killall)\b[^\n]*\bbeam\b|npm\s+(?:uninstall|remove)\b[^\n]*@?agent-beam|rm\b[^\n]*(?:\.beam|beam-cli|@agent-beam))/i.test(text);
+  const stopsBeam = /\b(?:beam\s+(?:service\s+(?:stop|uninstall)|(?:jev|judge)\s+(?:configure|disable)|uninstall)|(?:launchctl|systemctl|pkill|killall)\b[^\n]*\bbeam\b|npm\s+(?:uninstall|remove)\b[^\n]*@?agent-beam|rm\b[^\n]*(?:\.beam|beam-cli|@agent-beam))/i.test(text);
   return touchesBeamFiles || stopsBeam;
 }
 

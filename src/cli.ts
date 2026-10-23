@@ -33,6 +33,7 @@ import { runAgent } from "./run.js";
 import { AGENT_BINARIES, installShims, listShims, pathExportLine, shimDir, uninstallShims } from "./shims.js";
 import { runMcpProxy } from "./mcp-proxy.js";
 import { registerJevCommands } from "./jev-cli.js";
+import { registerJudgeCommands } from "./judge-cli.js";
 import { addTrustedPath, readTrustedPaths, removeTrustedPath, trustedPathsFile } from "./trusted-paths.js";
 import { blockedTargetsFile, readBlockedTargets, removeBlockedTarget } from "./blocked-targets.js";
 import { checkForUpdate, installUpdate } from "./update.js";
@@ -75,6 +76,7 @@ const program = new Command()
   .version(packageJson.version);
 
 registerJevCommands(program);
+registerJudgeCommands(program);
 
 program.command("setup")
   .description("One-shot onboarding: wire beam's hook into every detected agent, connect this device, and optionally start the background service")

@@ -118,6 +118,42 @@ Hook requests include only agent, tool, tool input and command, with known crede
 
 Use the bundled [Jev action judging skill](Skills/jev-action-judge/SKILL.md), read the [Beam walkthrough](https://agentbeam.com/blog/beam-cli-jev-action-judging), or explore the [Awesome Jev use-case collection](https://github.com/whyashthakker/awesome-jev-use-cases). API semantics: [Noul](https://docs.typesafe.ai/primitives/noul), [Score](https://docs.typesafe.ai/primitives/score), [HTTP reference](https://docs.typesafe.ai/api).
 
+## Optional judging with any LLM or decision service
+
+`beam judge` works like Jev but with a model you choose. It's disabled by default. Pick one provider:
+
+- **`llm`:** any model behind an OpenAI-compatible chat completions endpoint, such as OpenAI, OpenRouter, a LiteLLM gateway, or a local Ollama or vLLM server. Beam asks it for an allow, review or deny verdict on the action.
+- **`http`:** your own decision service: an internal policy engine, a classifier, or a fine-tuned model behind an API.
+
+```bash
+# General LLM. On OpenAI the default model is gpt-4.1-nano; key from your secret manager
+op read op://vault/openai/key | beam judge configure --provider llm --key-stdin
+
+# A local model: no key, nothing leaves the machine
+beam judge configure --provider llm --url http://localhost:11434/v1 --model llama3.2
+
+# Your own decision service, enforcing
+beam judge configure --provider http --url https://decide.internal.example/v1/check --mode enforce
+
+beam judge status
+beam judge check action.json --dry-run   # print the redacted request; nothing is sent
+beam judge check action.json             # 0 allow, 2 review/deny, 1 error
+beam judge disable                       # stop checks and remove the stored key
+```
+
+A decision service receives `POST {"version":1,"action":{"agent","tool","input","command"},"context"?}` and must answer `{"verdict":"allow"|"review"|"deny","reason":"..."}`. A `decision` field is accepted in place of `verdict`. The key, if any, comes from `BEAM_JUDGE_API_KEY` or is stored in `~/.beam/judge.json` (mode 0600), and is sent as `Authorization: Bearer`.
+
+The safety rules match Jev's:
+
+- It runs only on pre-tool hooks, and only when local policy would let the action run.
+- Inputs are redacted the same way.
+- Observation mode is the default. Only `--mode enforce` blocks an action, on `review`, `deny` or an error.
+- A refusal from a general model counts as `review`. Anything unreadable counts as an error, never as `allow`.
+- Requests time out after 3 seconds by default (`--timeout-ms`, from 500 to 15000).
+- Agents can't run `beam judge configure` or `beam judge disable`.
+
+Jev and `beam judge` can run together. Each adds its own wait to every eligible tool call.
+
 ## App monitoring (optional)
 
 `beam monitor` watches a running application rather than an AI agent. It follows the app's log files and HTTP access logs around the clock and alerts on activity that looks like an attack or a compromise. `beam cve check` checks the app's dependencies for known vulnerabilities.
@@ -200,7 +236,7 @@ After enrollment, the AgentBeam dashboard shows agent activity, policy decisions
 
 ## Privacy and local operation
 
-AgentBeam's hook and policy decision run locally, so actions can be blocked even when the collector or dashboard is unavailable. Optional Jev judgments use the remote TypeSafe API; local policy remains independent. Telemetry is redacted before storage or forwarding. The local service binds to loopback, and AgentBeam files are protected from modification or removal by agent hooks.
+AgentBeam's hook and policy decision run locally, so actions can be blocked even when the collector or dashboard is unavailable. Optional Jev judgments use the remote TypeSafe API, and optional `beam judge` checks use the model or service you configure; local policy remains independent. Telemetry is redacted before storage or forwarding. The local service binds to loopback, and AgentBeam files are protected from modification or removal by agent hooks.
 
 ## Development
 
