@@ -11,3 +11,5 @@ coverage/
 npm-debug.log*
 .build-watch.log
 .build-watch.pid
+# Generated at publish time (prepublishOnly / release workflow) and shipped in the package
+/stress-report.json

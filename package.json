@@ -44,7 +44,8 @@
   },
   "files": [
     "dist",
-    "Skills"
+    "Skills",
+    "stress-report.json"
   ],
   "pkg": {
     "assets": [
@@ -59,7 +60,7 @@
     "test": "node --no-warnings --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
     "test:watch": "node --no-warnings --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "prepublishOnly": "npm run validate:skills && npm run typecheck && npm test && npm run build",
+    "prepublishOnly": "npm run validate:skills && npm run typecheck && npm test && npm run build && node --expose-gc scripts/stress-report.mjs --out stress-report.json",
     "setup": "npm run build && node dist/cli.js setup",
     "setup:global": "bash scripts/setup-global.sh",
     "validate:skills": "node Skills/scripts/validate-skills.mjs",

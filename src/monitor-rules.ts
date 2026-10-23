@@ -43,8 +43,28 @@ function ssrf(s: string): boolean {
   }
   return false;
 }
-// Credentials, by format. LLM provider keys are worth the most to an attacker right now.
-const SECRET = /-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk-(?:proj-|ant-|or-v1-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|AIza[0-9A-Za-z_-]{35}|gsk_[A-Za-z0-9]{40,}|hf_[A-Za-z0-9]{30,}|r8_[A-Za-z0-9]{30,}|xai-[A-Za-z0-9]{40,}|pplx-[A-Za-z0-9]{40,}|beam_app_[\w-]{20,})\b|\bauthorization:\s*bearer\s+[A-Za-z0-9._~+/-]{20,}/i;
+// Credentials, by format. Case-sensitive, as the real prefixes are. The bare "sk-" family also has
+// to look random, because "sk-" turns up in ordinary text: a URL slug like
+// /blog/samsung-sk-hynix-upgrade-china-nand-plants-2026 is not an OpenAI key.
+const KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk-(?:proj-|ant-|or-v1-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|AIza[0-9A-Za-z_-]{35}|gsk_[A-Za-z0-9]{40,}|hf_[A-Za-z0-9]{30,}|r8_[A-Za-z0-9]{30,}|xai-[A-Za-z0-9]{40,}|pplx-[A-Za-z0-9]{40,}|beam_app_[\w-]{20,})\b/g;
+const BEARER = /\bauthorization:\s*bearer\s+[A-Za-z0-9._~+/-]{20,}/i;
+/** A matched credential, or text that only looks like one (an sk- slug, a sentence). */
+export function keyLike(match: string): boolean {
+  if (!match.startsWith("sk-")) return true;
+  const body = match.replace(/^sk-(?:proj-|ant-|or-v1-|svcacct-|admin-)?/, "");
+  // Lowercase words joined by hyphens or underscores: a slug or a name, never a key.
+  if (/^[a-z0-9]+(?:[-_][a-z0-9]+){2,}$/.test(body) && /[a-z]{3,}[-_][a-z]{3,}/.test(body)) return false;
+  const digits = body.replace(/\D/g, "").length;
+  const mixedCase = /[a-z]/.test(body) && /[A-Z]/.test(body);
+  // Real keys: mixed case with digits (OpenAI, Anthropic), or long hex (DeepSeek, OpenRouter).
+  return (mixedCase && digits >= 2) || /^[a-f0-9]{32,}$/.test(body);
+}
+/** Whether the text holds something that looks like a real credential. */
+export function hasSecret(text: string): boolean {
+  if (BEARER.test(text)) return true;
+  for (const [match] of text.matchAll(KEY)) if (keyLike(match)) return true;
+  return false;
+}
 const XSS = /<script[\s>]|javascript:\s*[a-z(]|<(?:img|svg|body|iframe)\b[^>]{0,200}\son(?:error|load)\s*=|\bdocument\.cookie\b/i;
 const EVERYWHERE: LineSource[] = ["log", "http", "prompt", "output"];
 const SENSITIVE_FILE = /\/(?:\.env(?:\.[\w-]+)?|\.git\/(?:config|HEAD)|\.aws\/credentials|\.ssh\/id_\w+|wp-config\.php(?:\.bak)?|\.htpasswd|server-status|actuator\/(?:env|heapdump)|\.DS_Store)(?=[\s?"'#]|$)/i;
@@ -73,7 +93,7 @@ const appRules: MonitorRule[] = [
   { id: "web.ssrf", title: "Server-side request forgery attempt", severity: "high", category: "exploit", sources: ["http"],
     match: s => ssrf(s) },
   { id: "app.secret_in_log", title: "Credential written to logs", severity: "high", category: "secrets",
-    match: (_s, raw) => SECRET.test(raw) },
+    match: (_s, raw) => hasSecret(raw) },
   { id: "web.xss", title: "Cross-site scripting attempt", severity: "medium", category: "exploit",
     match: s => XSS.test(s) },
   { id: "web.prototype_pollution", title: "Prototype pollution attempt", severity: "medium", category: "exploit",
@@ -114,7 +134,7 @@ const llmRules: MonitorRule[] = [
   { id: "llm.output_exfiltration", title: "Data exfiltration link in model output", severity: "high", category: "llm", sources: ["output"],
     match: (_s, raw) => promptAttack.htmlExfil(raw) },
   { id: "llm.output_secret", title: "Credential in model output", severity: "high", category: "llm", sources: ["output"],
-    match: (_s, raw) => SECRET.test(raw) || promptAttack.envSecret(raw) },
+    match: (_s, raw) => hasSecret(raw) || promptAttack.envSecret(raw) },
   { id: "llm.output_script", title: "Script or active HTML in model output", severity: "medium", category: "llm", sources: ["output"],
     match: (_s, raw) => XSS.test(raw) },
 ];
@@ -164,7 +184,7 @@ export function redactLine(line: string, custom: CustomDetector[] = []): string 
   // Hidden Unicode text is made readable first, so it is redacted like the rest and a reviewer can see it.
   let out = revealHidden(line.slice(0, 4000))
     .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-]*PRIVATE KEY-----|$)/g, "[REDACTED PRIVATE KEY]")
-    .replace(/\b(?:sk-(?:proj-|ant-|or-v1-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|AIza[0-9A-Za-z_-]{35}|gsk_[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|r8_[A-Za-z0-9]{20,}|xai-[A-Za-z0-9]{20,}|pplx-[A-Za-z0-9]{20,}|beam_app_[\w-]{20,})\b/g, "[REDACTED TOKEN]")
+    .replace(/\b(?:sk-(?:proj-|ant-|or-v1-|svcacct-|admin-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|AIza[0-9A-Za-z_-]{35}|gsk_[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|r8_[A-Za-z0-9]{20,}|xai-[A-Za-z0-9]{20,}|pplx-[A-Za-z0-9]{20,}|beam_app_[\w-]{20,})\b/g, m => (keyLike(m) ? "[REDACTED TOKEN]" : m))
     .replace(/(bearer\s+)[A-Za-z0-9._~+/-]{8,}/gi, "$1[REDACTED]")
     .replace(/(\b(?:[\w-]*(?:api[_-]?key|token|secret|password|passwd|pwd|authorization|session|cookie)[\w-]*)["']?\s*[:=]\s*)["']?[^\s,"';&}\]]+/gi, "$1[REDACTED]")
     .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1[REDACTED]@")
