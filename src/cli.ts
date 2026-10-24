@@ -42,6 +42,8 @@ import { WORKER_COMMAND, autoUpdateAllowed, autoUpdateTick, readUpdateState, run
 import { recordExpectedHooks, reportControlEvent } from "./tamper.js";
 import { monitorConfigure, monitorStatus, monitorTest, runMonitor } from "./monitor.js";
 import { CVE_SEVERITIES, runCveCheck, type CveSeverity } from "./cve.js";
+import { addPackage, attachVulnerabilities, runInstall } from "./packages.js";
+import { isPackageBlocked, scanInstalledPackages, scanNpmPackage, scanPythonDist, type PackageScan } from "./package-scan.js";
 
 // Lets 'BEAM_API_URL=... beam connect' style overrides live in a .env file instead of the
 // shell profile. Checked in cwd first (handy when developing from the repo), then in
@@ -483,6 +485,82 @@ add.command("skill")
       if (options.scanOnly) console.log(dim("Scan only: nothing was installed."));
     }
     if (result.blocked.length) process.exitCode = 2;
+  });
+
+function printPackageScan(scan: PackageScan): void {
+  const badge = scan.risk === "critical" || scan.risk === "high" ? red(scan.risk.toUpperCase()) : scan.risk === "medium" ? scan.risk : green(scan.findings.length ? scan.risk : "clean");
+  console.log(`\n${scan.name}${scan.version ? `@${scan.version}` : ""} (${scan.ecosystem})  [${badge}]  risk score ${scan.score}/100 (${scan.level})  ${scan.filesScanned} files scanned`);
+  for (const f of scan.findings.slice(0, 10)) console.log(`  ${f.severity.padEnd(8)} ${f.title}  ${dim(`${f.file}${f.line ? `:${f.line}` : ""}`)}\n           ${dim(f.evidence.split("\n")[0].slice(0, 100))}`);
+  if (scan.findings.length > 10) console.log(dim(`  … ${scan.findings.length - 10} more (use --json for all)`));
+  for (const s of scan.skipped.slice(0, 3)) console.log(dim(`  skipped ${s}`));
+}
+
+// Only packages with something worth reading are printed; a tree has hundreds of clean ones.
+// Info-only findings (compiled binaries) don't count as flagged.
+const isFlagged = (scan: PackageScan) => scan.findings.some(f => f.severity !== "info");
+function printPackageSummary(scans: PackageScan[], notes: string[]): void {
+  const flagged = scans.filter(isFlagged);
+  flagged.forEach(printPackageScan);
+  console.log(`\n${flagged.length ? "!" : green("✔")} ${scans.length} package${scans.length === 1 ? "" : "s"} scanned, ${flagged.length} flagged${flagged.length ? ` (${flagged.filter(isPackageBlocked).length} critical)` : ""}.`);
+  for (const note of notes) console.log(dim(note));
+}
+
+add.command("package")
+  .description("Fetch an npm or PyPI package and its dependencies without running them, scan for malware and known vulnerabilities, then install the scanned version only if it passes")
+  .argument("<spec>", "npm name or name@version (e.g. express@4.21.2); with --pip, a PyPI requirement (e.g. requests==2.32.3)")
+  .option("--pip", "a PyPI package, installed with pip")
+  .option("-D, --dev", "save as a dev dependency (npm)")
+  .option("-g, --global", "install globally (npm -g, or pip --user)")
+  .option("--python <path>", "Python interpreter to download and install with (default: python3)")
+  .option("--force", "install even when the scan finds a critical risk")
+  .option("--scan-only", "scan without installing anything")
+  .option("--no-cve", "skip the known-vulnerability check")
+  .option("--json", "print the scan result as JSON")
+  .action(async (spec: string, options: { pip?: boolean; dev?: boolean; global?: boolean; python?: string; force?: boolean; scanOnly?: boolean; cve: boolean; json?: boolean }) => {
+    let result;
+    const scan = () => addPackage(spec, options);
+    try { result = options.json ? await scan() : await withSpinner(`Fetching and scanning ${spec} and its dependencies (nothing is run)`, scan); }
+    catch (e) { console.error(`✖ ${e instanceof Error ? e.message : e}`); process.exitCode = 1; return; }
+    if (options.json) console.log(JSON.stringify(result, null, 2));
+    else {
+      const [top, ...deps] = result.scans;
+      // The requested package is always shown, even when clean.
+      if (top && !isFlagged(top)) printPackageScan(top);
+      printPackageSummary(result.scans, result.notes);
+      if (deps.length) console.log(dim(`${result.name}@${result.version} pulls in ${deps.length} dependenc${deps.length === 1 ? "y" : "ies"}.`));
+      if (result.blocked.length) console.error(`✖ ${options.force ? "Critical risk found (installing anyway with --force)" : "Not installed (critical risk)"}: ${result.blocked.join(", ")}${options.force ? "" : "\n  Review the findings above. If you trust the source, re-run with --force."}`);
+      if (options.scanOnly) console.log(dim("Scan only: nothing was installed."));
+    }
+    if (result.install) {
+      if (!options.json) console.log(`\nInstalling ${result.name}@${result.version}: ${result.install.command} ${result.install.args.join(" ")}`);
+      try { await runInstall(result.install); if (!options.json) console.log(`${green("✔")} Installed ${result.name}@${result.version}`); }
+      catch (e) { console.error(`✖ ${e instanceof Error ? e.message : e}`); process.exitCode = 1; return; }
+    }
+    if (result.blocked.length) process.exitCode = 2;
+  });
+
+const packages = program.command("packages").description("Scan installed npm and Python packages for malware and known vulnerabilities");
+packages.command("scan")
+  .description("Scan a project's node_modules and virtualenvs (or one package folder) for install-time malware, obfuscation, credential theft and typosquats; exits 2 on a critical finding")
+  .argument("[dir]", "project folder, a site-packages folder, or a single package folder", ".")
+  .option("--no-cve", "skip the known-vulnerability check")
+  .option("--json", "print results as JSON")
+  .action(async (target: string, options: { cve: boolean; json?: boolean }) => {
+    const dir = path.resolve(target);
+    const notes: string[] = [];
+    const run = async () => {
+      let { scans } = await scanInstalledPackages(dir);
+      // Pointed at one package rather than a project.
+      if (!scans.length && fs.existsSync(path.join(dir, "package.json")) && !fs.existsSync(path.join(dir, "node_modules"))) scans = [await scanNpmPackage(dir, { direct: true })];
+      else if (!scans.length && (fs.existsSync(path.join(dir, "setup.py")) || fs.existsSync(path.join(dir, "PKG-INFO")))) scans = [await scanPythonDist(dir, { direct: true })];
+      if (scans.length && options.cve) await attachVulnerabilities(scans, notes);
+      return scans;
+    };
+    const scans = options.json ? await run() : await withSpinner(`Scanning packages under ${dir}`, run);
+    if (options.json) console.log(JSON.stringify({ scans: scans.filter(isFlagged), scanned: scans.length, notes }, null, 2));
+    else if (!scans.length) console.log(`No installed packages found under ${dir}. Beam looks in node_modules and in .venv, venv or env virtualenvs.`);
+    else printPackageSummary(scans, notes);
+    if (scans.some(isPackageBlocked)) process.exitCode = 2;
   });
 
 const skills = program.command("skills").description("Inspect installed agent skills");

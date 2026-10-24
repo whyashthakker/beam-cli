@@ -51,6 +51,8 @@ beam sync                  # fetch the latest organization policy
 beam monitor --file <log>  # watch a running app's logs and traffic (see App monitoring)
 beam monitor configure     # save what to watch and which LLM key to use; shows where each setting comes from
 beam cve check .           # check an app's dependencies for known vulnerabilities
+beam add package express   # scan an npm package and its dependencies, then install it if it passes
+beam packages scan .       # scan everything already in node_modules and .venv for malware
 beam share ./my-skill      # share a skill, CLAUDE.md or slash command with your team (see Team library)
 ```
 
@@ -356,6 +358,22 @@ Each release runs a stress test of all of this (`npm run stress`) and publishes 
 **Dependency checks** read `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lock`, `requirements*.txt` (pinned `==` lines), `poetry.lock`, `uv.lock`, `Pipfile.lock`, `go.mod`, `Cargo.lock`, `composer.lock`, `Gemfile.lock`, NuGet `packages.lock.json`, `gradle.lockfile`, `mix.lock`, `Package.resolved` and GitHub Actions workflow files. The search goes four directory levels deep and skips `node_modules`, `vendor` and virtual environments. Manifests without pinned versions, such as `package.json` ranges or `pom.xml`, are not checked.
 
 **Usage.** Findings, dependency checks and LLM checks count toward the workspace's monthly App monitoring allowance, shown in `beam monitor status` and in the dashboard. When the allowance runs out, capture pauses until the reset date. The app itself is never affected.
+
+## Package scanning
+
+`beam add package` scans npm and PyPI packages before they're installed, the way `beam add skill` does for skills. It's useful when an AI agent wants to install a package it named itself.
+
+```bash
+beam add package zod                          # scan zod and every dependency, then install the scanned version
+beam add package requests==2.32.3 --pip       # PyPI, installed with pip
+beam add package some-cli -g --scan-only      # report only, install nothing
+beam packages scan .                          # scan node_modules (npm, yarn, pnpm, bun) and .venv/venv/env
+```
+
+- **Nothing runs during the scan.** npm packages are fetched with `--ignore-scripts`. Python packages are fetched as wheels only, because building a source distribution would run its `setup.py`. When a package ships source only, its sdist comes straight from PyPI, its hash is checked, and it's unpacked without being built.
+- **What it looks for:** install scripts, and what those scripts run, that read the whole environment, fingerprint the machine and phone home, or contact Discord or Telegram webhooks and request-capture services. It also looks for decode-and-exec droppers (`eval(Buffer.from(...))`, `exec(base64.b64decode(...))`), obfuscated code, credential and wallet file access, `.pth` startup hooks, dependencies from outside the registry, and names one typo away from a popular package. A typo name on a package first published in the last 30 days is blocked.
+- **Known vulnerabilities:** on a machine connected with `beam connect` (or with `BEAM_APP_TOKEN` set), every package in the tree is checked against the same database as `beam cve check`. Only names and versions are sent. Critical advisories and actively exploited ones (CISA KEV) count as critical.
+- **What blocks an install:** a critical finding stops the install, and the command exits 2 (`--force` installs anyway). Other findings are shown as warnings. If the package passes, Beam installs the exact version it scanned with your project's own package manager (`npm`, `pnpm`, `yarn` or `bun`, detected from the lockfile).
 
 ## Team library
 

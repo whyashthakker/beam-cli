@@ -17,6 +17,7 @@ const dist = new URL("../dist/", import.meta.url);
 const { matchLine } = await import(new URL("monitor-rules.js", dist).href);
 const { MonitorPipeline } = await import(new URL("monitor-pipeline.js", dist).href);
 const { checkOutput, checkPrompt, createAppMonitor } = await import(new URL("sdk.js", dist).href);
+const { scanCode } = await import(new URL("package-risk-rules.js", dist).href);
 const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
 if (typeof globalThis.gc !== "function") {
@@ -61,6 +62,29 @@ const check = (id, title, passed, summary, measured, limit) => {
   check("hostile-input", "Hostile input", worst < 250,
     `${results.length} attack shapes at 16 KB; the slowest took ${worst} ms (${results[0].input})`,
     { worstMs: worst, cases: results.length, slowest: results.slice(0, 5) }, "under 250 ms for any single 16 KB input");
+}
+
+// 1b. Package scanning reads attacker-written code: every package rule against 3 MB files (the
+// largest file 'beam add package' and 'beam packages scan' read) shaped to trigger backtracking.
+{
+  const N = 3 * 1024 * 1024;
+  const fill = unit => unit.repeat(Math.ceil(N / unit.length)).slice(0, N);
+  const attacks = {
+    "eval(Buffer.from(": fill("eval(Buffer.from("), "exec(compile(": fill("exec(compile( "), "hex escapes": fill(`${"\\x41".repeat(39)} `), "_0x": fill("_0x12 "),
+    "webhook": fill("discord.com/api/webhooks/123456789012345678/"), "telegram": fill("api.telegram.org/bot123456:"), "ngrok": fill("a-a-a.ngrok"),
+    "JSON.stringify(": fill("JSON.stringify( "), ".ssh/": fill(".ssh/"), "os.hostname()": fill("os.hostname() "), "curl ": fill("curl "),
+    "require('dns')": fill("require('dns')."), "fetch": fill("fetch "), "rm -rf": fill("rm -rf "), "launchctl": fill("launchctl "),
+    "one long line": fill("a"), "short lines": fill("x\n"),
+  };
+  const results = Object.entries(attacks).map(([name, text]) => {
+    const t = clock();
+    scanCode(text, { shell: true });
+    return { input: name, ms: round(clock() - t, 1) };
+  }).sort((a, b) => b.ms - a.ms);
+  const worst = results[0].ms;
+  check("package-scan", "Package scanning, hostile files", worst < 1000,
+    `${results.length} attack shapes at 3 MB; the slowest took ${worst} ms (${results[0].input})`,
+    { worstMs: worst, cases: results.length, slowest: results.slice(0, 5) }, "under 1 s for any single 3 MB file");
 }
 
 // 2. Throughput of the detection pipeline on realistic, mixed traffic.
