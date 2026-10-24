@@ -51,6 +51,7 @@ beam sync                  # fetch the latest organization policy
 beam monitor --file <log>  # watch a running app's logs and traffic (see App monitoring)
 beam monitor configure     # save what to watch and which LLM key to use; shows where each setting comes from
 beam cve check .           # check an app's dependencies for known vulnerabilities
+beam share ./my-skill      # share a skill, CLAUDE.md or slash command with your team (see Team library)
 ```
 
 Run `beam setup` again when adding an agent or repairing an installation. It preserves existing agent configuration.
@@ -355,6 +356,27 @@ Each release runs a stress test of all of this (`npm run stress`) and publishes 
 **Dependency checks** read `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lock`, `requirements*.txt` (pinned `==` lines), `poetry.lock`, `uv.lock`, `Pipfile.lock`, `go.mod`, `Cargo.lock`, `composer.lock`, `Gemfile.lock`, NuGet `packages.lock.json`, `gradle.lockfile`, `mix.lock`, `Package.resolved` and GitHub Actions workflow files. The search goes four directory levels deep and skips `node_modules`, `vendor` and virtual environments. Manifests without pinned versions, such as `package.json` ranges or `pom.xml`, are not checked.
 
 **Usage.** Findings, dependency checks and LLM checks count toward the workspace's monthly App monitoring allowance, shown in `beam monitor status` and in the dashboard. When the allowance runs out, capture pauses until the reset date. The app itself is never affected.
+
+## Team library
+
+`beam share` shares a skill, a `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`, a slash command, a subagent or a Cursor rule with everyone in your workspace. Teammates install it with one command. It needs a device connected with `beam setup`. The same library is in the dashboard under **Team library**, where you can also share from the browser.
+
+```bash
+beam share ./.claude/skills/release-checklist        # share a skill folder (the kind is detected from the path)
+beam share ./CLAUDE.md --name "Backend conventions"  # share project instructions
+beam share ./.claude/commands/review.md -m "Covers migrations"   # publish a new version with a note
+beam share list                                      # what your team has shared
+beam share install release-checklist                 # install the newest approved version
+beam share install release-checklist@3 --all-agents  # a specific version, for every supported agent
+beam share update                                    # bring installed shares up to date
+beam share delete release-checklist                  # unshare something you shared
+```
+
+- **Only what you confirm leaves your machine.** Beam lists every file and shows its own scan before asking. Hidden files, `node_modules`, symlinks and non-text files are left out, and each one left out is listed. Limits: 100 files, 128 KB per file, 512 KB per share.
+- **Credentials are refused.** If a file contains an API key, access token, private key or a password inside a URL, Beam doesn't upload anything. The workspace runs the same check again. The error names the file and line, never the value.
+- **The workspace scans every upload itself.** Prompt injection or other high-risk findings send a share to an administrator for review before anyone can install it. Administrators can also require review for every share, or turn sharing off.
+- **Installs are checked before anything is written.** Beam checks the download against the workspace's content hash, re-validates every path, and runs its full skill scan on this machine. Files are only written inside the install folder, and never as executables. A file or folder that Beam didn't install, or that you edited since, is left alone unless you pass `--force`, which keeps a backup beside it.
+- **Only you or an administrator can publish new versions of your share.** A teammate can't push their own content under your share's name. Every publish, approval, rejection and deletion is in the workspace audit log.
 
 ## Dashboard
 
