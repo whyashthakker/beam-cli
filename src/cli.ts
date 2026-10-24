@@ -671,8 +671,9 @@ monitor.command("start", { isDefault: true })
   .option("--llm <provider>", LLM_OPTION)
   .option("--max-cpu <percent>", "the most of one CPU core detection may use (1-100, default 25); past it, lines are skipped until the next minute")
   .option("--config <file>", "a project config file to use instead of ./beam.monitor.json")
-  .action(async (options: { file?: string[]; stdin?: boolean; echo: boolean; app?: string; fromStart?: boolean; wait: boolean; llm?: string; maxCpu?: string; config?: string }) => {
-    await runMonitor({ files: options.file, stdin: options.stdin, echo: options.echo, app: options.app, fromStart: options.fromStart, wait: options.wait, llm: options.llm, maxCpu: options.maxCpu === undefined ? undefined : Number(options.maxCpu), config: options.config });
+  .option("--stack <name>", "the app's framework (nextjs, express, nestjs, vite, node, django, flask, fastapi, rails, laravel, php, wordpress, spring, java, go, dotnet, static); default: detected from --app")
+  .action(async (options: { file?: string[]; stdin?: boolean; echo: boolean; app?: string; fromStart?: boolean; wait: boolean; llm?: string; maxCpu?: string; config?: string; stack?: string }) => {
+    await runMonitor({ files: options.file, stdin: options.stdin, echo: options.echo, app: options.app, fromStart: options.fromStart, wait: options.wait, llm: options.llm, maxCpu: options.maxCpu === undefined ? undefined : Number(options.maxCpu), config: options.config, stack: options.stack });
   });
 
 monitor.command("configure")

@@ -192,6 +192,16 @@ describe("security events, usage and outbound calls", () => {
     expect(sent.find(f => f.ruleId === "signal.new_outbound_host")!.title).toBe("First call to collector.example.net");
     expect(JSON.stringify(sent)).not.toContain("leak=1");
   });
+  it("flags a Next.js middleware bypass header and rolls up other stacks' exploits for a Next.js app", async () => {
+    const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test", stack: "nextjs" });
+    await tick();
+    monitor.request({ method: "GET", url: "/admin", ip: "203.0.113.9", headers: { "x-middleware-subrequest": "middleware:middleware" } });
+    monitor.request({ method: "POST", url: "/_ignition/execute-solution", ip: "203.0.113.9" });
+    await monitor.flush({ force: true });
+    const sent = posted.flatMap(p => p.body.findings) as { ruleId: string; severity?: string; rollup?: { outcome: string } }[];
+    expect(sent.find(f => f.ruleId === "stack.nextjs.middleware_bypass")).toMatchObject({ severity: "critical" });
+    expect(sent.find(f => f.ruleId === "stack.laravel.ignition_rce")).toMatchObject({ severity: "low", rollup: { outcome: "not_applicable" } });
+  });
   it("leaves fetch alone by default", () => {
     const before = globalThis.fetch;
     createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test" });
@@ -215,6 +225,6 @@ describe("edge runtime safety", () => {
     };
     walk(resolve("src/sdk.ts"));
     expect(bad).toEqual([]);
-    expect([...seen].map(f => f.split("/").pop()).sort()).toEqual(["monitor-llm.ts", "monitor-pipeline.ts", "monitor-rules.ts", "monitor-signals.ts", "prompt-attacks.ts", "rule-catalog.ts", "sdk.ts"]);
+    expect([...seen].map(f => f.split("/").pop()).sort()).toEqual(["monitor-llm.ts", "monitor-pipeline.ts", "monitor-rules.ts", "monitor-signals.ts", "monitor-stacks.ts", "prompt-attacks.ts", "rule-catalog.ts", "sdk.ts"]);
   });
 });

@@ -250,6 +250,8 @@ beam.usage({ user: user.id, tokens: res.usage.total_tokens, model });
 const beam = createAppMonitor({ watchOutbound: true });  // notes the host of each fetch(); never the URL or body
 ```
 
+**Framework-aware.** Tell Beam the app's framework (`createAppMonitor({ stack: "nextjs" })`, or `beam monitor --stack django`; `--app` detects it) and it adds that framework's rules, such as the Next.js middleware bypass, Laravel Ignition, Spring4Shell, exposed Spring actuators, Werkzeug consoles, Rails info pages, Go pprof and ASP.NET diagnostics. Attacks on frameworks the app doesn't run are rolled up instead of raised. Stacks: `nextjs`, `express`, `nestjs`, `vite`, `node`, `django`, `flask`, `fastapi`, `rails`, `laravel`, `php`, `wordpress`, `spring`, `java`, `go`, `dotnet`, `static`. Per-framework cookbooks: [docs.agentbeam.com/cookbooks/overview](https://docs.agentbeam.com/cookbooks/overview).
+
 **LLM features (prompt injection and friends).** If the app sends text to a model, check it on the way in and out with the same `beam` instance. Both calls run locally in microseconds and return what they found, so the app decides what to do. Beam itself still never blocks anything.
 
 ```ts

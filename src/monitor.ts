@@ -24,6 +24,8 @@ import type { CustomDetector } from "./data-detectors.js";
 
 export { BRUTE_FORCE_THRESHOLD, DEDUPE_WINDOW_MS, MAX_NEW_FINDINGS_PER_10_MIN, MonitorPipeline, meetsLevel, type PipelineOptions, type SendOutcome } from "./monitor-pipeline.js";
 import { MonitorPipeline, type SendOutcome } from "./monitor-pipeline.js";
+import { STACKS, isStack } from "./monitor-stacks.js";
+import { detectStack } from "./stack-detect.js";
 
 /** Follows a log file like `tail -F`: survives rotation (new inode) and truncation (copytruncate). */
 export class FileTailer {
@@ -130,6 +132,8 @@ export interface MonitorOptions {
   maxCpu?: number;
   /** A project config file to use instead of ./beam.monitor.json (--config). */
   config?: string;
+  /** The app's framework (--stack). Default: detected from the --app directory. */
+  stack?: string;
 }
 
 const MAX_BACKOFF_MS = 5 * 60_000;
@@ -233,7 +237,12 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
   }
 
   const maxCpu = Math.min(100, Math.max(1, Number(resolved.locked.has("maxCpuPercent") ? saved.maxCpuPercent : options.maxCpu ?? saved.maxCpuPercent) || 25));
+  if (options.stack !== undefined && !isStack(options.stack))
+    throw new Error(`--stack must be one of: ${STACKS.join(", ")}.`);
+  const stack = isStack(options.stack) ? options.stack : appDir ? detectStack(appDir) ?? undefined : undefined;
+  if (stack) log(`Stack: ${stack}${options.stack ? "" : ` (detected from ${appDir})`}. Attacks on other frameworks are rolled up.`);
   const pipeline = new MonitorPipeline({
+    stack,
     level: () => (config && Date.now() >= pausedUntil ? config.level : null),
     customDetectors: () => custom,
     cpuBudgetMsPerMinute: 600 * maxCpu, // 1% of a core = 600 ms per minute

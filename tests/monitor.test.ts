@@ -7,6 +7,8 @@ import { decodeForMatch, lineSource, matchLine, redactLine, requestMeta, request
 import { BRUTE_FORCE_THRESHOLD, FileTailer, MAX_NEW_FINDINGS_PER_10_MIN, MonitorPipeline, runMonitor, vulnerabilityFinding, type SendOutcome } from "../src/monitor.js";
 import { ROLLUP_EVERY_MS } from "../src/monitor-pipeline.js";
 import { SIGNAL_THRESHOLDS } from "../src/monitor-signals.js";
+import { stackRules, type Stack } from "../src/monitor-stacks.js";
+import { detectStack } from "../src/stack-detect.js";
 import type { MonitorFinding, MonitorLevel } from "../src/monitor-client.js";
 
 const ids = (line: string) => matchLine(line).map(r => r.id);
@@ -309,6 +311,97 @@ describe("attack-in-progress signals", () => {
     expect(f.misses).toBeLessThanOrEqual(5000);
     expect(f.walks).toBeLessThanOrEqual(2000);
     expect(f.errors).toBeLessThanOrEqual(1000);
+  });
+});
+
+describe("stack-aware monitoring", () => {
+  const now = Date.parse("2026-10-23T10:00:00Z");
+  const make = (stack?: Stack) => new MonitorPipeline({ level: () => "strict", now: () => now, stack });
+  const sdkLine = (path: string, extra: object = {}) => JSON.stringify({ method: "GET", path, srcIp: "203.0.113.4", clientUa: "Mozilla/5.0", ...extra });
+
+  it("flags each framework's own attacks and exposures", () => {
+    const cases: [string, string][] = [
+      [sdkLine("/dashboard", { "x-middleware-subrequest": "middleware:middleware:middleware" }), "stack.nextjs.middleware_bypass"],
+      [access("/@fs/etc/passwd?raw??", "198.51.100.1", 200), "stack.vite.fs_read"],
+      [access("/console?__debugger__=yes&cmd=print(1)&frm=0&s=x", "198.51.100.1", 200), "stack.flask.debugger_console"],
+      [access("/__debug__/render_panel/", "198.51.100.1", 200), "stack.django.debug_toolbar_exposed"],
+      [access("/rails/info/properties", "198.51.100.1", 200), "stack.rails.info_exposed"],
+      [access("/_ignition/execute-solution", "198.51.100.1", 405), "stack.laravel.ignition_rce"],
+      [access("/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php", "198.51.100.1", 404), "stack.php.phpunit_rce"],
+      [access("/index.php?%ADd+allow_url_include%3d1", "198.51.100.1", 200), "stack.php.cgi_argument_injection"],
+      [access("/wp-json/wp/v2/users", "198.51.100.1", 200), "stack.wordpress.recon_user_enum"],
+      [access("/login?class.module.classLoader.resources.context.parent.pipeline.first.pattern=x", "198.51.100.1", 200), "stack.spring.spring4shell"],
+      [access("/actuator/env", "198.51.100.1", 200), "stack.spring.actuator_exposed"],
+      [access("/debug/pprof/heap", "198.51.100.1", 200), "stack.go.pprof_exposed"],
+      [access("/elmah.axd", "198.51.100.1", 200), "stack.dotnet.diagnostics_exposed"],
+      [access("/graphql?query={__schema{types{name}}}", "198.51.100.1", 200), "stack.graphql.recon_introspection"],
+    ];
+    for (const [line, rule] of cases) expect([rule, ids(line)]).toEqual([rule, expect.arrayContaining([rule])]);
+    // An exposure needs the endpoint to answer.
+    expect(ids(access("/actuator/env", "198.51.100.1", 404))).not.toContain("stack.spring.actuator_exposed");
+  });
+  it("rolls up attacks on frameworks the app doesn't run, and keeps its own", () => {
+    const next = make("nextjs");
+    next.ingestLine(sdkLine("/_ignition/execute-solution"));
+    next.ingestLine(sdkLine("/login?class.module.classLoader.x=1"));
+    next.ingestLine(sdkLine("/", { "x-middleware-subrequest": "middleware" }));
+    expect(next.rollingUp).toBe(2);
+    expect(next.pending.map(f => f.ruleId)).toEqual(["stack.nextjs.middleware_bypass"]);
+    const laravel = make("laravel");
+    laravel.ingestLine(sdkLine("/_ignition/execute-solution"));
+    expect(laravel.pending.map(f => [f.ruleId, f.severity])).toEqual([["stack.laravel.ignition_rce", "critical"]]);
+    // No stack declared: nothing is ruled out.
+    const unknown = make();
+    unknown.ingestLine(sdkLine("/_ignition/execute-solution"));
+    expect(unknown.pending).toHaveLength(1);
+    // A status always wins over the stack.
+    const served = make("nextjs");
+    served.ingestLine(access("/_ignition/execute-solution", "198.51.100.1", 200));
+    expect(served.pending.map(f => f.request?.outcome)).toEqual(["served"]);
+  });
+  it("rules out other stacks' paths by the app's stack", () => {
+    expect(requestOutcome({ path: "/wp-admin/" }, { stack: "wordpress" })).toBe("unknown");
+    expect(requestOutcome({ path: "/wp-login.php" }, { stack: "laravel" })).toBe("not_applicable");
+    expect(requestOutcome({ path: "/index.php" }, { stack: "laravel" })).toBe("unknown");
+    expect(requestOutcome({ path: "/wp-admin/" }, { stack: "django" })).toBe("not_applicable");
+    expect(requestOutcome({ path: "/actuator/env" }, { stack: "spring" })).toBe("unknown");
+    expect(requestOutcome({ path: "/actuator/env" }, { stack: "go" })).toBe("not_applicable");
+    expect(requestOutcome({ path: "/@fs/etc/passwd" }, { stack: "nextjs" })).toBe("not_applicable");
+    expect(requestOutcome({ path: "/@fs/etc/passwd" }, { stack: "vite" })).toBe("unknown");
+    expect(requestOutcome({ path: "/admin/users" }, { stack: "rails" })).toBe("unknown");
+  });
+  it("keeps every framework rule linear on hostile input", () => {
+    const shapes = ["?query=", "/phpunit/", "admin-ajax.php?", "/_next/static/", "Telerik.Web.UI.WebResource.axd?", "/@fs/", "/console?", "%{(#", "class.module.", "/actuator/", "\"x-middleware-subrequest\""];
+    for (const shape of shapes) {
+      const line = `"GET ${shape.repeat(Math.ceil(16_384 / shape.length)).slice(0, 16_384)} HTTP/1.1" 200 1 "-" "-"`;
+      const decoded = decodeForMatch(line);
+      for (const rule of stackRules) {
+        const start = performance.now();
+        rule.match(decoded, line);
+        expect([rule.id, shape, performance.now() - start < 5]).toEqual([rule.id, shape, true]);
+      }
+    }
+  });
+  it("detects an app's stack from its manifests", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "beam-stack-"));
+    const at = async (files: Record<string, string>) => {
+      await rm(dir, { recursive: true, force: true });
+      await mkdir(dir, { recursive: true });
+      for (const [name, body] of Object.entries(files)) await writeFile(join(dir, name), body);
+      return detectStack(dir);
+    };
+    expect(await at({ "package.json": JSON.stringify({ dependencies: { next: "16.0.0", react: "19" } }) })).toBe("nextjs");
+    expect(await at({ "package.json": JSON.stringify({ dependencies: { express: "5" } }) })).toBe("express");
+    expect(await at({ "composer.json": '{"require":{"laravel/framework":"^11"}}' })).toBe("laravel");
+    expect(await at({ "manage.py": "" })).toBe("django");
+    expect(await at({ "requirements.txt": "fastapi==0.115\nuvicorn" })).toBe("fastapi");
+    expect(await at({ "Gemfile": "gem 'rails', '~> 8.0'" })).toBe("rails");
+    expect(await at({ "pom.xml": "<artifactId>spring-boot-starter-web</artifactId>" })).toBe("spring");
+    expect(await at({ "go.mod": "module x" })).toBe("go");
+    expect(await at({ "Api.csproj": "<Project/>" })).toBe("dotnet");
+    expect(await at({ "wp-config.php": "<?php" })).toBe("wordpress");
+    expect(await at({ "README.md": "hi" })).toBe(null);
+    await rm(dir, { recursive: true, force: true });
   });
 });
 

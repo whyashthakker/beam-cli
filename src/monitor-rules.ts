@@ -8,6 +8,7 @@ import { builtinRulesById, type RuleCategory } from "./rule-catalog.js";
 import type { CustomDetector } from "./data-detectors.js";
 import type { MonitorSeverity } from "./monitor-client.js";
 import { promptAttack, revealHidden } from "./prompt-attacks.js";
+import { foreignTo, pathFamilies, stackRules, type Stack } from "./monitor-stacks.js";
 
 /** log/http: lines from log files and traffic. prompt/output: text going into, or coming out of, an LLM (SDK). */
 export type LineSource = "log" | "http" | "prompt" | "output";
@@ -146,7 +147,7 @@ const sharedRules: MonitorRule[] = builtinRulesById(["network.reverse-shell", "e
     ...(r.id === "network.metadata" ? { sources: EVERYWHERE } : {}),
   }));
 
-export const monitorRules: MonitorRule[] = [...appRules, ...llmRules, ...sharedRules];
+export const monitorRules: MonitorRule[] = [...appRules, ...llmRules, ...sharedRules, ...stackRules];
 const CLASSIC: LineSource[] = ["log", "http"];
 
 const HTTP_LINE = /"(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|TRACE) \S+ HTTP\/[\d.]+"|^\S+ \S+ \S+ \[[^\]]+\] "|"(?:method|http_method|request_method)"\s*:\s*"[A-Z]+"/;
@@ -282,17 +283,20 @@ export function requestMeta(line: string): RequestMeta {
  * - unknown: no status to go on
  */
 export type RequestOutcome = "served" | "blocked" | "failed" | "not_applicable" | "unknown";
-// Paths only a PHP, ASP, Java or CGI server answers. A Node, Bun or edge app answers them only
-// when it proxies or rewrites to one, which the SDK's `proxiesOtherStacks` option says.
-const OTHER_STACK = /(?:\.(?:php\d?|phtml|aspx?|ashx|asmx|jsp|jspx|do|action|cgi|pl)(?=[/?#;]|$)|\/(?:wordpress|wp-(?:admin|content|includes|json)|cgi-bin|phpmyadmin|xmlrpc)(?=[/?#]|$))/i;
-export function requestOutcome(meta: RequestMeta, options: { javascriptApp?: boolean } = {}): RequestOutcome {
+/**
+ * With no status, a path only another stack serves (PHP, WordPress, ASP.NET, Java, a Vite dev
+ * server...) can't have worked on an app that declares its stack. `javascriptApp` is the SDK's
+ * older switch, the same as stack "node".
+ */
+export function requestOutcome(meta: RequestMeta, options: { javascriptApp?: boolean; stack?: Stack } = {}): RequestOutcome {
   const status = meta.status;
   if (status !== undefined) {
     if (status >= 500) return "failed";
     if (status >= 300) return "blocked";
     if (status >= 200) return "served";
   }
-  if (options.javascriptApp && meta.path && OTHER_STACK.test(meta.path.split("?")[0]!)) return "not_applicable";
+  const stack = options.stack ?? (options.javascriptApp ? "node" : undefined);
+  if (stack && meta.path && foreignTo(stack, pathFamilies(meta.path))) return "not_applicable";
   return "unknown";
 }
 

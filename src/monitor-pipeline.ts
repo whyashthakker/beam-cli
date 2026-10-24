@@ -8,6 +8,7 @@ import {
   requestOutcome, routeKey, tokenUsage, type LineSource, type MonitorRule,
 } from "./monitor-rules.js";
 import { DistinctPerMinute, MinuteSeries, SIGNAL_THRESHOLDS, meaningfulPath, outboundHost } from "./monitor-signals.js";
+import { foreignTo, ruleFamilies, type Stack } from "./monitor-stacks.js";
 
 /** A short, stable fingerprint (two seeded 53-bit hashes); not cryptographic, only used for dedupe ids. */
 export function fingerprint(text: string): string {
@@ -108,6 +109,11 @@ export interface PipelineOptions {
    * code that would run it, so it's rolled up like a refused one even without a response status.
    */
   javascriptApp?: boolean;
+  /**
+   * The app's stack (nextjs, django, laravel, spring...). Attacks aimed at software it doesn't run
+   * are rolled up as not applicable, and its own framework's rules count in full.
+   */
+  stack?: Stack;
 }
 
 const clock = () => (globalThis.performance?.now?.() ?? Date.now());
@@ -199,6 +205,7 @@ export class MonitorPipeline {
   }
 
   private now(): number { return this.opts.now?.() ?? Date.now(); }
+  private stack(): Stack | undefined { return this.opts.stack ?? (this.opts.javascriptApp ? "node" : undefined); }
 
   get pending(): MonitorFinding[] { return [...this.queue]; }
   /** Roll-ups still collecting; a forced flush sends them early. */
@@ -253,13 +260,17 @@ export class MonitorPipeline {
     const request = source === "http" ? this.describeRequest(line, ip, custom, options.excerpt !== false) : undefined;
     const raised: string[] = [];
     const seenRules = new Set<string>();
+    const stack = this.stack();
     for (const rule of matchLine(line, source, options.rules)) {
       if (seenRules.has(rule.id)) continue;
+      // An attack on a framework this app doesn't run (a Laravel exploit against a Next.js app),
+      // with no status to say otherwise, can't have worked.
+      const outcome = request?.outcome === "unknown" && stack && foreignTo(stack, ruleFamilies(rule.id)) ? "not_applicable" : request?.outcome;
       // Refused, or aimed at software that isn't here: rolled up whatever the level, as context
       // for the dashboard, never one finding (or alert) per address.
-      if (request && (request.outcome === "blocked" || request.outcome === "not_applicable")) {
+      if (request && (outcome === "blocked" || outcome === "not_applicable")) {
         seenRules.add(rule.id);
-        this.rollUp(rule, request.outcome, request, file, excerpt);
+        this.rollUp(rule, outcome, { ...request, outcome }, file, excerpt);
         raised.push(rule.id);
         continue;
       }
@@ -469,7 +480,7 @@ export class MonitorPipeline {
     const meta = requestMeta(line);
     const clip = (s: string | undefined, max: number) => (s === undefined ? undefined : redactLine(s, custom).slice(0, max));
     const request: FindingRequest = {
-      outcome: requestOutcome(meta, { javascriptApp: this.opts.javascriptApp }),
+      outcome: requestOutcome(meta, { stack: this.stack() }),
       ip, method: meta.method, status: meta.status, bytes: meta.bytes, durationMs: meta.durationMs,
       host: clip(meta.host, 200), country: meta.country, asn: meta.asn, userAgent: clip(meta.userAgent, 300),
       // The path and referrer carry the payload; an app that withholds text withholds them too.

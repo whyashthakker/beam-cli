@@ -18,6 +18,7 @@
 import type { MonitorFinding, MonitorLevel, MonitorSeverity } from "./monitor-client.js";
 import { CpuBudget, MonitorPipeline, type SendOutcome } from "./monitor-pipeline.js";
 import { matchLine, type MonitorRule } from "./monitor-rules.js";
+import { isStack, type Stack } from "./monitor-stacks.js";
 import { containsCanary } from "./prompt-attacks.js";
 import { judgeWithOwnLlm, ownLlmConfig, type OwnLlmConfig } from "./monitor-llm.js";
 
@@ -58,6 +59,13 @@ export interface AppMonitorOptions {
    * app doesn't run, instead of raised on its own, since a JavaScript app can't execute it.
    */
   proxiesOtherStacks?: boolean;
+  /**
+   * The app's framework: "nextjs", "express", "nestjs", "vite", "node" (the default), or for a
+   * backend that reports through a Node service, "django", "flask", "fastapi", "rails", "laravel",
+   * "php", "wordpress", "spring", "java", "go", "dotnet". Turns on that framework's rules, and
+   * rolls up attacks on frameworks the app doesn't run.
+   */
+  stack?: Stack;
   /**
    * Note the host of every fetch() the app makes, so a first call to a new host is raised (after
    * the workspace has learned the app's usual hosts for a day). Wraps globalThis.fetch once; only
@@ -315,7 +323,8 @@ function start(options: AppMonitorOptions): AppMonitor {
   const pipeline = new MonitorPipeline({
     level: () => (!revoked() && Date.now() >= pausedUntil ? level : null),
     budget,
-    javascriptApp: options.proxiesOtherStacks !== true,
+    // Proxying other stacks' paths: nothing can be ruled out by stack.
+    stack: options.proxiesOtherStacks === true ? undefined : isStack(options.stack) ? options.stack : "node",
     tokensPerUserHour: typeof options.tokensPerUserHour === "number" && options.tokensPerUserHour > 0 ? options.tokensPerUserHour : undefined,
   });
 
@@ -382,7 +391,8 @@ function start(options: AppMonitorOptions): AppMonitor {
   };
 
   const flush = (force = false): Promise<void> => {
-    if (flushing) return flushing;
+    // A forced flush waits for one in flight, then sends what that one left (roll-ups still collecting).
+    if (flushing) return force ? flushing.then(() => flush(true)) : flushing;
     if (!pipeline.pending.length && !(force && pipeline.rollingUp)) return Promise.resolve();
     const now = Date.now();
     if (!force && (now - lastFlush < flushEvery || now < nextSendAt)) return Promise.resolve();
@@ -492,6 +502,8 @@ function start(options: AppMonitorOptions): AppMonitor {
           durationMs: count(info.durationMs),
           country: country && /^[A-Za-z]{2}$/.test(country) ? country.toUpperCase() : undefined,
           asn: count(info.asn),
+          // Sent only by Next.js itself; from a client it's an attempt to skip middleware (CVE-2025-29927).
+          "x-middleware-subrequest": text(header("x-middleware-subrequest"), 200),
         }), "requests");
       } catch {
         /* never let monitoring affect the app */
