@@ -1,9 +1,9 @@
 // The detection pipeline shared by `beam monitor` and the in-app SDK: rule matching, level filter,
 // grouping and deduplication, flood control and batching. Pure TypeScript with no Node.js
 // built-ins, so it also runs in edge runtimes (Next.js middleware).
-import type { MonitorFinding, MonitorLevel, MonitorSeverity } from "./monitor-client.js";
+import type { MonitorFinding, MonitorLevel, MonitorRollup, MonitorSeverity } from "./monitor-client.js";
 import type { CustomDetector } from "./data-detectors.js";
-import { clientIp, isAuthFailure, isLlmRequest, lineSource, matchLine, redactLine, type LineSource, type MonitorRule } from "./monitor-rules.js";
+import { clientIp, isAuthFailure, isLlmRequest, lineSource, matchLine, redactLine, requestMeta, requestOutcome, type LineSource, type MonitorRule } from "./monitor-rules.js";
 
 /** A short, stable fingerprint (two seeded 53-bit hashes); not cryptographic, only used for dedupe ids. */
 export function fingerprint(text: string): string {
@@ -41,6 +41,28 @@ export const MAX_NEW_FINDINGS_PER_10_MIN = 200;
 const FLOOD_WINDOW_MS = 10 * 60_000;
 const MAX_QUEUE = 1000;
 const BATCH_SIZE = 100;
+// Attacks that were refused or can't work here are rolled up per rule and sent this often.
+export const ROLLUP_EVERY_MS = 5 * 60_000;
+const ROLLUP_LIMITS = { addresses: 10_000, clients: 2000, paths: 500, userAgents: 300, countries: 250 };
+const ROLLUP_TOP = { clients: 25, paths: 10, userAgents: 10, countries: 10 };
+
+type FindingRequest = NonNullable<MonitorFinding["request"]>;
+interface OpenRollup {
+  ruleId: string; title: string; category: string; file?: string; outcome: MonitorRollup["outcome"];
+  started: number; last: number; requests: number; excerpt: string;
+  addresses: Set<string>; statuses: Map<string, number>;
+  clients: Map<string, MonitorRollup["clients"][number]>;
+  paths: Map<string, number>; userAgents: Map<string, number>; countries: Map<string, number>;
+}
+/** Adds one to `key`, keeping at most `max` keys (new keys past it aren't tracked). */
+function bump(map: Map<string, number>, key: string | undefined, max: number): void {
+  if (!key) return;
+  const n = map.get(key);
+  if (n !== undefined) map.set(key, n + 1);
+  else if (map.size < max) map.set(key, 1);
+}
+const top = (map: Map<string, number>, n: number) => [...map].sort((a, b) => b[1] - a[1]).slice(0, n);
+const OUTCOME_TITLE: Record<MonitorRollup["outcome"], string> = { blocked: "refused by the app", not_applicable: "aimed at software this app doesn't run" };
 
 export type SendOutcome = "sent" | "retry" | "drop";
 
@@ -75,6 +97,11 @@ export interface PipelineOptions {
   cpuBudgetMsPerMinute?: number;
   /** Or a budget shared with other work (the SDK's prompt and output checks). */
   budget?: CpuBudget;
+  /**
+   * The app is JavaScript (the SDK): a request for a PHP, WordPress, ASP or Java path can't reach
+   * code that would run it, so it's rolled up like a refused one even without a response status.
+   */
+  javascriptApp?: boolean;
 }
 
 const clock = () => (globalThis.performance?.now?.() ?? Date.now());
@@ -139,6 +166,7 @@ export class MonitorPipeline {
   private floodBucket = -1;
   private floodCount = 0;
   private suppressed: { count: number; severity: MonitorSeverity } | null = null;
+  private rollups = new Map<string, OpenRollup>();
   private maintainedMinute = -1;
   readonly budget: CpuBudget | null;
 
@@ -149,10 +177,12 @@ export class MonitorPipeline {
   private now(): number { return this.opts.now?.() ?? Date.now(); }
 
   get pending(): MonitorFinding[] { return [...this.queue]; }
+  /** Roll-ups still collecting; a forced flush sends them early. */
+  get rollingUp(): number { return this.rollups.size; }
 
   /** Sizes of everything the pipeline keeps, for tests and diagnostics: all of them are bounded. */
-  get footprint(): { seen: number; queue: number; queued: number; authFailures: number; llmCalls: number } {
-    return { seen: this.seen.size, queue: this.queue.length, queued: this.queued.size, authFailures: this.authFailures.size, llmCalls: this.llmCalls.size };
+  get footprint(): { seen: number; queue: number; queued: number; authFailures: number; llmCalls: number; rollups: number } {
+    return { seen: this.seen.size, queue: this.queue.length, queued: this.queued.size, authFailures: this.authFailures.size, llmCalls: this.llmCalls.size, rollups: this.rollups.size };
   }
 
   /** Once a minute: forget dedupe entries and counters that can no longer matter. */
@@ -165,6 +195,7 @@ export class MonitorPipeline {
     this.authFailures.prune(now);
     this.llmCalls.prune(now);
     if (this.queued.size > 5000) this.queued.clear(); // dependency ids; a repeat is deduped by the server too
+    this.emitRollups(now, false);
   }
 
   /**
@@ -186,15 +217,26 @@ export class MonitorPipeline {
     const ip = options.client ? redactLine(options.client, custom).slice(0, 80) : source === "http" ? clientIp(line) : undefined;
     this.maintain(this.now());
     const excerpt = options.excerpt === false ? "(the app withheld the text)" : redactLine(line, custom);
+    const request = source === "http" ? this.describeRequest(line, ip, custom, options.excerpt !== false) : undefined;
     const raised: string[] = [];
     const seenRules = new Set<string>();
     for (const rule of matchLine(line, source, options.rules)) {
-      if (!meetsLevel(rule.severity, level) || seenRules.has(rule.id)) continue;
+      if (seenRules.has(rule.id)) continue;
+      // Refused, or aimed at software that isn't here: rolled up whatever the level, as context
+      // for the dashboard, never one finding (or alert) per address.
+      if (request && (request.outcome === "blocked" || request.outcome === "not_applicable")) {
+        seenRules.add(rule.id);
+        this.rollUp(rule, request.outcome, request, file, excerpt);
+        raised.push(rule.id);
+        continue;
+      }
+      if (!meetsLevel(rule.severity, level)) continue;
       seenRules.add(rule.id);
       // Traffic groups by client address (one scan = one finding); app logs group by line shape.
       this.raise(level, ip ?? normalizeForGrouping(line), {
         ruleId: rule.id, title: ip ? `${rule.title} from ${ip}` : rule.title, severity: rule.severity,
         category: rule.category, source: wire, file, evidence: options.excerpt === false ? `Matched "${rule.title}"; the app withheld the text.` : excerpt,
+        ...(request ? { request } : {}),
       });
       raised.push(rule.id);
     }
@@ -205,6 +247,7 @@ export class MonitorPipeline {
         this.raise(level, key, {
           ruleId: "app.auth_bruteforce", title: `Repeated failed sign-ins from ${key}`, severity: "high", category: "recon",
           source: wire, file, evidence: `${recent} failures in 5 minutes. Latest: ${redactLine(line, custom)}`.slice(0, 600),
+          ...(request ? { request } : {}),
         });
         raised.push("app.auth_bruteforce");
       }
@@ -216,11 +259,84 @@ export class MonitorPipeline {
         this.raise(level, ip, {
           ruleId: "llm.denial_of_wallet", title: `Unusual volume of LLM requests from ${ip}`, severity: "high", category: "llm",
           source: wire, file, evidence: `${recent} ${source === "prompt" ? "prompts" : "requests to LLM endpoints"} in 5 minutes. Scripted use runs up the model bill. Latest: ${excerpt}`.slice(0, 600),
+          ...(request ? { request } : {}),
         });
         raised.push("llm.denial_of_wallet");
       }
     }
     return raised;
+  }
+
+  /** The request behind a traffic line, redacted like evidence, with what became of it. */
+  private describeRequest(line: string, ip: string | undefined, custom: CustomDetector[], withText: boolean): FindingRequest {
+    const meta = requestMeta(line);
+    const clip = (s: string | undefined, max: number) => (s === undefined ? undefined : redactLine(s, custom).slice(0, max));
+    const request: FindingRequest = {
+      outcome: requestOutcome(meta, { javascriptApp: this.opts.javascriptApp }),
+      ip, method: meta.method, status: meta.status, bytes: meta.bytes, durationMs: meta.durationMs,
+      host: clip(meta.host, 200), country: meta.country, asn: meta.asn, userAgent: clip(meta.userAgent, 300),
+      // The path and referrer carry the payload; an app that withholds text withholds them too.
+      ...(withText ? { path: clip(meta.path, 500), referer: clip(meta.referer, 300) } : {}),
+    };
+    for (const key of Object.keys(request) as (keyof FindingRequest)[]) if (request[key] === undefined) delete request[key];
+    return request;
+  }
+
+  private rollUp(rule: MonitorRule, outcome: MonitorRollup["outcome"], request: FindingRequest, file: string | undefined, excerpt: string): void {
+    const now = this.now();
+    const key = `${rule.id}\0${outcome}\0${file ?? ""}`;
+    let r = this.rollups.get(key);
+    if (!r) {
+      r = {
+        ruleId: rule.id, title: rule.title, category: rule.category, file, outcome, started: now, last: now, requests: 0, excerpt,
+        addresses: new Set(), statuses: new Map(), clients: new Map(), paths: new Map(), userAgents: new Map(), countries: new Map(),
+      };
+      this.rollups.set(key, r);
+    }
+    r.requests++;
+    r.last = now;
+    r.excerpt = excerpt;
+    const ip = request.ip ?? "unknown";
+    if (r.addresses.size < ROLLUP_LIMITS.addresses) r.addresses.add(ip);
+    bump(r.statuses, request.status === undefined ? "none" : String(request.status), 100);
+    bump(r.paths, request.path, ROLLUP_LIMITS.paths);
+    bump(r.userAgents, request.userAgent, ROLLUP_LIMITS.userAgents);
+    bump(r.countries, request.country, ROLLUP_LIMITS.countries);
+    const client = r.clients.get(ip);
+    const latest = { status: request.status, path: request.path, userAgent: request.userAgent, country: request.country, asn: request.asn };
+    for (const k of Object.keys(latest) as (keyof typeof latest)[]) if (latest[k] === undefined) delete latest[k];
+    if (client) Object.assign(client, latest, { count: client.count + 1 });
+    else if (r.clients.size < ROLLUP_LIMITS.clients) r.clients.set(ip, { ip, count: 1, ...latest });
+  }
+
+  /** Queues roll-ups that have collected for ROLLUP_EVERY_MS, or all of them when `force`. */
+  private emitRollups(now: number, force: boolean): void {
+    for (const [key, r] of this.rollups) {
+      if (!force && now - r.started < ROLLUP_EVERY_MS) continue;
+      this.rollups.delete(key);
+      const statuses = Object.fromEntries(r.statuses);
+      const answered = Object.entries(statuses).filter(([s]) => s !== "none").sort((a, b) => b[1] - a[1]).map(([s, n]) => `${n} × ${s}`).join(", ");
+      const [topPath] = top(r.paths, 1);
+      const rollup: MonitorRollup = {
+        outcome: r.outcome, requests: r.requests, addresses: r.addresses.size,
+        from: new Date(r.started).toISOString(), to: new Date(r.last).toISOString(), statuses,
+        clients: [...r.clients.values()].sort((a, b) => b.count - a.count).slice(0, ROLLUP_TOP.clients),
+        paths: top(r.paths, ROLLUP_TOP.paths).map(([path, count]) => ({ path, count })),
+        userAgents: top(r.userAgents, ROLLUP_TOP.userAgents).map(([userAgent, count]) => ({ userAgent, count })),
+        countries: top(r.countries, ROLLUP_TOP.countries).map(([country, count]) => ({ country, count })),
+      };
+      const plural = (n: number, word: string) => `${n.toLocaleString("en-US")} ${word}${n === 1 ? "" : word.endsWith("s") ? "es" : "s"}`;
+      this.enqueue({
+        id: `rollup-${fingerprint(key)}-${r.started}`, ruleId: r.ruleId, title: `${r.title}, ${OUTCOME_TITLE[r.outcome]}`,
+        severity: "low", category: r.category, source: "http", file: r.file, count: r.requests, firstSeen: rollup.from,
+        evidence: [
+          `${plural(r.requests, "request")} from ${plural(r.addresses.size, "address")}${answered ? `, answered ${answered}` : ""}.`,
+          topPath ? `Most sent: ${topPath[0]} (${topPath[1]}).` : "",
+          `Latest: ${r.excerpt}`,
+        ].filter(Boolean).join(" ").slice(0, 900),
+        rollup,
+      });
+    }
   }
 
   /** Queues a finding produced elsewhere (dependency checks) under its own stable id, once. */
@@ -281,9 +397,13 @@ export class MonitorPipeline {
     this.queue.push(finding);
   }
 
-  /** Sends queued findings in batches; a "retry" outcome keeps the batch for the next flush. */
-  async flush(send: (batch: MonitorFinding[]) => Promise<SendOutcome>): Promise<void> {
+  /**
+   * Sends queued findings in batches; a "retry" outcome keeps the batch for the next flush.
+   * `force` (shutdown, the SDK's flush({ force })) also sends roll-ups still collecting.
+   */
+  async flush(send: (batch: MonitorFinding[]) => Promise<SendOutcome>, options: { force?: boolean } = {}): Promise<void> {
     if (this.suppressed && Math.floor(this.now() / FLOOD_WINDOW_MS) !== this.floodBucket) this.emitSuppressed();
+    this.emitRollups(this.now(), Boolean(options.force));
     while (this.queue.length) {
       const batch = this.queue.splice(0, BATCH_SIZE);
       if ((await send(batch)) === "retry") {

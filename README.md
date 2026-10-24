@@ -219,13 +219,16 @@ export function middleware(request: NextRequest, event: NextFetchEvent) {
     url: request.nextUrl.pathname + request.nextUrl.search,
     ip: request.headers.get("x-forwarded-for")?.split(",")[0]?.trim(),
     userAgent: request.headers.get("user-agent"),
+    headers: request.headers, // host and country (x-vercel-ip-country, cf-ipcountry) for the analytics
   });
   event.waitUntil(beam.flush());
   return NextResponse.next();
 }
 ```
 
-For Express, use `app.use((req, _res, next) => { beam.request({ method: req.method, url: req.originalUrl, ip: req.ip, userAgent: req.get("user-agent") }); next(); })`. `beam.log(line)` checks application log lines too.
+For Express, report after the response so Beam knows what became of each request: `app.use((req, res, next) => { res.on("finish", () => beam.request({ method: req.method, url: req.originalUrl, ip: req.ip, userAgent: req.get("user-agent"), status: res.statusCode })); next(); })`. `beam.log(line)` checks application log lines too.
+
+**Only what might have worked is raised.** With a response status (from the SDK's `status`, or the access logs `beam monitor` reads), an attack the app refused (3xx or 4xx) is folded into one low-severity roll-up per rule every few minutes: never alerted on, not counted against the monthly allowance, and shown in the dashboard's attack analytics. Middleware runs before the response, so there the SDK also rolls up attacks on software a JavaScript app can't run, like WordPress, PHP or Java paths; set `proxiesOtherStacks: true` if the app proxies such paths to another server.
 
 **LLM features (prompt injection and friends).** If the app sends text to a model, check it on the way in and out with the same `beam` instance. Both calls run locally in microseconds and return what they found, so the app decides what to do. Beam itself still never blocks anything.
 

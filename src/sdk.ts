@@ -52,6 +52,12 @@ export interface AppMonitorOptions {
    * the app and only the verdict goes to AgentBeam. Runs during flush(), never on a request.
    */
   llm?: string;
+  /**
+   * True when this app proxies or rewrites some paths to a PHP, WordPress, ASP or Java server.
+   * By default an attack on such a path (/wp-admin/, *.php) is rolled up as aimed at software the
+   * app doesn't run, instead of raised on its own, since a JavaScript app can't execute it.
+   */
+  proxiesOtherStacks?: boolean;
 }
 
 export interface RequestInfo {
@@ -60,7 +66,23 @@ export interface RequestInfo {
   url: string;
   ip?: string | null;
   userAgent?: string | null;
+  /**
+   * The response status, when the hook runs after the response (Express `res.on("finish")`,
+   * Fastify `onResponse`). Attacks the app refused (3xx/4xx) are rolled up instead of alerted on.
+   */
   status?: number | null;
+  /** Response size in bytes and time taken, when known. */
+  bytes?: number | null;
+  durationMs?: number | null;
+  /** Two-letter country and autonomous system number of the client, when the host or CDN provides them. */
+  country?: string | null;
+  asn?: number | null;
+  /**
+   * The request's headers (a Headers object or a plain record). Read for Host, Referer, User-Agent
+   * and the country your platform adds (x-vercel-ip-country, cf-ipcountry,
+   * cloudfront-viewer-country). Nothing else is read and no header is sent as-is.
+   */
+  headers?: Headers | Record<string, string | string[] | undefined> | null;
 }
 
 export interface PromptInfo {
@@ -115,6 +137,14 @@ const CONFIG_RETRY_MS = 60 * 1000;
 function env(name: string): string | undefined {
   const p = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process;
   return p?.env?.[name]?.trim() || undefined;
+}
+
+/** Case-insensitive lookup in a Headers object or a plain record; the first value of a list. */
+function headerReader(headers: RequestInfo["headers"]): (name: string) => string | undefined {
+  if (!headers || typeof headers !== "object") return () => undefined;
+  if (typeof (headers as Headers).get === "function") return name => (headers as Headers).get(name) ?? undefined;
+  const lower = new Map(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), Array.isArray(v) ? v[0] : v]));
+  return name => lower.get(name) ?? undefined;
 }
 
 function withTimeout(ms: number): { signal: AbortSignal; done: () => void } {
@@ -256,7 +286,11 @@ function start(options: AppMonitorOptions): AppMonitor {
   let budgetReportedAt = 0;
   const revoked = () => Date.now() < revokedUntil;
 
-  const pipeline = new MonitorPipeline({ level: () => (!revoked() && Date.now() >= pausedUntil ? level : null), budget });
+  const pipeline = new MonitorPipeline({
+    level: () => (!revoked() && Date.now() >= pausedUntil ? level : null),
+    budget,
+    javascriptApp: options.proxiesOtherStacks !== true,
+  });
 
   const refreshConfig = async () => {
     configInFlight = true;
@@ -317,11 +351,11 @@ function start(options: AppMonitorOptions): AppMonitor {
 
   const flush = (force = false): Promise<void> => {
     if (flushing) return flushing;
-    if (!pipeline.pending.length) return Promise.resolve();
+    if (!pipeline.pending.length && !(force && pipeline.rollingUp)) return Promise.resolve();
     const now = Date.now();
     if (!force && (now - lastFlush < flushEvery || now < nextSendAt)) return Promise.resolve();
     lastFlush = now;
-    flushing = pipeline.flush(send).catch(() => {}).finally(() => { flushing = null; });
+    flushing = pipeline.flush(send, { force }).catch(() => {}).finally(() => { flushing = null; });
     return flushing;
   };
 
@@ -365,14 +399,23 @@ function start(options: AppMonitorOptions): AppMonitor {
     request(info) {
       try {
         if (!info || typeof info.url !== "string") return;
-        const text = (v: unknown, max: number) => (v === null || v === undefined ? undefined : String(v).slice(0, max));
+        const text = (v: unknown, max: number) => (v === null || v === undefined || v === "" ? undefined : String(v).slice(0, max));
+        const count = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined);
+        const header = headerReader(info.headers);
+        const country = text(info.country ?? header("x-vercel-ip-country") ?? header("cf-ipcountry") ?? header("cloudfront-viewer-country"), 2);
         // Same JSON shape as an access-log line, so the rules see method, path+query, client and agent.
+        // The referrer isn't included: it's the page the visitor came from, usually this app's own.
         ingest(JSON.stringify({
           method: String(info.method || "GET").toUpperCase().slice(0, 16),
           path: info.url.slice(0, 8192),
-          httpStatus: typeof info.status === "number" ? info.status : undefined,
+          httpStatus: count(info.status),
           srcIp: text(info.ip, 64),
-          clientUa: text(info.userAgent, 512),
+          clientUa: text(info.userAgent ?? header("user-agent"), 512),
+          host: text(header("host"), 200),
+          responseBytes: count(info.bytes),
+          durationMs: count(info.durationMs),
+          country: country && /^[A-Za-z]{2}$/.test(country) ? country.toUpperCase() : undefined,
+          asn: count(info.asn),
         }), "requests");
       } catch {
         /* never let monitoring affect the app */

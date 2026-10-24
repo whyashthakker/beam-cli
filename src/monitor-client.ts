@@ -4,6 +4,7 @@
 import { readIdentity, type Identity } from "./enroll.js";
 import { getDashboardUrl } from "./config.js";
 import type { InstalledPackage } from "./lockfiles.js";
+import type { RequestMeta, RequestOutcome } from "./monitor-rules.js";
 
 /** What the App monitoring API needs: where to send, and the secret to send with. */
 export type MonitorAuth = Pick<Identity, "apiBase" | "deviceSecret">;
@@ -38,6 +39,28 @@ export interface MonitorFinding {
   source: "log" | "http" | "cve"; file?: string; evidence: string; count: number; firstSeen: string;
   /** Verdict from the user's own LLM (BEAM_LLM_*), when one is configured on this machine. */
   llm?: { verdict: "malicious" | "suspicious" | "benign" | "declined" | "error"; reason: string; model: string };
+  /** The flagged request (traffic findings): client, agent, path, response status and what became of it. Redacted. */
+  request?: RequestMeta & { ip?: string; outcome: RequestOutcome };
+  /** Set on a roll-up: many requests that matched a rule but couldn't have worked, sent as one finding. */
+  rollup?: MonitorRollup;
+}
+/**
+ * Requests that matched one rule but were refused (3xx/4xx) or aimed at software the app doesn't
+ * run, over a few minutes. Sent as one low-severity finding instead of one per address, so a
+ * botnet's scan shows up as one campaign and doesn't spend the month's allowance or page anyone.
+ */
+export interface MonitorRollup {
+  outcome: "blocked" | "not_applicable";
+  requests: number;
+  /** Distinct client addresses (counted up to 10,000). */
+  addresses: number;
+  from: string; to: string;
+  statuses: Record<string, number>;
+  /** The busiest addresses, with what each sent last. */
+  clients: { ip: string; count: number; status?: number; path?: string; userAgent?: string; country?: string; asn?: number }[];
+  paths: { path: string; count: number }[];
+  userAgents: { userAgent: string; count: number }[];
+  countries: { country: string; count: number }[];
 }
 export interface Vulnerability {
   id: string; slug: string; url: string; title: string; severity: string; kev: boolean; epss: number | null;

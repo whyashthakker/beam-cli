@@ -222,6 +222,80 @@ export function isLlmRequest(line: string): boolean {
   return method === "POST" && Boolean(path && LLM_PATH.test(path.split("?")[0]!));
 }
 
+/**
+ * What an access-log line says about the request and its response, for the finding (and the
+ * dashboard's attack analytics). Every field is optional: log formats differ, and a request seen
+ * by the SDK in middleware has no response yet.
+ */
+export interface RequestMeta {
+  method?: string; path?: string; host?: string; status?: number; bytes?: number; durationMs?: number;
+  userAgent?: string; referer?: string; country?: string; asn?: number;
+}
+// nginx/Apache combined: "GET /x HTTP/1.1" 404 512 "referer" "agent"
+const COMBINED = /"([A-Z]+) (\S+) HTTP\/[\d.]+" (\d{3}) (\d+|-)(?: "([^"]*)" "([^"]*)")?/;
+const jsonField = (names: string, number = false) =>
+  new RegExp(`"(?:${names})"\\s*:\\s*${number ? String.raw`"?(\d{1,12}(?:\.\d+)?)` : String.raw`"((?:[^"\\]|\\.){0,2000})"`}`);
+const J_HOST = jsonField("host|hostname|http_host|domain|requestHost");
+const J_UA = jsonField("clientUa|userAgent|user_agent|http_user_agent|ua|requestUserAgent");
+const J_REFERER = jsonField("referer|referrer|http_referer");
+const J_COUNTRY = jsonField("country|geo_country|cf_ipcountry|clientCountry|ipCountry|countryCode");
+const J_STATUS = jsonField("status|httpStatus|status_code|statusCode|response_status|responseStatusCode", true);
+const J_BYTES = jsonField("bytes|body_bytes_sent|bytes_sent|responseBytes|response_size|responseSize", true);
+const J_DURATION = jsonField("durationMs|duration_ms|responseTimeMs|response_time_ms|latencyMs", true);
+const J_ASN = jsonField("asn|as_number|clientAsn|asNumber", true);
+const unescape = (s: string | undefined) => (s === undefined ? undefined : s.replace(/\\(["\\/])/g, "$1"));
+const num = (s: string | undefined, max: number) => {
+  const n = s === undefined ? NaN : Number(s);
+  return Number.isFinite(n) && n >= 0 && n <= max ? n : undefined;
+};
+
+/** Method, path, status, size, client agent and so on, from a combined-format or JSON access-log line. */
+export function requestMeta(line: string): RequestMeta {
+  const text = line.length > 16_384 ? line.slice(0, 16_384) : line;
+  const c = text.match(COMBINED);
+  const request = c ? null : text.match(REQUEST_LINE);
+  const status = num(c?.[3] ?? text.match(J_STATUS)?.[1], 599);
+  const country = unescape(text.match(J_COUNTRY)?.[1])?.toUpperCase();
+  const meta: RequestMeta = {
+    method: c?.[1] ?? request?.[1] ?? text.match(JSON_METHOD)?.[1],
+    path: c?.[2] ?? request?.[2] ?? unescape(text.match(JSON_PATH)?.[1]),
+    host: unescape(text.match(J_HOST)?.[1]),
+    status: status !== undefined && status >= 100 ? Math.floor(status) : undefined,
+    bytes: num(c?.[4] === "-" ? undefined : (c?.[4] ?? text.match(J_BYTES)?.[1]), 1e12),
+    durationMs: num(text.match(J_DURATION)?.[1], 3_600_000),
+    userAgent: c?.[6] ?? unescape(text.match(J_UA)?.[1]),
+    referer: c?.[5] && c[5] !== "-" ? c[5] : unescape(text.match(J_REFERER)?.[1]),
+    country: country && /^[A-Z]{2}$/.test(country) ? country : undefined,
+    asn: num(text.match(J_ASN)?.[1], 4_294_967_295),
+  };
+  for (const key of Object.keys(meta) as (keyof RequestMeta)[]) if (meta[key] === undefined || meta[key] === "") delete meta[key];
+  return meta;
+}
+
+/**
+ * What became of a flagged request.
+ * - served: 2xx, the app answered it (the payload may have worked; needs a look)
+ * - blocked: 3xx or 4xx, refused, not found or sent elsewhere
+ * - failed: 5xx, the app errored (sometimes a sign the payload reached the code)
+ * - not_applicable: no response yet, but it targets software this app doesn't run (PHP or
+ *   WordPress against a JavaScript app), so it can't work here
+ * - unknown: no status to go on
+ */
+export type RequestOutcome = "served" | "blocked" | "failed" | "not_applicable" | "unknown";
+// Paths only a PHP, ASP, Java or CGI server answers. A Node, Bun or edge app answers them only
+// when it proxies or rewrites to one, which the SDK's `proxiesOtherStacks` option says.
+const OTHER_STACK = /(?:\.(?:php\d?|phtml|aspx?|ashx|asmx|jsp|jspx|do|action|cgi|pl)(?=[/?#;]|$)|\/(?:wordpress|wp-(?:admin|content|includes|json)|cgi-bin|phpmyadmin|xmlrpc)(?=[/?#]|$))/i;
+export function requestOutcome(meta: RequestMeta, options: { javascriptApp?: boolean } = {}): RequestOutcome {
+  const status = meta.status;
+  if (status !== undefined) {
+    if (status >= 500) return "failed";
+    if (status >= 300) return "blocked";
+    if (status >= 200) return "served";
+  }
+  if (options.javascriptApp && meta.path && OTHER_STACK.test(meta.path.split("?")[0]!)) return "not_applicable";
+  return "unknown";
+}
+
 /** A failed sign-in: a 401/403 on an auth path in an access log, or an app's own "login failed" line. */
 export function isAuthFailure(line: string, source: LineSource): boolean {
   if (source === "prompt" || source === "output") return false; // a chat message saying "login failed" isn't one

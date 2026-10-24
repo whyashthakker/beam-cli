@@ -291,7 +291,7 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
         const outcome = await send(batch);
         retry = outcome === "retry";
         return outcome;
-      });
+      }, { force });
     } finally {
       flushing = false;
       if (retry) nextSendAt = Date.now() + backoff(++sendFailures);

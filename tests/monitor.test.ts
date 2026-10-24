@@ -3,8 +3,9 @@ import { appendFile, mkdir, mkdtemp, rename, rm, truncate, writeFile } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
-import { decodeForMatch, lineSource, matchLine, redactLine } from "../src/monitor-rules.js";
+import { decodeForMatch, lineSource, matchLine, redactLine, requestMeta, requestOutcome } from "../src/monitor-rules.js";
 import { BRUTE_FORCE_THRESHOLD, FileTailer, MAX_NEW_FINDINGS_PER_10_MIN, MonitorPipeline, runMonitor, vulnerabilityFinding, type SendOutcome } from "../src/monitor.js";
+import { ROLLUP_EVERY_MS } from "../src/monitor-pipeline.js";
 import type { MonitorFinding, MonitorLevel } from "../src/monitor-client.js";
 
 const ids = (line: string) => matchLine(line).map(r => r.id);
@@ -53,6 +54,26 @@ describe("monitor rules", () => {
     expect(out).not.toContain("eyJhbGciOi");
     expect(out).not.toContain("AKIAABCDEFGHIJKLMNOP");
     expect(redactLine("card 4111", [{ name: "card", pattern: "\\d{4}", replacement: "[CARD]" }])).toBe("card [CARD]");
+  });
+  it("reads the request and response from combined and JSON access logs", () => {
+    expect(requestMeta(`${access("/x?a=1", "203.0.113.9", 404, "sqlmap/1.8")}`)).toEqual({
+      method: "GET", path: "/x?a=1", status: 404, bytes: 512, userAgent: "sqlmap/1.8",
+    });
+    expect(requestMeta('{"method":"POST","path":"/api","httpStatus":403,"host":"app.example","clientUa":"curl/8","country":"de","asn":13335,"responseBytes":12,"durationMs":4}'))
+      .toEqual({ method: "POST", path: "/api", status: 403, host: "app.example", userAgent: "curl/8", country: "DE", asn: 13335, bytes: 12, durationMs: 4 });
+    expect(requestMeta('{"method":"GET","path":"/","status":"ok"}')).toEqual({ method: "GET", path: "/" });
+  });
+  it("works out what became of a request", () => {
+    expect(requestOutcome({ status: 200 })).toBe("served");
+    expect(requestOutcome({ status: 301 })).toBe("blocked");
+    expect(requestOutcome({ status: 404 })).toBe("blocked");
+    expect(requestOutcome({ status: 502 })).toBe("failed");
+    expect(requestOutcome({ path: "/wordpress/?p=1" })).toBe("unknown");
+    expect(requestOutcome({ path: "/wordpress/?p=1" }, { javascriptApp: true })).toBe("not_applicable");
+    expect(requestOutcome({ path: "/xmlrpc.php" }, { javascriptApp: true })).toBe("not_applicable");
+    expect(requestOutcome({ path: "/blog/wordpress-vs-ghost" }, { javascriptApp: true })).toBe("unknown");
+    expect(requestOutcome({ path: "/api/run?x=a.php" }, { javascriptApp: true })).toBe("unknown");
+    expect(requestOutcome({ path: "/wp-admin/", status: 200 }, { javascriptApp: true })).toBe("served");
   });
 });
 
@@ -121,6 +142,61 @@ describe("monitor pipeline", () => {
     await p.flush(send);
     expect(p.pending).toHaveLength(0);
     expect(send).toHaveBeenCalledTimes(2);
+  });
+  it("sends the request behind a traffic finding: client, agent, path, status and outcome", () => {
+    const p = make();
+    p.ingestLine(access("/item?id=1%20UNION%20SELECT%201", "203.0.113.9", 200, "curl/8.4"));
+    expect(p.pending[0]!.request).toEqual({
+      outcome: "served", ip: "203.0.113.9", method: "GET", path: "/item?id=1%20UNION%20SELECT%201", status: 200, bytes: 512, userAgent: "curl/8.4",
+    });
+    p.ingestLine(access("/item?id=2%20UNION%20SELECT%202", "198.51.100.3", 500));
+    expect(p.pending[1]).toMatchObject({ severity: "high", request: { outcome: "failed", status: 500 } });
+  });
+  it("rolls up attacks the app refused into one low-severity finding per rule, whatever the level", async () => {
+    level = "light";
+    const p = make();
+    // A distributed WordPress scan: one payload, many addresses, every one answered 404.
+    const payload = "/wordpress/?page_id=6&pagename=sections%252f%252e%252e%252f%252e%252e%252fwp-links-opml";
+    for (let i = 0; i < 300; i++) p.ingestLine(access(payload, `10.2.${Math.floor(i / 200)}.${i % 200}`, 404, i % 2 ? "Mozilla/5.0 Chrome/126" : "Mozilla/5.0 Safari/605"));
+    p.ingestLine(access(payload, "10.2.0.0", 404));
+    expect(p.pending).toHaveLength(0);
+    expect(p.rollingUp).toBe(1);
+    now += ROLLUP_EVERY_MS;
+    const sent: MonitorFinding[] = [];
+    await p.flush(async batch => { sent.push(...batch); return "sent"; });
+    expect(sent).toHaveLength(1);
+    const [f] = sent;
+    expect(f).toMatchObject({ ruleId: "web.path_traversal", severity: "low", count: 301, title: "Path traversal attempt, refused by the app" });
+    expect(f!.rollup).toMatchObject({ outcome: "blocked", requests: 301, addresses: 300, statuses: { 404: 301 } });
+    expect(f!.rollup!.clients[0]).toMatchObject({ ip: "10.2.0.0", count: 2, status: 404 });
+    expect(f!.rollup!.paths).toEqual([{ path: payload, count: 301 }]);
+    expect(f!.rollup!.userAgents.map(u => u.count)).toEqual([150, 150, 1]);
+    expect(f!.evidence).toMatch(/^301 requests from 300 addresses, answered 301 × 404\./);
+  });
+  it("sends a roll-up early on a forced flush, and keeps capturing nothing while off", async () => {
+    const p = make();
+    p.ingestLine(access("/../../etc/passwd", "192.0.2.8", 403));
+    const sent: MonitorFinding[] = [];
+    await p.flush(async batch => { sent.push(...batch); return "sent"; });
+    expect(sent).toHaveLength(0);
+    await p.flush(async batch => { sent.push(...batch); return "sent"; }, { force: true });
+    expect(sent.map(f => f.rollup?.outcome)).toEqual(["blocked"]);
+    level = null;
+    p.ingestLine(access("/../../etc/passwd", "192.0.2.8", 403));
+    expect(p.rollingUp).toBe(0);
+  });
+  it("in a JavaScript app, rolls up attacks on PHP and WordPress paths even without a status", () => {
+    const js = new MonitorPipeline({ level: () => level, now: () => now, javascriptApp: true });
+    const line = (path: string) => JSON.stringify({ method: "GET", path, srcIp: "203.0.113.4", clientUa: "Mozilla/5.0" });
+    js.ingestLine(line("/wp-admin/admin-ajax.php?file=../../../wp-config.php"));
+    js.ingestLine(line("/api/files?name=../../../etc/passwd"));
+    expect(js.rollingUp).toBe(2); // traversal, and the wp-config.php probe
+    expect(js.pending.map(f => [f.ruleId, f.request?.outcome])).toEqual([["web.path_traversal", "unknown"]]);
+    // beam monitor reads logs from any stack, so there a PHP path is just a path.
+    const any = make();
+    any.ingestLine(line("/wp-admin/admin-ajax.php?file=../../../wp-config.php"));
+    expect(any.rollingUp).toBe(0);
+    expect(any.pending).toHaveLength(1);
   });
   it("turns dependency vulnerabilities into stable findings, KEV as critical", () => {
     const v = { id: "CVE-2026-1", slug: "cve-2026-1", url: "https://agentbeam.com/cve/cve-2026-1", title: "Bug", severity: "medium", kev: true, epss: null,
