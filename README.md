@@ -2,6 +2,8 @@
 
 AgentBeam is a local security layer for AI agents. `beam` is the AgentBeam CLI. It installs hooks for the agents detected on your machine, captures agent and MCP activity, applies your AgentBeam policy locally, and sends approved telemetry to the AgentBeam dashboard.
 
+**Full documentation, guides and cookbooks: [docs.agentbeam.com](https://docs.agentbeam.com).** This README is a quick reference; the docs explain each feature in depth, and every page there can be handed to your coding agent.
+
 ## WipeBench: coding agent safety benchmark
 
 [WipeBench](https://github.com/whyashthakker/WipeBench) gives coding agents an
@@ -229,6 +231,24 @@ export function middleware(request: NextRequest, event: NextFetchEvent) {
 For Express, report after the response so Beam knows what became of each request: `app.use((req, res, next) => { res.on("finish", () => beam.request({ method: req.method, url: req.originalUrl, ip: req.ip, userAgent: req.get("user-agent"), status: res.statusCode })); next(); })`. `beam.log(line)` checks application log lines too.
 
 **Only what might have worked is raised.** With a response status (from the SDK's `status`, or the access logs `beam monitor` reads), an attack the app refused (3xx or 4xx) is folded into one low-severity roll-up per rule every few minutes: never alerted on, not counted against the monthly allowance, and shown in the dashboard's attack analytics. Middleware runs before the response, so there the SDK also rolls up attacks on software a JavaScript app can't run, like WordPress, PHP or Java paths; set `proxiesOtherStacks: true` if the app proxies such paths to another server.
+
+**Signs an attack is underway.** ([details](https://docs.agentbeam.com/agent-cli/app-monitoring#signs-an-attack-is-underway)) Besides single requests, Beam watches for patterns, with thresholds that follow the level:
+
+| Signal | What it means | From |
+| --- | --- | --- |
+| Scan found a live path | An address with a run of 4xx answers gets a 2xx on a real page | Access logs, `request()` with `status` |
+| Server errors jumped | 5xx on one route far above its usual rate | Access logs, `request()` with `status` |
+| Address walking the app | One address requests 100+ different paths in a minute | Access logs, `request()` |
+| Sign-in after failures | A sign-in succeeds right after a run of failures (same address or user) | Access logs, log lines, `event()` |
+| Admin granted, new API key | A role or admin grant, or a new key or token | Log lines, writes to role and key endpoints, `event()` |
+| Unusual LLM spend | One user's tokens in an hour past a budget (`tokensPerUserHour`) | Logged usage fields, `usage()` |
+| First call to a new host | The app calls a host it never has; the workspace learns the usual ones for a day first | `watchOutbound: true`, `outbound()` |
+
+```ts
+beam.event("login.failed", { user: user.id, ip });       // and "login.succeeded", "admin.granted", "apikey.created"
+beam.usage({ user: user.id, tokens: res.usage.total_tokens, model });
+const beam = createAppMonitor({ watchOutbound: true });  // notes the host of each fetch(); never the URL or body
+```
 
 **LLM features (prompt injection and friends).** If the app sends text to a model, check it on the way in and out with the same `beam` instance. Both calls run locally in microseconds and return what they found, so the app decides what to do. Beam itself still never blocks anything.
 

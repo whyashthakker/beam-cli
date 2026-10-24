@@ -3,7 +3,11 @@
 // built-ins, so it also runs in edge runtimes (Next.js middleware).
 import type { MonitorFinding, MonitorLevel, MonitorRollup, MonitorSeverity } from "./monitor-client.js";
 import type { CustomDetector } from "./data-detectors.js";
-import { clientIp, isAuthFailure, isLlmRequest, lineSource, matchLine, redactLine, requestMeta, requestOutcome, type LineSource, type MonitorRule } from "./monitor-rules.js";
+import {
+  clientIp, isAuthFailure, isAuthSuccess, isLlmRequest, lineSource, logUser, matchLine, privilegeChange, quickRequest, redactLine, requestMeta,
+  requestOutcome, routeKey, tokenUsage, type LineSource, type MonitorRule,
+} from "./monitor-rules.js";
+import { DistinctPerMinute, MinuteSeries, SIGNAL_THRESHOLDS, meaningfulPath, outboundHost } from "./monitor-signals.js";
 
 /** A short, stable fingerprint (two seeded 53-bit hashes); not cryptographic, only used for dedupe ids. */
 export function fingerprint(text: string): string {
@@ -97,6 +101,8 @@ export interface PipelineOptions {
   cpuBudgetMsPerMinute?: number;
   /** Or a budget shared with other work (the SDK's prompt and output checks). */
   budget?: CpuBudget;
+  /** LLM tokens one user may use in an hour before it's raised. Default: SIGNAL_THRESHOLDS.tokensPerHour for the level. */
+  tokensPerUserHour?: number;
   /**
    * The app is JavaScript (the SDK): a request for a PHP, WordPress, ASP or Java path can't reach
    * code that would run it, so it's rolled up like a refused one even without a response status.
@@ -150,6 +156,16 @@ export class WindowCounter {
     for (let i = 0; i < this.windowMinutes; i++) if (minute - entry.minutes[i]! < this.windowMinutes) total += entry.counts[i]!;
     return total;
   }
+  /** The count over the window, without recording anything. */
+  peek(key: string, now: number): number {
+    const entry = this.keys.get(key);
+    if (!entry) return 0;
+    const minute = Math.floor(now / 60_000);
+    let total = 0;
+    for (let i = 0; i < this.windowMinutes; i++) if (minute - entry.minutes[i]! < this.windowMinutes) total += entry.counts[i]!;
+    return total;
+  }
+  clear(key: string): void { this.keys.delete(key); }
   /** Drops keys with nothing in the window. */
   prune(now: number): void {
     const minute = Math.floor(now / 60_000);
@@ -167,6 +183,14 @@ export class MonitorPipeline {
   private floodCount = 0;
   private suppressed: { count: number; severity: MonitorSeverity } | null = null;
   private rollups = new Map<string, OpenRollup>();
+  // Attack-in-progress signals (monitor-signals.ts).
+  private misses = new MinuteSeries(10, 5000);
+  private errors = new MinuteSeries(35, 1000);
+  private walks = new DistinctPerMinute(SIGNAL_THRESHOLDS.pathWalk.light, 2000);
+  private loginFailures = new WindowCounter(15, 10_000);
+  private tokens = new MinuteSeries(60, 5000);
+  private knownHosts = new Set<string>();
+  private reportedHosts = new Set<string>();
   private maintainedMinute = -1;
   readonly budget: CpuBudget | null;
 
@@ -181,8 +205,12 @@ export class MonitorPipeline {
   get rollingUp(): number { return this.rollups.size; }
 
   /** Sizes of everything the pipeline keeps, for tests and diagnostics: all of them are bounded. */
-  get footprint(): { seen: number; queue: number; queued: number; authFailures: number; llmCalls: number; rollups: number } {
-    return { seen: this.seen.size, queue: this.queue.length, queued: this.queued.size, authFailures: this.authFailures.size, llmCalls: this.llmCalls.size, rollups: this.rollups.size };
+  get footprint(): Record<"seen" | "queue" | "queued" | "authFailures" | "llmCalls" | "rollups" | "misses" | "errors" | "walks" | "loginFailures" | "tokens" | "hosts", number> {
+    return {
+      seen: this.seen.size, queue: this.queue.length, queued: this.queued.size, authFailures: this.authFailures.size, llmCalls: this.llmCalls.size,
+      rollups: this.rollups.size, misses: this.misses.size, errors: this.errors.size, walks: this.walks.size, loginFailures: this.loginFailures.size,
+      tokens: this.tokens.size, hosts: this.knownHosts.size + this.reportedHosts.size,
+    };
   }
 
   /** Once a minute: forget dedupe entries and counters that can no longer matter. */
@@ -194,6 +222,11 @@ export class MonitorPipeline {
     for (const [fp, entry] of this.seen) if (entry.at < cutoff) this.seen.delete(fp);
     this.authFailures.prune(now);
     this.llmCalls.prune(now);
+    this.misses.prune(now);
+    this.errors.prune(now);
+    this.walks.prune(now);
+    this.loginFailures.prune(now);
+    this.tokens.prune(now);
     if (this.queued.size > 5000) this.queued.clear(); // dependency ids; a repeat is deduped by the server too
     this.emitRollups(now, false);
   }
@@ -264,7 +297,171 @@ export class MonitorPipeline {
         raised.push("llm.denial_of_wallet");
       }
     }
+    if (source === "http" || source === "log") raised.push(...this.signals(line, source, wire, file, ip, request, level, custom, excerpt));
     return raised;
+  }
+
+  /** The attack-in-progress signals for one traffic or log line. Returns the rule ids raised. */
+  private signals(
+    line: string, source: LineSource, wire: "http" | "log", file: string | undefined, ip: string | undefined,
+    request: FindingRequest | undefined, level: MonitorLevel, custom: CustomDetector[], excerpt: string,
+  ): string[] {
+    const now = this.now();
+    const out: string[] = [];
+    const high = meetsLevel("high", level);
+    const base = { source: wire, file, ...(request ? { request } : {}) } as const;
+    if (source === "http" && request) {
+      const path = request.path ?? quickRequest(line).path;
+      const status = request.status;
+      // A scan finding something: an address with a run of 4xx gets a 2xx on a real page.
+      if (ip && status !== undefined) {
+        if (status >= 400 && status < 500) this.misses.add(ip, now);
+        else if (status >= 200 && status < 300 && path && meaningfulPath(path)) {
+          const misses = this.misses.sum(ip, now, 0, 9);
+          if (high && misses >= SIGNAL_THRESHOLDS.probeMisses[level]) {
+            const route = routeKey(redactLine(path, custom));
+            this.raise(level, ip, {
+              ruleId: "signal.probe_hit", title: `Scan from ${ip} found a live path`, severity: "high", category: "activity", ...base,
+              evidence: `${ip} got ${misses} 4xx answers in 10 minutes, then ${status} on ${route}. Latest: ${excerpt}`.slice(0, 600),
+            });
+            out.push("signal.probe_hit");
+          }
+        }
+      }
+      // A jump in server errors on one route, against its own last half hour.
+      if (status !== undefined && status >= 500 && path) {
+        const route = routeKey(redactLine(path, custom));
+        this.errors.add(route, now);
+        const recent = this.errors.sum(route, now, 0, 4);
+        const usual = this.errors.sum(route, now, 5, 34) / 6;
+        if (high && recent >= SIGNAL_THRESHOLDS.errorSpike[level] && recent >= 5 * Math.max(1, usual)) {
+          this.raise(level, route, {
+            ruleId: "signal.error_spike", title: `Server errors jumped on ${route}`, severity: "high", category: "activity", ...base,
+            evidence: `${recent} 5xx answers on ${route} in 5 minutes, against about ${Math.round(usual)} per 5 minutes before. Latest: ${excerpt}`.slice(0, 600),
+          });
+          out.push("signal.error_spike");
+        }
+      }
+      // One address walking the app: many distinct paths in a minute.
+      if (ip && path) {
+        const distinct = this.walks.add(ip, path.split(/[?#]/)[0]!, now);
+        if (high && distinct >= SIGNAL_THRESHOLDS.pathWalk[level]) {
+          this.raise(level, ip, {
+            ruleId: "signal.path_walk", title: `${ip} is walking the app's paths`, severity: "high", category: "activity", ...base,
+            evidence: `${distinct}+ different paths from ${ip} within a minute: a scanner or scraper mapping the app. Latest: ${excerpt}`.slice(0, 600),
+          });
+          out.push("signal.path_walk");
+        }
+      }
+    }
+    // A sign-in that succeeds right after a run of failures, by address or by user.
+    const who = [source === "http" ? ip : clientIp(line), logUser(line)];
+    const keys = [who[0] ? `ip:${who[0]}` : null, who[1] ? `user:${who[1]}` : null].filter((k): k is string => Boolean(k));
+    if (keys.length && isAuthFailure(line, source)) for (const key of keys) this.loginFailures.add(key, now);
+    else if (keys.length && isAuthSuccess(line, source)) out.push(...this.loginSucceeded(level, keys, who[0], wire, file, request, excerpt));
+    // A role or permission granted, or a new API key.
+    const change = privilegeChange(line, source);
+    if (change) out.push(...this.privilegeChanged(level, change, ip ?? normalizeForGrouping(line), wire, file, request, excerpt));
+    // LLM token usage the app logs, per user.
+    const usage = source === "log" ? tokenUsage(line) : null;
+    if (usage) out.push(...this.noteTokens(level, usage.user ?? who[0] ?? "unknown", usage.tokens, wire, file, excerpt, custom));
+    return out;
+  }
+
+  private loginSucceeded(
+    level: MonitorLevel, keys: string[], ip: string | undefined, wire: "http" | "log", file: string | undefined,
+    request: FindingRequest | undefined, excerpt: string,
+  ): string[] {
+    const now = this.now();
+    const failures = Math.max(...keys.map(k => this.loginFailures.peek(k, now)));
+    for (const key of keys) this.loginFailures.clear(key);
+    if (failures < SIGNAL_THRESHOLDS.loginAfterFailures[level]) return [];
+    this.raise(level, keys[0]!, {
+      ruleId: "signal.login_after_failures", title: `Sign-in succeeded after ${failures} failed attempts${ip ? ` from ${ip}` : ""}`,
+      severity: "critical", category: "activity", source: wire, file, ...(request ? { request } : {}),
+      evidence: `${failures} failed sign-ins in 15 minutes, then a successful one: a guessed or stuffed password, possibly. Latest: ${excerpt}`.slice(0, 600),
+    });
+    return ["signal.login_after_failures"];
+  }
+
+  private privilegeChanged(
+    level: MonitorLevel, change: "admin" | "key", groupKey: string, wire: "http" | "log", file: string | undefined,
+    request: FindingRequest | undefined, excerpt: string,
+  ): string[] {
+    const severity: MonitorSeverity = change === "admin" ? "high" : "medium";
+    if (!meetsLevel(severity, level)) return [];
+    this.raise(level, `${change}\0${groupKey}`, {
+      ruleId: "signal.privilege_change", title: change === "admin" ? "Admin or role granted" : "New API key or access token created",
+      severity, category: "activity", source: wire, file, ...(request ? { request } : {}),
+      evidence: `${change === "admin" ? "Someone was given admin rights or a new role." : "A new API key or access token was created."} Latest: ${excerpt}`.slice(0, 600),
+    });
+    return ["signal.privilege_change"];
+  }
+
+  private noteTokens(level: MonitorLevel, user: string, tokens: number, wire: "http" | "log", file: string | undefined, excerpt: string, custom: CustomDetector[]): string[] {
+    const now = this.now();
+    this.tokens.add(user, now, tokens);
+    const total = this.tokens.sum(user, now, 0, 59);
+    const limit = this.opts.tokensPerUserHour ?? SIGNAL_THRESHOLDS.tokensPerHour[level];
+    if (!meetsLevel("high", level) || total < limit) return [];
+    const shown = redactLine(user, custom).slice(0, 80);
+    this.raise(level, user, {
+      ruleId: "llm.token_spend", title: `Unusual LLM spend: ${Math.round(total).toLocaleString("en-US")} tokens in an hour for ${shown}`,
+      severity: "high", category: "llm", source: wire, file,
+      evidence: `${Math.round(total).toLocaleString("en-US")} tokens in the last hour for ${shown} (limit ${limit.toLocaleString("en-US")}). Scripted use or a runaway loop runs up the bill. Latest: ${excerpt}`.slice(0, 600),
+    });
+    return ["llm.token_spend"];
+  }
+
+  /**
+   * Structured security events from the app (the SDK's event() and usage()), checked like the log
+   * lines that say the same thing.
+   */
+  event(type: "login.failed" | "login.succeeded" | "admin.granted" | "apikey.created", who: { ip?: string; user?: string }, detail = ""): string[] {
+    const level = this.opts.level();
+    if (!level) return [];
+    const run = () => {
+      this.maintain(this.now());
+      const custom = this.opts.customDetectors?.() ?? [];
+      const ip = who.ip ? redactLine(who.ip, custom).slice(0, 80) : undefined;
+      const keys = [who.ip ? `ip:${who.ip}` : null, who.user ? `user:${who.user}` : null].filter((k): k is string => Boolean(k));
+      const excerpt = redactLine(`${type}${ip ? ` ip=${ip}` : ""}${who.user ? ` user=${who.user}` : ""}${detail ? ` ${detail}` : ""}`, custom);
+      if (type === "login.failed") { for (const key of keys) this.loginFailures.add(key, this.now()); return []; }
+      if (type === "login.succeeded") return keys.length ? this.loginSucceeded(level, keys, ip, "log", "security events", undefined, excerpt) : [];
+      return this.privilegeChanged(level, type === "admin.granted" ? "admin" : "key", keys[1] ?? keys[0] ?? excerpt, "log", "security events", undefined, excerpt);
+    };
+    return (this.budget ? this.budget.run(run) : run()) ?? [];
+  }
+
+  /** LLM tokens used by one user (or address), as reported by the app. */
+  usage(user: string, tokens: number, detail = ""): string[] {
+    const level = this.opts.level();
+    if (!level || !(tokens > 0) || !user) return [];
+    this.maintain(this.now());
+    const custom = this.opts.customDetectors?.() ?? [];
+    return this.noteTokens(level, user, tokens, "log", "llm usage", redactLine(`${tokens} tokens user=${user}${detail ? ` ${detail}` : ""}`, custom), custom);
+  }
+
+  /** Hosts the workspace has already seen this app call (from its config), so only new ones are raised. */
+  setKnownOutboundHosts(hosts: string[]): void {
+    this.knownHosts = new Set(hosts.slice(0, 5000).map(h => outboundHost(h)).filter((h): h is string => Boolean(h)));
+  }
+
+  /** The app called this URL or host. Raises the first call to a host the workspace hasn't seen for this app. */
+  outbound(target: string): boolean {
+    const level = this.opts.level();
+    const host = outboundHost(target);
+    if (!level || !host || this.knownHosts.has(host) || this.reportedHosts.has(host)) return false;
+    if (this.reportedHosts.size >= 2000) return false;
+    this.reportedHosts.add(host);
+    if (!meetsLevel("high", level)) return false;
+    this.maintain(this.now());
+    this.raise(level, host, {
+      ruleId: "signal.new_outbound_host", title: `First call to ${host}`, severity: "high", category: "activity", source: "log", file: "outbound calls",
+      evidence: `The app called ${host}, a host it hasn't called before. New destinations are how stolen data and stolen compute leave a server.`,
+      request: { outcome: "unknown", host },
+    });
+    return true;
   }
 
   /** The request behind a traffic line, redacted like evidence, with what became of it. */

@@ -3,9 +3,10 @@ import { appendFile, mkdir, mkdtemp, rename, rm, truncate, writeFile } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
-import { decodeForMatch, lineSource, matchLine, redactLine, requestMeta, requestOutcome } from "../src/monitor-rules.js";
+import { decodeForMatch, lineSource, matchLine, redactLine, requestMeta, requestOutcome, tokenUsage } from "../src/monitor-rules.js";
 import { BRUTE_FORCE_THRESHOLD, FileTailer, MAX_NEW_FINDINGS_PER_10_MIN, MonitorPipeline, runMonitor, vulnerabilityFinding, type SendOutcome } from "../src/monitor.js";
 import { ROLLUP_EVERY_MS } from "../src/monitor-pipeline.js";
+import { SIGNAL_THRESHOLDS } from "../src/monitor-signals.js";
 import type { MonitorFinding, MonitorLevel } from "../src/monitor-client.js";
 
 const ids = (line: string) => matchLine(line).map(r => r.id);
@@ -207,6 +208,107 @@ describe("monitor pipeline", () => {
     const p = make();
     expect(p.addFinding(a)).toBe(true);
     expect(p.addFinding(a)).toBe(false);
+  });
+});
+
+describe("attack-in-progress signals", () => {
+  let now = Date.parse("2026-10-23T10:00:00Z");
+  let level: MonitorLevel | null = "standard";
+  const make = (extra: Partial<ConstructorParameters<typeof MonitorPipeline>[0]> = {}) => new MonitorPipeline({ level: () => level, now: () => now, ...extra });
+  const rules = (p: MonitorPipeline) => p.pending.map(f => f.ruleId);
+  const req = (method: string, path: string, status: number, ip = "198.51.100.7") => `${ip} - - [23/Oct/2026:10:00:00 +0000] "${method} ${path} HTTP/1.1" ${status} 12 "-" "curl/8"`;
+  beforeEach(() => { now = Date.parse("2026-10-23T10:00:00Z"); level = "standard"; });
+
+  it("raises a scan that finds a live path after a run of 404s, but not a static file or one stray 404", () => {
+    const p = make();
+    p.ingestLine(access("/missing", "192.0.2.1", 404));
+    p.ingestLine(access("/admin", "192.0.2.1", 200));
+    for (let i = 0; i < 30; i++) p.ingestLine(access(`/guess-${i}`, "198.51.100.7", 404));
+    p.ingestLine(access("/main.js", "198.51.100.7", 200));
+    expect(rules(p)).not.toContain("signal.probe_hit");
+    p.ingestLine(access("/backup-admin", "198.51.100.7", 200));
+    expect(p.pending.find(f => f.ruleId === "signal.probe_hit")).toMatchObject({ severity: "high", title: "Scan from 198.51.100.7 found a live path", category: "activity" });
+  });
+  it("raises a jump in 5xx on one route against its own usual rate", () => {
+    const p = make();
+    // A route that always errors a little, then twice as much: not a jump.
+    for (let m = 0; m < 30; m++) { now += 60_000; for (let i = 0; i < 3; i++) p.ingestLine(access(`/api/orders/${m}`, "192.0.2.9", 500)); }
+    for (let m = 0; m < 5; m++) { now += 60_000; for (let i = 0; i < 6; i++) p.ingestLine(access(`/api/orders/${m}`, "192.0.2.9", 500)); }
+    expect(rules(p)).not.toContain("signal.error_spike");
+    // Then a burst far above its usual rate.
+    for (let i = 0; i < 80; i++) p.ingestLine(access(`/api/orders/${1000 + i}`, "192.0.2.9", 502));
+    const spike = p.pending.find(f => f.ruleId === "signal.error_spike");
+    expect(spike).toMatchObject({ title: "Server errors jumped on /api/orders/:id", severity: "high" });
+    // A quiet route jumping from nothing counts as soon as it passes the threshold.
+    const fresh = make();
+    for (let i = 0; i < SIGNAL_THRESHOLDS.errorSpike.standard; i++) fresh.ingestLine(access("/api/pay", "192.0.2.9", 500));
+    expect(rules(fresh)).toContain("signal.error_spike");
+  });
+  it("raises one address walking many paths in a minute", () => {
+    const p = make();
+    for (let i = 0; i < SIGNAL_THRESHOLDS.pathWalk.standard - 1; i++) p.ingestLine(access(`/p/${i}`, "203.0.113.50", 404));
+    expect(rules(p)).not.toContain("signal.path_walk");
+    p.ingestLine(access("/p/last", "203.0.113.50", 404));
+    expect(p.pending.filter(f => f.ruleId === "signal.path_walk").map(f => f.title)).toEqual(["203.0.113.50 is walking the app's paths"]);
+  });
+  it("raises a sign-in that succeeds right after a run of failures, from traffic, log lines or events", () => {
+    const p = make();
+    for (let i = 0; i < 9; i++) p.ingestLine(req("POST", "/login", 401));
+    p.ingestLine(req("POST", "/login", 302));
+    expect(rules(p)).not.toContain("signal.login_after_failures"); // 9 < 10
+    for (let i = 0; i < 10; i++) p.ingestLine(req("POST", "/login", 401));
+    p.ingestLine(req("POST", "/login", 302));
+    expect(p.pending.find(f => f.ruleId === "signal.login_after_failures")).toMatchObject({ severity: "critical", title: "Sign-in succeeded after 10 failed attempts from 198.51.100.7" });
+    const logs = make();
+    for (let i = 0; i < 10; i++) logs.ingestLine(`2026-10-23 WARN login failed user=u_42 ip=203.0.113.77`);
+    logs.ingestLine(`2026-10-23 INFO login succeeded user=u_42 ip=10.9.9.9`);
+    expect(rules(logs)).toContain("signal.login_after_failures"); // same user, a different address
+    const events = make();
+    for (let i = 0; i < 10; i++) events.event("login.failed", { user: "u_7" });
+    events.event("login.succeeded", { user: "u_7", ip: "203.0.113.8" });
+    expect(rules(events)).toEqual(["signal.login_after_failures"]);
+  });
+  it("raises admin grants and new API keys from logs, traffic and events", () => {
+    const p = make();
+    p.ingestLine("2026-10-23 INFO audit: user 12 granted admin role to user 99");
+    p.ingestLine(req("POST", "/api/members/99/role", 200));
+    p.ingestLine(req("POST", "/admin/posts", 200));
+    expect(p.pending.filter(f => f.ruleId === "signal.privilege_change").map(f => f.title)).toEqual(["Admin or role granted", "Admin or role granted"]);
+    level = "strict";
+    const keys = make();
+    keys.ingestLine("2026-10-23 INFO API key created for workspace 3");
+    keys.event("apikey.created", { user: "u_1" });
+    expect(keys.pending.map(f => [f.title, f.severity])).toEqual([
+      ["New API key or access token created", "medium"],
+      ["New API key or access token created", "medium"],
+    ]);
+  });
+  it("raises a user's LLM spend past the hourly budget, from logs or usage()", () => {
+    const p = make({ tokensPerUserHour: 10_000 });
+    p.ingestLine('{"msg":"completion","user":"u_9","usage":{"prompt_tokens":3000,"completion_tokens":2000}}');
+    expect(rules(p)).toEqual([]);
+    p.usage("u_9", 6000);
+    expect(p.pending.map(f => [f.ruleId, f.title])).toEqual([["llm.token_spend", "Unusual LLM spend: 11,000 tokens in an hour for u_9"]]);
+    expect(tokenUsage('{"usage":{"total_tokens":420},"userId":"a"}')).toEqual({ tokens: 420, user: "a" });
+  });
+  it("raises the first call to an outbound host the workspace hasn't seen, once", () => {
+    const p = make();
+    p.setKnownOutboundHosts(["api.openai.com", "https://api.stripe.com/v1"]);
+    expect(p.outbound("https://api.openai.com/v1/chat")).toBe(false);
+    expect(p.outbound("https://api.stripe.com/v1/charges")).toBe(false);
+    expect(p.outbound("https://exfil.example.net:8443/upload?d=secret")).toBe(true);
+    expect(p.outbound("exfil.example.net")).toBe(false);
+    const [f] = p.pending;
+    expect(f).toMatchObject({ ruleId: "signal.new_outbound_host", title: "First call to exfil.example.net", request: { host: "exfil.example.net" } });
+    expect(JSON.stringify(f)).not.toContain("secret");
+  });
+  it("keeps every signal's memory bounded", () => {
+    const p = make();
+    for (let i = 0; i < 20_000; i++) p.ingestLine(access(`/x/${i}`, `10.${(i >> 16) & 255}.${(i >> 8) & 255}.${i & 255}`, i % 2 ? 404 : 500));
+    const f = p.footprint;
+    expect(f.misses).toBeLessThanOrEqual(5000);
+    expect(f.walks).toBeLessThanOrEqual(2000);
+    expect(f.errors).toBeLessThanOrEqual(1000);
   });
 });
 

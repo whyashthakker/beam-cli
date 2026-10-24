@@ -58,6 +58,23 @@ export interface AppMonitorOptions {
    * app doesn't run, instead of raised on its own, since a JavaScript app can't execute it.
    */
   proxiesOtherStacks?: boolean;
+  /**
+   * Note the host of every fetch() the app makes, so a first call to a new host is raised (after
+   * the workspace has learned the app's usual hosts for a day). Wraps globalThis.fetch once; only
+   * the hostname is kept, never the URL, headers or body. Calls made without fetch (Node's http
+   * module, some SDKs) can be reported with outbound(). Default false.
+   */
+  watchOutbound?: boolean;
+  /** LLM tokens one user may use in an hour before it's raised (usage()). Default: 500,000 on the standard level. */
+  tokensPerUserHour?: number;
+}
+
+/** Who a security event is about. The user is an opaque id, not an email. */
+export interface SecurityEventInfo {
+  ip?: string | null;
+  user?: string | null;
+  /** A short note shown with the finding, e.g. "role=admin by user 12". Redacted like evidence. */
+  detail?: string;
 }
 
 export interface RequestInfo {
@@ -120,6 +137,15 @@ export interface AppMonitor {
    * script, a leaked canary, and injected instructions passed along to the next agent.
    */
   output(text: string, info?: PromptInfo): TextCheck;
+  /**
+   * Report a security event: failed and successful sign-ins (a success right after a run of
+   * failures is raised as a possible account takeover), admin or role grants, and new API keys.
+   */
+  event(type: "login.failed" | "login.succeeded" | "admin.granted" | "apikey.created", info?: SecurityEventInfo): void;
+  /** Report LLM tokens used for one user, to catch runaway or scripted spend (tokensPerUserHour). */
+  usage(info: { tokens: number; user?: string | null; ip?: string | null; model?: string }): void;
+  /** Report an outbound call (a URL or host) the app made, when watchOutbound can't see it. */
+  outbound(target: string): void;
   /**
    * Send pending findings when the flush interval is due (or now, with `force`). Returns the
    * in-flight send, so `event.waitUntil(beam.flush())` keeps it alive past the response; cheap to
@@ -218,7 +244,7 @@ export function checkOutput(text: string, options: { canaries?: string[] } = {})
 
 // Without a token the checks still work locally; nothing is reported.
 const noop: AppMonitor = {
-  request() {}, log() {}, flush: async () => {}, enabled: false,
+  request() {}, log() {}, event() {}, usage() {}, outbound() {}, flush: async () => {}, enabled: false,
   prompt: text => checkPrompt(text),
   output: text => checkOutput(text),
 };
@@ -290,6 +316,7 @@ function start(options: AppMonitorOptions): AppMonitor {
     level: () => (!revoked() && Date.now() >= pausedUntil ? level : null),
     budget,
     javascriptApp: options.proxiesOtherStacks !== true,
+    tokensPerUserHour: typeof options.tokensPerUserHour === "number" && options.tokensPerUserHour > 0 ? options.tokensPerUserHour : undefined,
   });
 
   const refreshConfig = async () => {
@@ -297,9 +324,14 @@ function start(options: AppMonitorOptions): AppMonitor {
     const t = withTimeout(REQUEST_TIMEOUT_MS);
     try {
       const response = await fetch(`${base}/v1/monitor/config`, { headers, signal: t.signal });
-      const body = (await response.json().catch(() => ({}))) as { level?: MonitorLevel; error?: string; resetAt?: string };
+      const body = (await response.json().catch(() => ({}))) as { level?: MonitorLevel; error?: string; resetAt?: string; outbound?: { hosts?: unknown } };
       configFailures = response.status >= 500 ? configFailures + 1 : 0;
-      if (response.ok) { level = body.level ?? "standard"; revokedUntil = 0; }
+      if (response.ok) {
+        level = body.level ?? "standard";
+        revokedUntil = 0;
+        const hosts = body.outbound?.hosts;
+        if (Array.isArray(hosts)) pipeline.setKnownOutboundHosts(hosts.filter((h): h is string => typeof h === "string"));
+      }
       else if (response.status === 401) {
         if (!revoked()) report("AgentBeam App monitoring paused: this app token was rejected (rotated or removed). Checking again in 15 minutes.");
         revokedUntil = Date.now() + REVOKED_RECHECK_MS;
@@ -393,9 +425,53 @@ function start(options: AppMonitorOptions): AppMonitor {
     return result;
   };
 
+  // Each call goes through the same gate as request(): nothing is counted until the config says on.
+  const guarded = (work: () => void) => {
+    try {
+      ensureConfig();
+      if (!level || revoked()) return;
+      work();
+      if (Date.now() - lastFlush >= flushEvery) void flush();
+    } catch {
+      /* never let monitoring affect the app */
+    }
+  };
+  const short = (v: unknown, max: number) => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : undefined);
+  const outbound = (target: unknown) => {
+    const text = typeof target === "string" ? target : target instanceof URL ? target.href : (target as { url?: unknown } | null)?.url;
+    if (typeof text !== "string") return;
+    // Beam's own reports aren't the app's traffic.
+    if (text.startsWith(base) || text === url.host) return;
+    guarded(() => { pipeline.outbound(text.slice(0, 2048)); });
+  };
+  if (options.watchOutbound === true) {
+    const g = globalThis as { fetch: typeof fetch; __beamFetchWrapped?: boolean };
+    if (!g.__beamFetchWrapped) {
+      const original = g.fetch;
+      g.fetch = function beamWatchedFetch(input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) {
+        try { outbound(input); } catch { /* never in the way */ }
+        return original.call(globalThis, input, init);
+      } as typeof fetch;
+      g.__beamFetchWrapped = true;
+    }
+  }
+
   void refreshConfig();
   return {
     enabled: true,
+    event(type, info) {
+      if (!["login.failed", "login.succeeded", "admin.granted", "apikey.created"].includes(type)) return;
+      guarded(() => {
+        pipeline.event(type, { ip: short(info?.ip, 64), user: short(info?.user, 80) }, short(info?.detail, 200) ?? "");
+      });
+    },
+    usage(info) {
+      const tokens = Number(info?.tokens);
+      const who = short(info?.user, 80) ?? short(info?.ip, 64);
+      if (!(tokens > 0) || !who) return;
+      guarded(() => { pipeline.usage(who, Math.min(tokens, 1e9), short(info?.model, 80) ? `model=${short(info?.model, 80)}` : ""); });
+    },
+    outbound,
     request(info) {
       try {
         if (!info || typeof info.url !== "string") return;

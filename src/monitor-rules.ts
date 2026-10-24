@@ -302,3 +302,72 @@ export function isAuthFailure(line: string, source: LineSource): boolean {
   if (source === "http") return (/"\s(?:401|403)\s/.test(line) || /"(?:status|httpStatus|status_code|statusCode|response_status)"\s*:\s*"?(?:401|403)\b/.test(line)) && AUTH_PATH.test(line);
   return AUTH_FAIL_TEXT.test(line);
 }
+
+/** Method, path and status only: the few fields the attack-in-progress signals read on every request. */
+export function quickRequest(line: string): { method?: string; path?: string; status?: number } {
+  const text = line.length > 16_384 ? line.slice(0, 16_384) : line;
+  const request = text.match(REQUEST_LINE);
+  const status = text.match(ACCESS_STATUS);
+  const code = Number(status?.[1] ?? status?.[2]);
+  return {
+    method: request?.[1] ?? text.match(JSON_METHOD)?.[1],
+    path: request?.[2] ?? text.match(JSON_PATH)?.[1],
+    status: code >= 100 && code <= 599 ? code : undefined,
+  };
+}
+
+/** A path as a route: no query, and ids, numbers and hashes as ":id" ("/orders/8812?x=1" -> "/orders/:id"). */
+export function routeKey(path: string): string {
+  return (path.split(/[?#]/)[0] || "/")
+    .split("/")
+    .map(s => (/^\d+$|^[0-9a-f]{8,}$|^[0-9a-f]{8}-[0-9a-f-]{27}$|^(?=.*\d)[A-Za-z0-9_-]{16,}$/i.test(s) ? ":id" : s))
+    .join("/")
+    .slice(0, 200);
+}
+
+const AUTH_SUCCESS_TEXT = /\b(?:login|sign[- ]?in|authentication|auth)\s+(?:succeeded|successful|success|ok)\b|\b(?:successfully\s+)?(?:logged|signed)\s+in\b|\bsession\s+(?:created|started)\s+for\b/i;
+/** A successful sign-in: a POST to an auth path answered 2xx or 3xx, or an app's "login succeeded" line. */
+export function isAuthSuccess(line: string, source: LineSource): boolean {
+  if (source === "http") {
+    const r = quickRequest(line);
+    return r.method === "POST" && r.status !== undefined && r.status >= 200 && r.status < 400 && Boolean(r.path && AUTH_PATH.test(r.path.split("?")[0]!));
+  }
+  return source === "log" && AUTH_SUCCESS_TEXT.test(line) && !AUTH_FAIL_TEXT.test(line);
+}
+
+// Privilege changes. Text: an app's own audit lines. Traffic: a write, answered 2xx, to an
+// endpoint whose path names roles, permissions or keys.
+const ADMIN_TEXT = /\b(?:granted|assigned|added|promoted|elevated|made|set)\b[^.\n]{0,60}\b(?:admin(?:istrator)?|owner|superuser|super[- ]admin|root)\b(?:\s+(?:role|access|privileges?|permissions?))?|\b(?:role|is_?admin|is_?superuser|permission)s?\b["']?\s*[:=]\s*["']?(?:admin|owner|superuser|true)\b[^.\n]{0,40}\b(?:granted|assigned|changed|updated|set)\b/i;
+const KEY_TEXT = /\b(?:api[ _-]?key|access[ _-]?token|personal access token|service[ _-]account(?: key)?|secret key)\b[^.\n]{0,40}\b(?:created|generated|issued|added|minted)\b|\b(?:created|generated|issued|minted)\b[^.\n]{0,40}\b(?:api[ _-]?key|access[ _-]?token|personal access token|service[ _-]account key)\b/i;
+const ADMIN_PATH = /\/(?:roles?|permissions?|grants?|promote|make[-_]admin|admins|privileges?)(?:\/|$)/i;
+const KEY_PATH = /\/(?:api[-_]?keys?|keys|tokens|access[-_]tokens|personal[-_]access[-_]tokens|credentials|service[-_]accounts)(?:\/|$)/i;
+/** "admin" for a role or permission grant, "key" for a new API key or token, else null. */
+export function privilegeChange(line: string, source: LineSource): "admin" | "key" | null {
+  if (source === "http") {
+    const r = quickRequest(line);
+    if (!r.method || !["POST", "PUT", "PATCH"].includes(r.method) || r.status === undefined || r.status < 200 || r.status >= 300 || !r.path) return null;
+    const path = r.path.split("?")[0]!;
+    return ADMIN_PATH.test(path) ? "admin" : KEY_PATH.test(path) ? "key" : null;
+  }
+  if (source !== "log") return null;
+  return ADMIN_TEXT.test(line) ? "admin" : KEY_TEXT.test(line) ? "key" : null;
+}
+
+const TOKENS_TOTAL = /"(?:total_tokens|totalTokens|tokens_used|tokensUsed)"\s*:\s*(\d{1,9})/;
+const TOKENS_IN = /"(?:input_tokens|prompt_tokens|inputTokens|promptTokens)"\s*:\s*(\d{1,9})/;
+const TOKENS_OUT = /"(?:output_tokens|completion_tokens|outputTokens|completionTokens)"\s*:\s*(\d{1,9})/;
+const LOG_USER = /"(?:user|userId|user_id|uid|account|accountId|account_id)"\s*:\s*"([^"]{1,80})"|\b(?:user(?:_?id)?|uid|account(?:_?id)?)=([\w.@:-]{1,80})/i;
+/** LLM token usage logged by the app (OpenAI and Anthropic usage fields), with the user it's for. */
+export function tokenUsage(line: string): { tokens: number; user?: string } | null {
+  if (!line.includes("tokens") && !line.includes("Tokens")) return null;
+  const total = line.match(TOKENS_TOTAL)?.[1];
+  const tokens = total ? Number(total) : Number(line.match(TOKENS_IN)?.[1] ?? 0) + Number(line.match(TOKENS_OUT)?.[1] ?? 0);
+  if (!tokens) return null;
+  const user = line.match(LOG_USER);
+  return { tokens, user: user?.[1] ?? user?.[2] };
+}
+/** The user a log line is about (user=, "userId": ...), for keying sign-ins and spend. */
+export function logUser(line: string): string | undefined {
+  const m = line.match(LOG_USER);
+  return m?.[1] ?? m?.[2];
+}

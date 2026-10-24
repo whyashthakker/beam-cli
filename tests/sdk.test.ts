@@ -170,6 +170,35 @@ describe("your own LLM key, inside the app", () => {
   });
 });
 
+describe("security events, usage and outbound calls", () => {
+  it("raises a sign-in after failures, LLM overspend and a new outbound host, and watches fetch only when asked", async () => {
+    global.fetch = jest.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/monitor/config")) return Response.json({ enabled: true, level: "standard", outbound: { hosts: ["api.openai.com"] } });
+      if (url.startsWith("https://dash.test")) { posted.push({ url, auth: null, body: JSON.parse(String(init?.body)) }); return Response.json({ accepted: 1 }, { status: 202 }); }
+      return new Response("ok");
+    }) as typeof fetch;
+    const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test", watchOutbound: true, tokensPerUserHour: 1000 });
+    await tick();
+    for (let i = 0; i < 10; i++) monitor.event("login.failed", { user: "u_1", ip: "203.0.113.5" });
+    monitor.event("login.succeeded", { user: "u_1", ip: "203.0.113.5" });
+    monitor.usage({ user: "u_2", tokens: 1500, model: "gpt-5" });
+    await fetch("https://api.openai.com/v1/responses");
+    await fetch("https://collector.example.net/x?leak=1");
+    monitor.outbound("https://collector.example.net/again");
+    await monitor.flush({ force: true });
+    const sent = posted.flatMap(p => p.body.findings);
+    expect(sent.map(f => f.ruleId).sort()).toEqual(["llm.token_spend", "signal.login_after_failures", "signal.new_outbound_host"]);
+    expect(sent.find(f => f.ruleId === "signal.new_outbound_host")!.title).toBe("First call to collector.example.net");
+    expect(JSON.stringify(sent)).not.toContain("leak=1");
+  });
+  it("leaves fetch alone by default", () => {
+    const before = globalThis.fetch;
+    createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test" });
+    expect(globalThis.fetch).toBe(before);
+  });
+});
+
 describe("edge runtime safety", () => {
   it("the SDK's runtime imports use no Node.js built-ins or packages", () => {
     const seen = new Set<string>();
@@ -186,6 +215,6 @@ describe("edge runtime safety", () => {
     };
     walk(resolve("src/sdk.ts"));
     expect(bad).toEqual([]);
-    expect([...seen].map(f => f.split("/").pop()).sort()).toEqual(["monitor-llm.ts", "monitor-pipeline.ts", "monitor-rules.ts", "prompt-attacks.ts", "rule-catalog.ts", "sdk.ts"]);
+    expect([...seen].map(f => f.split("/").pop()).sort()).toEqual(["monitor-llm.ts", "monitor-pipeline.ts", "monitor-rules.ts", "monitor-signals.ts", "prompt-attacks.ts", "rule-catalog.ts", "sdk.ts"]);
   });
 });
