@@ -64,6 +64,7 @@
     "setup": "npm run build && node dist/cli.js setup",
     "setup:global": "bash scripts/setup-global.sh",
     "validate:skills": "node Skills/scripts/validate-skills.mjs",
+    "release:local": "bash scripts/release-local.sh",
     "stress": "npm run build && node --expose-gc scripts/stress-report.mjs"
   },
   "publishConfig": {
