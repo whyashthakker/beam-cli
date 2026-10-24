@@ -391,8 +391,9 @@ function start(options: AppMonitorOptions): AppMonitor {
   };
 
   const flush = (force = false): Promise<void> => {
-    // A forced flush waits for one in flight, then sends what that one left (roll-ups still collecting).
-    if (flushing) return force ? flushing.then(() => flush(true)) : flushing;
+    // A forced flush waits for one in flight, then sends what that one left (roll-ups still collecting),
+    // unless that send failed: the batch stays queued for after the backoff, not resent straight away.
+    if (flushing) return force ? flushing.then(() => (Date.now() < nextSendAt ? undefined : flush(true))) : flushing;
     if (!pipeline.pending.length && !(force && pipeline.rollingUp)) return Promise.resolve();
     const now = Date.now();
     if (!force && (now - lastFlush < flushEvery || now < nextSendAt)) return Promise.resolve();
