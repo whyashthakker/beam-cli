@@ -231,6 +231,30 @@ export function isLlmRequest(line: string): boolean {
 export interface RequestMeta {
   method?: string; path?: string; host?: string; status?: number; bytes?: number; durationMs?: number;
   userAgent?: string; referer?: string; country?: string; asn?: number;
+  /** The Web Bot Auth key directory the client named (Signature-Agent), e.g. "https://chatgpt.com". A claim until verified. */
+  signatureAgent?: string;
+  /** What else the client sent about itself (SDK only, beside the line); see ClientSignals. */
+  signals?: ClientSignals;
+}
+/**
+ * Hints about the client beyond its user agent, as the SDK reads them from headers and the CDN:
+ * which headers were present (never their values), whether the request carried an HTTP message
+ * signature, the MCP protocol version, and Cloudflare's bot verdict when the app runs behind it.
+ */
+export interface ClientSignals {
+  /** Signature and Signature-Input headers were both present (RFC 9421). */
+  signed?: boolean;
+  /** Accept-Language, Sec-Fetch-Mode and Sec-CH-UA were present. Real browsers send all three. */
+  acceptLanguage?: boolean; secFetch?: boolean; clientHints?: boolean;
+  /** The MCP-Protocol-Version header (or "unknown" when only Mcp-Session-Id was sent). */
+  mcp?: string;
+  /** Cloudflare Bot Management: verified bot, Web Bot Auth signed agent, score 1-99, category, JA4 TLS fingerprint. */
+  cfVerifiedBot?: boolean; cfSignedAgent?: boolean; cfBotScore?: number; cfBotCategory?: string; ja4?: string;
+}
+/** "https://chatgpt.com" from a Signature-Agent value in any of its forms ("…", g="…", bare). */
+export function signatureAgentOrigin(value: string | undefined | null): string | undefined {
+  const url = value?.slice(0, 500).match(/https?:\/\/[A-Za-z0-9.-]{1,200}(?::\d{1,5})?/)?.[0];
+  return url?.toLowerCase();
 }
 // nginx/Apache combined: "GET /x HTTP/1.1" 404 512 "referer" "agent"
 const COMBINED = /"([A-Z]+) (\S+) HTTP\/[\d.]+" (\d{3}) (\d+|-)(?: "([^"]*)" "([^"]*)")?/;
@@ -244,6 +268,7 @@ const J_STATUS = jsonField("status|httpStatus|status_code|statusCode|response_st
 const J_BYTES = jsonField("bytes|body_bytes_sent|bytes_sent|responseBytes|response_size|responseSize", true);
 const J_DURATION = jsonField("durationMs|duration_ms|responseTimeMs|response_time_ms|latencyMs", true);
 const J_ASN = jsonField("asn|as_number|clientAsn|asNumber", true);
+const J_SIG_AGENT = jsonField("signatureAgent|signature_agent|http_signature_agent");
 const unescape = (s: string | undefined) => (s === undefined ? undefined : s.replace(/\\(["\\/])/g, "$1"));
 const num = (s: string | undefined, max: number) => {
   const n = s === undefined ? NaN : Number(s);
@@ -268,6 +293,8 @@ export function requestMeta(line: string): RequestMeta {
     referer: c?.[5] && c[5] !== "-" ? c[5] : unescape(text.match(J_REFERER)?.[1]),
     country: country && /^[A-Z]{2}$/.test(country) ? country : undefined,
     asn: num(text.match(J_ASN)?.[1], 4_294_967_295),
+    // Only lines that carry one pay for this lookup (nginx: "signature_agent":"$http_signature_agent").
+    signatureAgent: text.includes("ignature") ? signatureAgentOrigin(unescape(text.match(J_SIG_AGENT)?.[1])) : undefined,
   };
   for (const key of Object.keys(meta) as (keyof RequestMeta)[]) if (meta[key] === undefined || meta[key] === "") delete meta[key];
   return meta;

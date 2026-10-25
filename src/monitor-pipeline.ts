@@ -7,6 +7,7 @@ import {
   clientIp, isAuthFailure, isAuthSuccess, isLlmRequest, lineSource, logUser, matchLine, privilegeChange, quickRequest, redactLine, requestMeta,
   requestOutcome, routeKey, tokenUsage, type LineSource, type MonitorRule,
 } from "./monitor-rules.js";
+import type { RequestMeta } from "./monitor-rules.js";
 import { DistinctPerMinute, MinuteSeries, SIGNAL_THRESHOLDS, meaningfulPath, outboundHost } from "./monitor-signals.js";
 import { foreignTo, ruleFamilies, type Stack } from "./monitor-stacks.js";
 
@@ -91,6 +92,11 @@ export interface IngestOptions {
   rules?: MonitorRule[];
   /** False sends the rule, count and sender without the text excerpt. */
   excerpt?: boolean;
+  /**
+   * What the client sent about itself (the SDK reads it from headers and the CDN). Kept beside the
+   * line, not in it, so the rules don't scan it; read only when a finding is raised.
+   */
+  identity?: () => Partial<Pick<RequestMeta, "signatureAgent" | "signals">>;
 }
 
 export interface PipelineOptions {
@@ -257,7 +263,7 @@ export class MonitorPipeline {
     const ip = options.client ? redactLine(options.client, custom).slice(0, 80) : source === "http" ? clientIp(line) : undefined;
     this.maintain(this.now());
     const excerpt = options.excerpt === false ? "(the app withheld the text)" : redactLine(line, custom);
-    const request = source === "http" ? this.describeRequest(line, ip, custom, options.excerpt !== false) : undefined;
+    const request = source === "http" ? this.describeRequest(line, ip, custom, options.excerpt !== false, options.identity) : undefined;
     const raised: string[] = [];
     const seenRules = new Set<string>();
     const stack = this.stack();
@@ -476,17 +482,28 @@ export class MonitorPipeline {
   }
 
   /** The request behind a traffic line, redacted like evidence, with what became of it. */
-  private describeRequest(line: string, ip: string | undefined, custom: CustomDetector[], withText: boolean): FindingRequest {
+  private describeRequest(
+    line: string, ip: string | undefined, custom: CustomDetector[], withText: boolean,
+    identity?: IngestOptions["identity"],
+  ): FindingRequest {
     const meta = requestMeta(line);
     const clip = (s: string | undefined, max: number) => (s === undefined ? undefined : redactLine(s, custom).slice(0, max));
     const request: FindingRequest = {
       outcome: requestOutcome(meta, { stack: this.stack() }),
       ip, method: meta.method, status: meta.status, bytes: meta.bytes, durationMs: meta.durationMs,
       host: clip(meta.host, 200), country: meta.country, asn: meta.asn, userAgent: clip(meta.userAgent, 300),
+      signatureAgent: meta.signatureAgent, signals: meta.signals,
       // The path and referrer carry the payload; an app that withholds text withholds them too.
       ...(withText ? { path: clip(meta.path, 500), referer: clip(meta.referer, 300) } : {}),
     };
     for (const key of Object.keys(request) as (keyof FindingRequest)[]) if (request[key] === undefined) delete request[key];
+    // Worked out on first read, which only happens when a finding is copied or sent.
+    if (identity) {
+      let cached: ReturnType<typeof identity> | undefined;
+      const read = () => (cached ??= (() => { try { return identity(); } catch { return {}; } })());
+      for (const key of ["signatureAgent", "signals"] as const)
+        Object.defineProperty(request, key, { enumerable: true, configurable: true, get: () => read()[key] });
+    }
     return request;
   }
 

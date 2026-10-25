@@ -221,7 +221,8 @@ export function middleware(request: NextRequest, event: NextFetchEvent) {
     url: request.nextUrl.pathname + request.nextUrl.search,
     ip: request.headers.get("x-forwarded-for")?.split(",")[0]?.trim(),
     userAgent: request.headers.get("user-agent"),
-    headers: request.headers, // host and country (x-vercel-ip-country, cf-ipcountry) for the analytics
+    headers: request.headers, // host, country, Signature-Agent and browser-header presence (values never sent)
+    // cf: request.cf,         // on Cloudflare Workers: verified bot, signed agent, bot score, JA4
   });
   event.waitUntil(beam.flush());
   return NextResponse.next();

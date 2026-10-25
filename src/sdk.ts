@@ -17,7 +17,7 @@
 // built-ins, so it runs in edge runtimes too.
 import type { MonitorFinding, MonitorLevel, MonitorSeverity } from "./monitor-client.js";
 import { CpuBudget, MonitorPipeline, type SendOutcome } from "./monitor-pipeline.js";
-import { matchLine, type MonitorRule } from "./monitor-rules.js";
+import { matchLine, signatureAgentOrigin, type ClientSignals, type MonitorRule } from "./monitor-rules.js";
 import { isStack, type Stack } from "./monitor-stacks.js";
 import { containsCanary } from "./prompt-attacks.js";
 import { judgeWithOwnLlm, ownLlmConfig, type OwnLlmConfig } from "./monitor-llm.js";
@@ -103,11 +103,49 @@ export interface RequestInfo {
   country?: string | null;
   asn?: number | null;
   /**
-   * The request's headers (a Headers object or a plain record). Read for Host, Referer, User-Agent
-   * and the country your platform adds (x-vercel-ip-country, cf-ipcountry,
-   * cloudfront-viewer-country). Nothing else is read and no header is sent as-is.
+   * The request's headers (a Headers object or a plain record). Read for Host, User-Agent, the
+   * country your platform adds (x-vercel-ip-country, cf-ipcountry, cloudfront-viewer-country),
+   * Signature-Agent (the origin only) and MCP-Protocol-Version. Accept-Language, Sec-Fetch-Mode,
+   * Sec-CH-UA, Signature, Signature-Input and Mcp-Session-Id are checked for presence only: their
+   * values are never read or sent.
    */
   headers?: Headers | Record<string, string | string[] | undefined> | null;
+  /**
+   * Cloudflare's request properties (`request.cf` in a Worker), when the app runs behind
+   * Cloudflare. Read for country, ASN and, with Bot Management, the verified-bot and signed-agent
+   * verdicts, bot score, verified-bot category and JA4 fingerprint.
+   */
+  cf?: CloudflareProperties | null;
+}
+
+export interface CloudflareProperties {
+  country?: string | null;
+  asn?: number | null;
+  verifiedBotCategory?: string | null;
+  botManagement?: { score?: number | null; verifiedBot?: boolean | null; signedAgent?: boolean | null; ja4?: string | null } | null;
+}
+
+/** Header presence and CDN verdicts for one request: lookups only, no parsing of values beyond a cap. */
+function clientSignals(header: (name: string) => string | undefined, cf: CloudflareProperties | null | undefined): ClientSignals {
+  const has = (name: string) => header(name) !== undefined;
+  // Presence only means something for a request's full headers, not a hand-built record of one or two.
+  const full = has("host") || has("user-agent");
+  const bm = cf && typeof cf === "object" ? cf.botManagement : undefined;
+  const mcpVersion = header("mcp-protocol-version");
+  const score = bm?.score;
+  const category = cf?.verifiedBotCategory;
+  return {
+    signed: has("signature") && has("signature-input") ? true : undefined,
+    acceptLanguage: full ? has("accept-language") : undefined,
+    secFetch: full ? has("sec-fetch-mode") : undefined,
+    clientHints: full ? has("sec-ch-ua") : undefined,
+    mcp: mcpVersion ? (/^[\w.-]{1,20}$/.test(mcpVersion) ? mcpVersion : "unknown") : has("mcp-session-id") ? "unknown" : undefined,
+    cfVerifiedBot: typeof bm?.verifiedBot === "boolean" ? bm.verifiedBot : undefined,
+    cfSignedAgent: typeof bm?.signedAgent === "boolean" ? bm.signedAgent : undefined,
+    cfBotScore: typeof score === "number" && score >= 1 && score <= 99 ? Math.round(score) : undefined,
+    cfBotCategory: typeof category === "string" && /^[\w .&/-]{1,60}$/.test(category) ? category : undefined,
+    ja4: typeof bm?.ja4 === "string" && /^\w{1,40}$/.test(bm.ja4) ? bm.ja4 : undefined,
+  };
 }
 
 export interface PromptInfo {
@@ -489,7 +527,8 @@ function start(options: AppMonitorOptions): AppMonitor {
         const text = (v: unknown, max: number) => (v === null || v === undefined || v === "" ? undefined : String(v).slice(0, max));
         const count = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined);
         const header = headerReader(info.headers);
-        const country = text(info.country ?? header("x-vercel-ip-country") ?? header("cf-ipcountry") ?? header("cloudfront-viewer-country"), 2);
+        const cf = info.cf && typeof info.cf === "object" ? info.cf : undefined;
+        const country = text(info.country ?? cf?.country ?? header("x-vercel-ip-country") ?? header("cf-ipcountry") ?? header("cloudfront-viewer-country"), 2);
         // Same JSON shape as an access-log line, so the rules see method, path+query, client and agent.
         // The referrer isn't included: it's the page the visitor came from, usually this app's own.
         ingest(JSON.stringify({
@@ -502,10 +541,17 @@ function start(options: AppMonitorOptions): AppMonitor {
           responseBytes: count(info.bytes),
           durationMs: count(info.durationMs),
           country: country && /^[A-Za-z]{2}$/.test(country) ? country.toUpperCase() : undefined,
-          asn: count(info.asn),
+          asn: count(info.asn ?? cf?.asn),
           // Sent only by Next.js itself; from a client it's an attempt to skip middleware (CVE-2025-29927).
           "x-middleware-subrequest": text(header("x-middleware-subrequest"), 200),
-        }), "requests");
+        }), "requests", info.headers || cf ? {
+          // Read from the headers only if this request raises a finding.
+          identity: () => {
+            const signals = clientSignals(header, cf);
+            for (const key of Object.keys(signals) as (keyof ClientSignals)[]) if (signals[key] === undefined) delete signals[key];
+            return { signatureAgent: signatureAgentOrigin(header("signature-agent")), signals: Object.keys(signals).length ? signals : undefined };
+          },
+        } : undefined);
       } catch {
         /* never let monitoring affect the app */
       }

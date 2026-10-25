@@ -192,6 +192,29 @@ describe("security events, usage and outbound calls", () => {
     expect(sent.find(f => f.ruleId === "signal.new_outbound_host")!.title).toBe("First call to collector.example.net");
     expect(JSON.stringify(sent)).not.toContain("leak=1");
   });
+  it("sends the signed agent and client signals, never header values", async () => {
+    const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test" });
+    await tick();
+    monitor.request({
+      ...attack,
+      userAgent: undefined,
+      headers: {
+        host: "shop.example", "user-agent": "Mozilla/5.0 Chrome/155.0.0.0", "accept-language": "fr-FR,secret-ish",
+        "signature-agent": '"https://chatgpt.com"', signature: "sig1=:c2lnbmF0dXJl:", "signature-input": 'sig1=("@authority");tag="web-bot-auth"',
+        "mcp-protocol-version": "2025-06-18",
+      },
+      cf: { asn: 16509, botManagement: { score: 3, verifiedBot: false, signedAgent: true, ja4: "t13d1516h2_8daaf6152771_02713d6af862" } },
+    });
+    await monitor.flush({ force: true });
+    const body = JSON.stringify(posted[0]!.body);
+    const [finding] = posted[0]!.body.findings as unknown as { request: Record<string, unknown> }[];
+    expect(finding!.request).toMatchObject({
+      asn: 16509, signatureAgent: "https://chatgpt.com",
+      signals: { signed: true, acceptLanguage: true, secFetch: false, clientHints: false, mcp: "2025-06-18", cfVerifiedBot: false, cfSignedAgent: true, cfBotScore: 3, ja4: "t13d1516h2_8daaf6152771_02713d6af862" },
+    });
+    expect(body).not.toContain("fr-FR");
+    expect(body).not.toContain("c2lnbmF0dXJl");
+  });
   it("flags a Next.js middleware bypass header and rolls up other stacks' exploits for a Next.js app", async () => {
     const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test", stack: "nextjs" });
     await tick();

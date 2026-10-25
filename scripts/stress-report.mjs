@@ -116,13 +116,24 @@ const mixed = [
   let t = clock();
   for (let i = 0; i < n; i++) requests.request({ method: "GET", url: `/api/orders?page=${i}&sort=created_at`, ip: "203.0.113.9", userAgent: "Mozilla/5.0 (Macintosh) Chrome/155.0.0.0 Safari/537.36" });
   const requestUs = round(((clock() - t) * 1000) / n);
+  // The same call with a browser's full headers and Cloudflare's properties, as most apps pass them.
+  const headers = new Headers({
+    host: "shop.example", "user-agent": "Mozilla/5.0 (Macintosh) Chrome/155.0.0.0 Safari/537.36", accept: "text/html",
+    "accept-language": "en-US,en;q=0.9", "sec-fetch-mode": "navigate", "sec-ch-ua": '"Chromium";v="155"', cookie: "a=b".repeat(200),
+    "signature-agent": '"https://chatgpt.com"', signature: "sig1=:abc:", "signature-input": 'sig1=("@authority" "signature-agent");tag="web-bot-auth"',
+  });
+  const cf = { country: "US", asn: 13335, verifiedBotCategory: "AI Assistant", botManagement: { score: 2, verifiedBot: true, signedAgent: true, ja4: "t13d1516h2_8daaf6152771_02713d6af862" } };
+  n = 100_000;
+  t = clock();
+  for (let i = 0; i < n; i++) requests.request({ method: "GET", url: `/api/orders?page=${i}&sort=created_at`, ip: "203.0.113.9", headers, cf });
+  const headersUs = round(((clock() - t) * 1000) / n);
   n = 20_000;
   t = clock();
   for (let i = 0; i < n; i++) prompts.prompt(`Can you help me write a polite email to my landlord about the heating? #${i}`, { user: "u1" });
   const promptUs = round(((clock() - t) * 1000) / n);
-  check("per-call", "Cost per call in your app", requestUs < 100 && promptUs < 200,
-    `request() ${requestUs} µs, prompt() ${promptUs} µs on a short message`,
-    { requestMicros: requestUs, promptMicros: promptUs }, "request() under 100 µs and prompt() under 200 µs");
+  check("per-call", "Cost per call in your app", requestUs < 100 && headersUs < 100 && promptUs < 200,
+    `request() ${requestUs} µs (${headersUs} µs with full headers and Cloudflare's bot fields), prompt() ${promptUs} µs on a short message`,
+    { requestMicros: requestUs, requestWithHeadersMicros: headersUs, promptMicros: promptUs }, "request() under 100 µs and prompt() under 200 µs");
 }
 
 // 4. Memory over millions of lines with AgentBeam unreachable the whole time (nothing ever leaves).

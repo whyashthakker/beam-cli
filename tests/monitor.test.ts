@@ -66,6 +66,12 @@ describe("monitor rules", () => {
       .toEqual({ method: "POST", path: "/api", status: 403, host: "app.example", userAgent: "curl/8", country: "DE", asn: 13335, bytes: 12, durationMs: 4 });
     expect(requestMeta('{"method":"GET","path":"/","status":"ok"}')).toEqual({ method: "GET", path: "/" });
   });
+  it("reads a Signature-Agent from a JSON access log in any of its forms", () => {
+    expect(requestMeta('{"method":"GET","path":"/","signatureAgent":"https://chatgpt.com"}')).toEqual({ method: "GET", path: "/", signatureAgent: "https://chatgpt.com" });
+    // nginx: log_format with "signature_agent":"$http_signature_agent" (the raw header, quotes included)
+    expect(requestMeta('{"method":"GET","path":"/","signature_agent":"g=\\"https://agent.bot.goog\\""}').signatureAgent).toBe("https://agent.bot.goog");
+    expect(requestMeta('{"method":"GET","path":"/","signature_agent":"not a url"}')).toEqual({ method: "GET", path: "/" });
+  });
   it("works out what became of a request", () => {
     expect(requestOutcome({ status: 200 })).toBe("served");
     expect(requestOutcome({ status: 301 })).toBe("blocked");
