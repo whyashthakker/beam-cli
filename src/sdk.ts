@@ -6,8 +6,10 @@
 // here with the same rules as the CLI; only redacted findings leave the process, in batches,
 // authenticated with the app's least-privilege BEAM_APP_TOKEN.
 //
-// It never throws, never blocks or alters a request, and never makes a request wait on the
-// network: findings are sent in the background (pass flush() to event.waitUntil in middleware).
+// It never throws, never blocks or alters a request on its own, and never makes a request wait on
+// the network: findings are sent in the background (pass flush() to event.waitUntil in middleware).
+// request() and check() also say whether the sender is paused (monitor-pause.ts): the app returns
+// pausedResponse() for those, or uses middleware() to do it for an Express or Node.js server.
 // It's built to stay out of the way when things go wrong: detection has a hard CPU budget
 // (maxCpuPercent), every rule is linear in the input, memory is bounded, and when AgentBeam is
 // slow or down it backs off (up to 5 minutes between tries) and holds at most 1,000 findings.
@@ -20,6 +22,9 @@ import { CpuBudget, MonitorPipeline, type SendOutcome } from "./monitor-pipeline
 import { matchLine, signatureAgentOrigin, type ClientSignals, type MonitorRule } from "./monitor-rules.js";
 import { isStack, type Stack } from "./monitor-stacks.js";
 import { containsCanary } from "./prompt-attacks.js";
+import { PauseBook, pausedBody, trustedRequestIp, type PauseReport, type Verdict } from "./monitor-pause.js";
+
+export type { Verdict, PauseScope } from "./monitor-pause.js";
 import { judgeWithOwnLlm, ownLlmConfig, type OwnLlmConfig } from "./monitor-llm.js";
 
 export interface AppMonitorOptions {
@@ -75,6 +80,13 @@ export interface AppMonitorOptions {
   watchOutbound?: boolean;
   /** LLM tokens one user may use in an hour before it's raised (usage()). Default: 500,000 on the standard level. */
   tokensPerUserHour?: number;
+  /**
+   * True when the `ip` you pass is always the real client address (Express with `trust proxy` set
+   * to your proxy count, a server with no proxy). By default Beam works it out: on Cloudflare,
+   * Vercel and Fly.io it reads the platform's own header, and elsewhere it only pauses an address
+   * the client couldn't have written (never the first entry of a forwarded X-Forwarded-For list).
+   */
+  trustIp?: boolean;
 }
 
 /** Who a security event is about. The user is an opaque id, not an email. */
@@ -90,6 +102,8 @@ export interface RequestInfo {
   /** Path and query string, e.g. request.nextUrl.pathname + request.nextUrl.search. */
   url: string;
   ip?: string | null;
+  /** The signed-in user's opaque id (not an email), when known: a paused user is refused from any address. */
+  user?: string | null;
   userAgent?: string | null;
   /**
    * The response status, when the hook runs after the response (Express `res.on("finish")`,
@@ -159,6 +173,9 @@ export interface PromptInfo {
 /** What a local check found. Matches count whatever the dashboard's level; reporting follows the level. */
 export interface TextCheck {
   flagged: boolean;
+  /** The sender is paused from the app's LLM features (or the whole app): refuse, with retryAfter seconds. */
+  paused?: boolean;
+  retryAfter?: number;
   /** True when the check didn't run because the CPU budget for this minute was spent. */
   skipped?: boolean;
   /** The most severe match, or null when nothing matched. */
@@ -166,9 +183,37 @@ export interface TextCheck {
   matches: { ruleId: string; title: string; severity: MonitorSeverity }[];
 }
 
+/** What check() needs: who sent the request, and where to. */
+export type CheckInfo = Partial<Pick<RequestInfo, "url" | "ip" | "user" | "headers" | "cf">>;
+
+/** The Node.js request and response middleware() works with (Express, Connect, node:http). */
+export interface NodeRequestLike {
+  method?: string; url?: string; originalUrl?: string; ip?: string;
+  headers?: Record<string, string | string[] | undefined>;
+  socket?: { remoteAddress?: string | null } | null;
+}
+export interface NodeResponseLike {
+  statusCode: number;
+  setHeader(name: string, value: string): unknown;
+  end(body?: string): unknown;
+  on?(event: "finish", listener: () => void): unknown;
+}
+
 export interface AppMonitor {
-  /** Check one incoming request. Cheap and synchronous; never throws. */
-  request(info: RequestInfo): void;
+  /**
+   * Check one incoming request. Cheap and synchronous; never throws. Returns whether the sender is
+   * paused: when `paused` is true, answer with pausedResponse(verdict) instead of handling it.
+   */
+  request(info: RequestInfo): Verdict;
+  /** Whether a sender is paused, without recording a request (an API route, a queue consumer). */
+  check(info: CheckInfo): Verdict;
+  /** A 429 with Retry-After for a paused sender. The body is generic: it doesn't say why. */
+  pausedResponse(verdict: Verdict): Response;
+  /**
+   * Express, Connect or node:http middleware: refuses paused senders with a 429 and reports every
+   * other request after its response, with the status. `app.use(beam.middleware())`.
+   */
+  middleware(): (req: NodeRequestLike, res: NodeResponseLike, next: (error?: unknown) => void) => void;
   /** Check one application log line (errors, auth failures, anything the app prints). */
   log(line: string): void;
   /**
@@ -288,9 +333,44 @@ export function checkOutput(text: string, options: { canaries?: string[] } = {})
   return check(text, "output", canaryRule(options.canaries ?? []));
 }
 
-// Without a token the checks still work locally; nothing is reported.
+const ALLOW: Verdict = Object.freeze({ paused: false }) as Verdict;
+
+function pausedResponse(verdict: Verdict): Response {
+  return new Response(pausedBody(), {
+    status: 429,
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store", "Retry-After": String(Math.max(1, Math.round(verdict?.retryAfter ?? 60))) },
+  });
+}
+
+/** middleware() for a monitor: refuse paused senders, report the rest after the response. */
+function nodeMiddleware(monitor: Pick<AppMonitor, "check" | "request">): ReturnType<AppMonitor["middleware"]> {
+  return (req, res, next) => {
+    try {
+      const url = String(req.originalUrl ?? req.url ?? "/");
+      const ip = req.ip ?? req.socket?.remoteAddress ?? undefined;
+      const verdict = monitor.check({ url, ip, headers: req.headers });
+      if (verdict.paused) {
+        res.statusCode = 429;
+        res.setHeader("Retry-After", String(verdict.retryAfter ?? 60));
+        res.setHeader("Content-Type", "application/json");
+        res.setHeader("Cache-Control", "no-store");
+        res.end(pausedBody());
+        return;
+      }
+      res.on?.("finish", () => {
+        monitor.request({ method: String(req.method ?? "GET"), url, ip, status: res.statusCode, headers: req.headers });
+      });
+    } catch {
+      /* never let monitoring affect the app */
+    }
+    next();
+  };
+}
+
+// Without a token the checks still work locally; nothing is reported and nobody is paused.
 const noop: AppMonitor = {
-  request() {}, log() {}, event() {}, usage() {}, outbound() {}, flush: async () => {}, enabled: false,
+  request: () => ALLOW, check: () => ALLOW, pausedResponse, middleware: () => (_req, _res, next) => next(),
+  log() {}, event() {}, usage() {}, outbound() {}, flush: async () => {}, enabled: false,
   prompt: text => checkPrompt(text),
   output: text => checkOutput(text),
 };
@@ -357,6 +437,22 @@ function start(options: AppMonitorOptions): AppMonitor {
   let flushing: Promise<void> | null = null;
   let budgetReportedAt = 0;
   const revoked = () => Date.now() < revokedUntil;
+  // Who the finding being raised is about, as far as it can be trusted (set around each ingest).
+  let who: { ip?: string | null; user?: string | null } | null = null;
+  let pausesUnsupported = false;
+  let pauseSendFailures = 0;
+  let nextPauseSendAt = 0;
+  const platform = { vercel: env("VERCEL") === "1", fly: Boolean(env("FLY_APP_NAME")), trustGiven: options.trustIp === true };
+  const book = new PauseBook({
+    onNotice: (message, kind) => {
+      report(`AgentBeam App monitoring: ${message}`);
+      if (kind === "breaker")
+        pipeline.addFinding({
+          id: `pause-breaker-${Math.floor(Date.now() / 1_800_000)}`, ruleId: "beam.pause.breaker", title: "Automatic pausing stopped: too many senders at once",
+          severity: "high", category: "activity", source: "http", count: 1, firstSeen: new Date().toISOString(), evidence: message,
+        });
+    },
+  });
 
   const pipeline = new MonitorPipeline({
     level: () => (!revoked() && Date.now() >= pausedUntil ? level : null),
@@ -364,6 +460,7 @@ function start(options: AppMonitorOptions): AppMonitor {
     // Proxying other stacks' paths: nothing can be ruled out by stack.
     stack: options.proxiesOtherStacks === true ? undefined : isStack(options.stack) ? options.stack : "node",
     tokensPerUserHour: typeof options.tokensPerUserHour === "number" && options.tokensPerUserHour > 0 ? options.tokensPerUserHour : undefined,
+    onRaise: finding => { if (who) book.consider(finding, who); },
   });
 
   const refreshConfig = async () => {
@@ -371,19 +468,26 @@ function start(options: AppMonitorOptions): AppMonitor {
     const t = withTimeout(REQUEST_TIMEOUT_MS);
     try {
       const response = await fetch(`${base}/v1/monitor/config`, { headers, signal: t.signal });
-      const body = (await response.json().catch(() => ({}))) as { level?: MonitorLevel; error?: string; resetAt?: string; outbound?: { hosts?: unknown } };
+      const body = (await response.json().catch(() => ({}))) as {
+        level?: MonitorLevel; error?: string; resetAt?: string; outbound?: { hosts?: unknown }; pausing?: unknown; pauses?: unknown; lifted?: unknown;
+      };
       configFailures = response.status >= 500 ? configFailures + 1 : 0;
       if (response.ok) {
         level = body.level ?? "standard";
         revokedUntil = 0;
         const hosts = body.outbound?.hosts;
         if (Array.isArray(hosts)) pipeline.setKnownOutboundHosts(hosts.filter((h): h is string => typeof h === "string"));
+        book.configure(body.pausing as Parameters<PauseBook["configure"]>[0], body.pauses, body.lifted);
       }
       else if (response.status === 401) {
         if (!revoked()) report("AgentBeam App monitoring paused: this app token was rejected (rotated or removed). Checking again in 15 minutes.");
         revokedUntil = Date.now() + REVOKED_RECHECK_MS;
       }
-      else if (response.status === 403) { level = null; report(typeof body.error === "string" ? body.error : "AgentBeam App monitoring is turned off for this workspace."); }
+      else if (response.status === 403) {
+        level = null;
+        book.configure(null, [], []);
+        report(typeof body.error === "string" ? body.error : "AgentBeam App monitoring is turned off for this workspace.");
+      }
       else if (response.status === 429) pausedUntil = pauseUntil(body.resetAt);
     } catch {
       configFailures++; // unreachable or slow: keep the last known level and back off
@@ -428,15 +532,35 @@ function start(options: AppMonitorOptions): AppMonitor {
     return outcome;
   };
 
+  // Pauses this instance made go to the workspace, so the dashboard shows them and the app's other
+  // instances pick them up with their config. A workspace that predates pausing is asked once.
+  const sendPauses = async (): Promise<void> => {
+    if (pausesUnsupported || !book.size.reports || Date.now() < nextPauseSendAt) return;
+    const batch: PauseReport[] = book.takeReports().slice(-100);
+    const t = withTimeout(REQUEST_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${base}/v1/monitor/pauses`, { method: "POST", headers, body: JSON.stringify({ pauses: batch }), signal: t.signal });
+      if (response.status === 404 || response.status === 405) pausesUnsupported = true;
+      else if (response.status >= 500) { book.returnReports(batch); nextPauseSendAt = Date.now() + backoff(flushEvery, ++pauseSendFailures); return; }
+      pauseSendFailures = 0;
+    } catch {
+      book.returnReports(batch);
+      nextPauseSendAt = Date.now() + backoff(flushEvery, ++pauseSendFailures);
+    } finally {
+      t.done();
+    }
+  };
+
   const flush = (force = false): Promise<void> => {
     // A forced flush waits for one in flight, then sends what that one left (roll-ups still collecting),
     // unless that send failed: the batch stays queued for after the backoff, not resent straight away.
     if (flushing) return force ? flushing.then(() => (Date.now() < nextSendAt ? undefined : flush(true))) : flushing;
-    if (!pipeline.pending.length && !(force && pipeline.rollingUp)) return Promise.resolve();
+    const pauses = book.size.reports > 0 && !pausesUnsupported;
+    if (!pipeline.pending.length && !(force && pipeline.rollingUp) && !pauses) return Promise.resolve();
     const now = Date.now();
     if (!force && (now - lastFlush < flushEvery || now < nextSendAt)) return Promise.resolve();
     lastFlush = now;
-    flushing = pipeline.flush(send, { force }).catch(() => {}).finally(() => { flushing = null; });
+    flushing = pipeline.flush(send, { force }).then(sendPauses).catch(() => {}).finally(() => { flushing = null; });
     return flushing;
   };
 
@@ -462,12 +586,29 @@ function start(options: AppMonitorOptions): AppMonitor {
   const llmText = (text: string, source: "prompt" | "output", info: PromptInfo | undefined): TextCheck => {
     const { result, window } = budgeted(text, source, source === "output" ? canaries : []);
     try {
+      const sender = { ip: typeof info?.ip === "string" ? info.ip : undefined, user: typeof info?.user === "string" ? info.user : undefined };
+      if (source === "prompt" && (sender.ip || sender.user)) {
+        ensureConfig();
+        const verdict = book.check(sender, { llm: true });
+        // Paused: refused before the model, so it isn't counted again.
+        if (verdict.paused) return { ...result, paused: true, retryAfter: verdict.retryAfter };
+      }
       if (!window.trim()) return result;
       const client = String(info?.ip ?? info?.user ?? "").trim().slice(0, 80) || undefined;
       const label = typeof info?.label === "string" && info.label.trim() ? info.label.trim().slice(0, 60) : source === "prompt" ? "prompts" : "model output";
       // Clean prompts are still counted per sender, to spot floods.
-      if (result.flagged || (source === "prompt" && client))
-        ingest(window, label, { source, client, rules: source === "output" ? canaries : undefined, excerpt: options.excerpts !== false });
+      if (result.flagged || (source === "prompt" && client)) {
+        who = sender;
+        try {
+          ingest(window, label, { source, client, rules: source === "output" ? canaries : undefined, excerpt: options.excerpts !== false });
+        } finally {
+          who = null;
+        }
+        if (source === "prompt") {
+          const verdict = book.check(sender, { llm: true });
+          if (verdict.paused) return { ...result, paused: true, retryAfter: verdict.retryAfter };
+        }
+      }
     } catch {
       /* never let monitoring affect the app */
     }
@@ -505,9 +646,40 @@ function start(options: AppMonitorOptions): AppMonitor {
     }
   }
 
+  // The sender of a request, as far as it can be trusted to pause.
+  const sender = (info: CheckInfo, header: (name: string) => string | undefined) => {
+    const cf = info.cf && typeof info.cf === "object" ? info.cf : undefined;
+    return {
+      ip: trustedRequestIp(typeof info.ip === "string" ? info.ip : undefined, header, { ...platform, cloudflare: Boolean(cf) }),
+      user: typeof info.user === "string" ? info.user : null,
+    };
+  };
+  // Pauses are made only from a trusted address, but enforced on the address the app passed too:
+  // a client that writes a paused address into X-Forwarded-For only refuses itself.
+  const verdictFor = (from: { ip: string | null; user: string | null }, given: unknown, path: string | undefined): Verdict => {
+    const verdict = book.check(from, { path });
+    if (verdict.paused || typeof given !== "string" || given === from.ip) return verdict;
+    const other = book.check({ ip: given, user: from.user }, { path });
+    return other.paused ? other : verdict;
+  };
+  const check = (info: CheckInfo): Verdict => {
+    try {
+      if (!info || typeof info !== "object") return ALLOW;
+      ensureConfig();
+      const header = headerReader(info.headers);
+      // A trusted platform header stands in for an address the app didn't pass.
+      return verdictFor(sender(info, header), info.ip, typeof info.url === "string" ? info.url : undefined);
+    } catch {
+      return ALLOW;
+    }
+  };
+
   void refreshConfig();
-  return {
+  const monitor: AppMonitor = {
     enabled: true,
+    check,
+    pausedResponse,
+    middleware: () => nodeMiddleware(monitor),
     event(type, info) {
       if (!["login.failed", "login.succeeded", "admin.granted", "apikey.created"].includes(type)) return;
       guarded(() => {
@@ -516,44 +688,62 @@ function start(options: AppMonitorOptions): AppMonitor {
     },
     usage(info) {
       const tokens = Number(info?.tokens);
-      const who = short(info?.user, 80) ?? short(info?.ip, 64);
-      if (!(tokens > 0) || !who) return;
-      guarded(() => { pipeline.usage(who, Math.min(tokens, 1e9), short(info?.model, 80) ? `model=${short(info?.model, 80)}` : ""); });
+      const sender = short(info?.user, 80) ?? short(info?.ip, 64);
+      if (!(tokens > 0) || !sender) return;
+      guarded(() => {
+        who = { user: short(info?.user, 80), ip: short(info?.ip, 64) };
+        try { pipeline.usage(sender, Math.min(tokens, 1e9), short(info?.model, 80) ? `model=${short(info?.model, 80)}` : ""); } finally { who = null; }
+      });
     },
     outbound,
     request(info) {
       try {
-        if (!info || typeof info.url !== "string") return;
+        if (!info || typeof info.url !== "string") return ALLOW;
         const text = (v: unknown, max: number) => (v === null || v === undefined || v === "" ? undefined : String(v).slice(0, max));
         const count = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.round(v) : undefined);
         const header = headerReader(info.headers);
         const cf = info.cf && typeof info.cf === "object" ? info.cf : undefined;
         const country = text(info.country ?? cf?.country ?? header("x-vercel-ip-country") ?? header("cf-ipcountry") ?? header("cloudfront-viewer-country"), 2);
+        ensureConfig();
+        const from = sender(info, header);
+        const before = verdictFor(from, info.ip, info.url);
+        const version = book.version;
+        // A paused sender is refused, not checked again: that would only count the refusals.
+        if (before.paused) return before;
         // Same JSON shape as an access-log line, so the rules see method, path+query, client and agent.
         // The referrer isn't included: it's the page the visitor came from, usually this app's own.
-        ingest(JSON.stringify({
-          method: String(info.method || "GET").toUpperCase().slice(0, 16),
-          path: info.url.slice(0, 8192),
-          httpStatus: count(info.status),
-          srcIp: text(info.ip, 64),
-          clientUa: text(info.userAgent ?? header("user-agent"), 512),
-          host: text(header("host"), 200),
-          responseBytes: count(info.bytes),
-          durationMs: count(info.durationMs),
-          country: country && /^[A-Za-z]{2}$/.test(country) ? country.toUpperCase() : undefined,
-          asn: count(info.asn ?? cf?.asn),
-          // Sent only by Next.js itself; from a client it's an attempt to skip middleware (CVE-2025-29927).
-          "x-middleware-subrequest": text(header("x-middleware-subrequest"), 200),
-        }), "requests", info.headers || cf ? {
-          // Read from the headers only if this request raises a finding.
-          identity: () => {
-            const signals = clientSignals(header, cf);
-            for (const key of Object.keys(signals) as (keyof ClientSignals)[]) if (signals[key] === undefined) delete signals[key];
-            return { signatureAgent: signatureAgentOrigin(header("signature-agent")), signals: Object.keys(signals).length ? signals : undefined };
-          },
-        } : undefined);
+        who = from;
+        try {
+          ingest(JSON.stringify({
+            method: String(info.method || "GET").toUpperCase().slice(0, 16),
+            path: info.url.slice(0, 8192),
+            httpStatus: count(info.status),
+            srcIp: text(info.ip ?? from.ip, 64),
+            clientUa: text(info.userAgent ?? header("user-agent"), 512),
+            host: text(header("host"), 200),
+            responseBytes: count(info.bytes),
+            durationMs: count(info.durationMs),
+            country: country && /^[A-Za-z]{2}$/.test(country) ? country.toUpperCase() : undefined,
+            asn: count(info.asn ?? cf?.asn),
+            // Sent only by Next.js itself; from a client it's an attempt to skip middleware (CVE-2025-29927).
+            "x-middleware-subrequest": text(header("x-middleware-subrequest"), 200),
+          }), "requests", info.headers || cf ? {
+            // Read from the headers only if this request raises a finding.
+            identity: () => {
+              const signals = clientSignals(header, cf);
+              for (const key of Object.keys(signals) as (keyof ClientSignals)[]) if (signals[key] === undefined) delete signals[key];
+              return { signatureAgent: signatureAgentOrigin(header("signature-agent")), signals: Object.keys(signals).length ? signals : undefined };
+            },
+          } : undefined);
+        } finally {
+          who = null;
+        }
+        // This request may be the one that tipped it (the 100th path in a minute); checked again
+        // only when it made a pause.
+        return book.version === version ? before : verdictFor(from, info.ip, info.url);
       } catch {
         /* never let monitoring affect the app */
+        return ALLOW;
       }
     },
     log(line) {
@@ -563,4 +753,5 @@ function start(options: AppMonitorOptions): AppMonitor {
     output: (text, info) => llmText(text, "output", info),
     flush: (opts) => flush(Boolean(opts?.force)).catch(() => {}),
   };
+  return monitor;
 }

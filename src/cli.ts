@@ -40,7 +40,7 @@ import { blockedTargetsFile, readBlockedTargets, removeBlockedTarget } from "./b
 import { checkForUpdate, installUpdate } from "./update.js";
 import { WORKER_COMMAND, autoUpdateAllowed, autoUpdateTick, readUpdateState, runAutoUpdateWorker, writeUpdateState } from "./auto-update.js";
 import { recordExpectedHooks, reportControlEvent } from "./tamper.js";
-import { monitorConfigure, monitorStatus, monitorTest, runMonitor } from "./monitor.js";
+import { monitorConfigure, monitorPause, monitorPaused, monitorStatus, monitorTest, monitorUnpause, runMonitor } from "./monitor.js";
 import { CVE_SEVERITIES, runCveCheck, type CveSeverity } from "./cve.js";
 import { addPackage, attachVulnerabilities, runInstall } from "./packages.js";
 import { isPackageBlocked, scanInstalledPackages, scanNpmPackage, scanPythonDist, type PackageScan } from "./package-scan.js";
@@ -661,7 +661,7 @@ const LLM_OPTION = "review flagged lines with your own key: openai, anthropic, g
 const monitor = program.command("monitor").description("Watch a running app's logs and traffic around the clock and alert on suspicious activity (a workspace admin turns App monitoring on in the dashboard first)");
 
 monitor.command("start", { isDefault: true })
-  .description("Start watching (the default). Reads log files or piped output only; never blocks or changes the app")
+  .description("Start watching (the default). Reads log files or piped output only; never blocks or changes the app, except that --deny-file writes paused senders to a deny list for your web server")
   .option("-f, --file <path...>", "log file to follow like tail -F, including access logs (repeatable)")
   .option("--stdin", "read piped output, e.g. 'node server.js 2>&1 | beam monitor --stdin'")
   .option("--no-echo", "with --stdin, don't pass lines through to stdout")
@@ -672,8 +672,17 @@ monitor.command("start", { isDefault: true })
   .option("--max-cpu <percent>", "the most of one CPU core detection may use (1-100, default 25); past it, lines are skipped until the next minute")
   .option("--config <file>", "a project config file to use instead of ./beam.monitor.json")
   .option("--stack <name>", "the app's framework (nextjs, express, nestjs, vite, node, django, flask, fastapi, rails, laravel, php, wordpress, spring, java, go, dotnet, static); default: detected from --app")
-  .action(async (options: { file?: string[]; stdin?: boolean; echo: boolean; app?: string; fromStart?: boolean; wait: boolean; llm?: string; maxCpu?: string; config?: string; stack?: string }) => {
-    await runMonitor({ files: options.file, stdin: options.stdin, echo: options.echo, app: options.app, fromStart: options.fromStart, wait: options.wait, llm: options.llm, maxCpu: options.maxCpu === undefined ? undefined : Number(options.maxCpu), config: options.config, stack: options.stack });
+  .option("--deny-file <path>", "write addresses the workspace pauses (whole app) to this file, e.g. /etc/nginx/beam-deny.conf; pausing is turned on in the dashboard")
+  .option("--auth-deny-file <path>", "the same for pauses on sign-in routes only, to include in your login location")
+  .option("--llm-deny-file <path>", "the same for pauses on LLM routes only")
+  .option("--deny-format <format>", "nginx (deny 1.2.3.4;, the default) or plain (one address per line)")
+  .option("--reload <command>", "run after a deny list changes, e.g. \"nginx -s reload\"")
+  .action(async (options: { file?: string[]; stdin?: boolean; echo: boolean; app?: string; fromStart?: boolean; wait: boolean; llm?: string; maxCpu?: string; config?: string; stack?: string; denyFile?: string; authDenyFile?: string; llmDenyFile?: string; denyFormat?: string; reload?: string }) => {
+    await runMonitor({
+      files: options.file, stdin: options.stdin, echo: options.echo, app: options.app, fromStart: options.fromStart, wait: options.wait, llm: options.llm,
+      maxCpu: options.maxCpu === undefined ? undefined : Number(options.maxCpu), config: options.config, stack: options.stack,
+      denyFile: options.denyFile, authDenyFile: options.authDenyFile, llmDenyFile: options.llmDenyFile, denyFormat: options.denyFormat, reload: options.reload,
+    });
   });
 
 monitor.command("configure")
@@ -689,8 +698,14 @@ monitor.command("configure")
   .option("--app <dir>", "app directory for daily dependency checks")
   .option("--no-app", "clear the saved app directory")
   .option("--max-cpu <percent>", "the most of one CPU core detection may use, 1-100 (default 25)")
+  .option("--deny-file <path>", "deny list for addresses paused from the whole app")
+  .option("--auth-deny-file <path>", "deny list for pauses on sign-in routes")
+  .option("--llm-deny-file <path>", "deny list for pauses on LLM routes")
+  .option("--deny-format <format>", "nginx or plain")
+  .option("--reload <command>", "run after a deny list changes, e.g. \"nginx -s reload\"")
+  .option("--no-deny", "clear the saved deny lists and reload command")
   .option("--check", "validate every config layer (managed, user, project) and exit 1 on a problem")
-  .action(async (options: { llm?: string; model?: string; baseUrl?: string; keyEnv?: string; keyStdin?: boolean; forgetKey?: boolean; file?: string[]; files: boolean; app?: string | false; maxCpu?: string; check?: boolean }) => {
+  .action(async (options: { llm?: string; model?: string; baseUrl?: string; keyEnv?: string; keyStdin?: boolean; forgetKey?: boolean; file?: string[]; files: boolean; app?: string | false; maxCpu?: string; check?: boolean; denyFile?: string; authDenyFile?: string; llmDenyFile?: string; denyFormat?: string; reload?: string; deny: boolean }) => {
     let key: string | undefined;
     if (options.keyStdin) {
       if (process.stdin.isTTY) throw new Error("Pipe your key from a secret manager, e.g. 'op read op://vault/openai/key | beam monitor configure --llm openai --key-stdin'.");
@@ -706,6 +721,8 @@ monitor.command("configure")
       llm: options.llm, model: options.model, baseUrl: options.baseUrl, keyEnv: options.keyEnv, key, forgetKey: options.forgetKey,
       files: options.file, noFiles: options.files === false, app: typeof options.app === "string" ? options.app : undefined, noApp: options.app === false,
       maxCpu: options.maxCpu === undefined ? undefined : Number(options.maxCpu),
+      denyFile: options.denyFile, authDenyFile: options.authDenyFile, llmDenyFile: options.llmDenyFile, denyFormat: options.denyFormat, reload: options.reload,
+      noDeny: options.deny === false,
       check: options.check,
     });
   });
@@ -719,6 +736,23 @@ monitor.command("status")
   .description("Show whether App monitoring is on for this workspace, its level, and this month's usage")
   .option("--llm <provider>", LLM_OPTION)
   .action(async (options: { llm?: string }) => { process.exitCode = await monitorStatus(console.log, options.llm); });
+
+monitor.command("pause <target>")
+  .description("Pause an address, a range (up to /16, IPv6 /32) or user:<id> for this app: the SDK answers it with a 429, and --deny-file lists it. Works whatever the dashboard's pausing mode")
+  .option("--for <duration>", "how long: 15m, 2h, 1d (up to 7d)", "1h")
+  .option("--scope <scope>", "all (the default), auth (sign-in routes only) or llm (LLM routes only)", "all")
+  .option("--reason <text>", "shown in the dashboard")
+  .action(async (target: string, options: { for?: string; scope?: string; reason?: string }) => { process.exitCode = await monitorPause(target, options); });
+
+monitor.command("unpause <target>")
+  .description("Lift a pause now. It isn't paused automatically again for a day")
+  .option("--scope <scope>", "lift only this scope (all, auth or llm); default: every scope")
+  .action(async (target: string, options: { scope?: string }) => { process.exitCode = await monitorUnpause(target, options); });
+
+monitor.command("paused")
+  .description("List what's paused for this app, and what a dry run would have paused")
+  .option("--json", "print JSON")
+  .action(async (options: { json?: boolean }) => { process.exitCode = await monitorPaused(options); });
 
 const cve = program.command("cve").description("Check an app's dependencies against Beam's vulnerability database");
 

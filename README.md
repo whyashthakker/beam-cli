@@ -52,6 +52,7 @@ beam studio                # open the local activity dashboard
 beam sync                  # fetch the latest organization policy
 beam monitor --file <log>  # watch a running app's logs and traffic (see App monitoring)
 beam monitor configure     # save what to watch and which LLM key to use; shows where each setting comes from
+beam monitor pause <ip>    # pause an attacker for this app (the SDK answers it with a 429); also unpause, paused
 beam cve check .           # check an app's dependencies for known vulnerabilities
 beam add package express   # scan an npm package and its dependencies, then install it if it passes
 beam packages scan .       # scan everything already in node_modules and .venv for malware
@@ -206,7 +207,7 @@ Run it under whatever keeps your app running: a systemd unit, a sidecar containe
 **Inside a Node.js or Next.js app (SDK).** Where the app doesn't write request logs (for example `next start` behind a platform proxy), monitor in-process instead. Detection runs in your app with the same rules, and only redacted findings leave it, sent in the background with `BEAM_APP_TOKEN`.
 
 - It has no dependencies and works in Next.js middleware, including the Edge runtime.
-- It never throws, never blocks a request, and never makes one wait on the network.
+- It never throws, never blocks a request on its own, and never makes one wait on the network. To refuse senders the workspace [paused](#pausing-attackers), return the verdict, as below.
 
 ```ts
 // middleware.ts (Next.js); npm i @agent-beam/beam
@@ -216,7 +217,7 @@ import { createAppMonitor } from "@agent-beam/beam/monitor";
 const beam = createAppMonitor(); // reads BEAM_APP_TOKEN
 
 export function middleware(request: NextRequest, event: NextFetchEvent) {
-  beam.request({
+  const verdict = beam.request({
     method: request.method,
     url: request.nextUrl.pathname + request.nextUrl.search,
     ip: request.headers.get("x-forwarded-for")?.split(",")[0]?.trim(),
@@ -225,11 +226,12 @@ export function middleware(request: NextRequest, event: NextFetchEvent) {
     // cf: request.cf,         // on Cloudflare Workers: verified bot, signed agent, bot score, JA4
   });
   event.waitUntil(beam.flush());
+  if (verdict.paused) return beam.pausedResponse(verdict); // a paused attacker: 429 + Retry-After
   return NextResponse.next();
 }
 ```
 
-For Express, report after the response so Beam knows what became of each request: `app.use((req, res, next) => { res.on("finish", () => beam.request({ method: req.method, url: req.originalUrl, ip: req.ip, userAgent: req.get("user-agent"), status: res.statusCode })); next(); })`. `beam.log(line)` checks application log lines too.
+For Express, `app.use(beam.middleware())` refuses paused senders and reports every other request after its response, with the status, so Beam knows what became of it. Or report yourself: `app.use((req, res, next) => { res.on("finish", () => beam.request({ method: req.method, url: req.originalUrl, ip: req.ip, userAgent: req.get("user-agent"), status: res.statusCode })); next(); })`. `beam.log(line)` checks application log lines too.
 
 **Only what might have worked is raised.** With a response status (from the SDK's `status`, or the access logs `beam monitor` reads), an attack the app refused (3xx or 4xx) is folded into one low-severity roll-up per rule every few minutes: never alerted on, not counted against the monthly allowance, and shown in the dashboard's attack analytics. Middleware runs before the response, so there the SDK also rolls up attacks on software a JavaScript app can't run, like WordPress, PHP or Java paths; set `proxiesOtherStacks: true` if the app proxies such paths to another server.
 
@@ -253,7 +255,7 @@ const beam = createAppMonitor({ watchOutbound: true });  // notes the host of ea
 
 **Framework-aware.** Tell Beam the app's framework (`createAppMonitor({ stack: "nextjs" })`, or `beam monitor --stack django`; `--app` detects it) and it adds that framework's rules, such as the Next.js middleware bypass, Laravel Ignition, Spring4Shell, exposed Spring actuators, Werkzeug consoles, Rails info pages, Go pprof and ASP.NET diagnostics. Attacks on frameworks the app doesn't run are rolled up instead of raised. Stacks: `nextjs`, `express`, `nestjs`, `vite`, `node`, `django`, `flask`, `fastapi`, `rails`, `laravel`, `php`, `wordpress`, `spring`, `java`, `go`, `dotnet`, `static`. Per-framework cookbooks: [docs.agentbeam.com/cookbooks/overview](https://docs.agentbeam.com/cookbooks/overview).
 
-**LLM features (prompt injection and friends).** If the app sends text to a model, check it on the way in and out with the same `beam` instance. Both calls run locally in microseconds and return what they found, so the app decides what to do. Beam itself still never blocks anything.
+**LLM features (prompt injection and friends).** If the app sends text to a model, check it on the way in and out with the same `beam` instance. Both calls run locally in microseconds and return what they found, so the app decides what to do. Beam itself still never blocks anything; `prompt(text, { user })` also returns `paused: true` for a sender paused from LLM routes.
 
 ```ts
 const beam = createAppMonitor({ canaries: [process.env.PROMPT_CANARY!] }); // a random string in your system prompt
@@ -308,6 +310,29 @@ What it looks for:
 - The workspace never lets "benign" silence a critical finding.
 
 Detection is heuristic. It will miss attacks it has no rule for, and some legitimate traffic will match. Use it alongside a web application firewall and regular patching, not instead of them.
+
+<a id="pausing-attackers"></a>**Pausing attackers.** ([details](https://docs.agentbeam.com/agent-cli/app-monitoring#pausing-attackers)) Beam can stop an attacker for a while instead of only telling you. A paused sender gets a 429 with `Retry-After`, only from the part of the app it went after:
+
+| Caught doing | Paused from | First pause |
+| --- | --- | --- |
+| Repeated failed sign-ins | Sign-in routes | 15 minutes |
+| Flooding LLM routes, or LLM spend past the budget | LLM routes (the user, when you pass `user`) | 15 minutes |
+| Walking the app's paths, or a scan that found a live path | The whole app | 1 hour |
+| A critical exploit that wasn't refused | The whole app | 1 hour |
+
+A repeat within a day pauses four times as long, up to 24 hours.
+
+- **Modes.** An admin picks the mode under App monitoring > Settings > Pausing: dry run (the default: apps list who they would have paused and refuse nobody), on, or off. Pauses made from a finding or with `beam monitor pause` apply in every mode, and **Lift** ends one.
+- **Who enforces it.** Your app does the refusing: the SDK's verdict above, `beam.middleware()`, or `beam.check({ ip, user, url })`. With `beam monitor`, `--deny-file` writes the paused addresses for nginx (or `--deny-format plain` for anything else) and `--reload` runs after each change.
+- **What's never paused.** An address the client could have forged (the first entry of a forwarded `X-Forwarded-For` list; on Cloudflare, Vercel and Fly.io the platform's own header is read instead), private and loopback addresses, and the allowlist.
+- **Limits.** IPv6 is paused by /64. If more than 50 senders would be paused within 10 minutes, apps stop pausing for 30 minutes and raise a finding.
+
+```bash
+beam monitor --file /var/log/nginx/access.log --deny-file /etc/nginx/beam/deny.conf --reload "nginx -s reload"
+beam monitor pause 203.0.113.9 --for 2h --reason "credential stuffing"   # also: --scope auth|llm, user:<id>, ranges
+beam monitor paused
+beam monitor unpause 203.0.113.9
+```
 
 **Alerts.** Findings appear on the dashboard's App monitoring and Risks pages and go to the webhooks a workspace admin adds there. Each webhook can be limited to critical, high and critical, or everything. Slack and Discord URLs get their native message format; any other URL gets JSON with a `findings` array. Every request is signed. To verify one:
 

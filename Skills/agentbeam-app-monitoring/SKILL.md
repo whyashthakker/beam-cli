@@ -57,7 +57,9 @@ Add the in-app SDK. It needs only the app token, no extra service or platform cr
 - Next.js `middleware.ts`: `const beam = createAppMonitor()` from `@agent-beam/beam/monitor` at module level. In `middleware(request, event)`, call `beam.request({ method: request.method, url: request.nextUrl.pathname + request.nextUrl.search, ip, userAgent })`, with `ip` from the first value of the `x-forwarded-for` header and `userAgent` from the `user-agent` header. Then call `event.waitUntil(beam.flush())`. Add the `event: NextFetchEvent` parameter if the function doesn't have it.
 - Express: an `app.use` middleware that calls `beam.request({ method: req.method, url: req.originalUrl, ip: req.ip, userAgent: req.get("user-agent") })` and then `next()`.
 
-The SDK never throws or blocks requests. The user sets `BEAM_APP_TOKEN` in the app's environment on their platform.
+The SDK never throws or blocks requests on its own. The user sets `BEAM_APP_TOKEN` in the app's environment on their platform.
+
+`beam.request()` returns a verdict saying whether the workspace paused this sender (an attacker caught scanning, guessing passwords or abusing LLM routes). Ask the user whether the app should refuse paused senders. If yes, in Next.js keep the result, `const verdict = beam.request({ ... })`, and return `beam.pausedResponse(verdict)` when `verdict.paused` is true, before `NextResponse.next()`. In Express, replace the reporting middleware with `app.use(beam.middleware())`, which does both. Pass `headers` (Next.js `request.headers`, Express `req.headers`) so Beam can tell a real client address from a forged `X-Forwarded-For`. Nothing is refused until an admin turns pausing on in the dashboard (it starts in dry run) or pauses someone.
 
 #### If the app calls an LLM
 
@@ -130,5 +132,6 @@ The test finding should appear within seconds on https://app.agentbeam.com/dashb
 - **Review flagged lines with the user's own key:** `beam monitor configure --llm openai` (or anthropic, gemini, groq, openrouter, mistral, deepseek, xai, ollama, custom) uses the provider key the user already keeps in that server's environment. The key stays on that server; never read or print it. `beam monitor test --llm <provider>` proves it works.
 - **Save the setup:** `beam monitor configure --file <log> --app <dir>` writes `~/.beam/monitor.json`, so the service can run a plain `beam monitor`.
 - **Separate alert channels:** add webhooks in App monitoring settings and limit each one to particular apps.
+- **Pause attackers at the web server:** where `beam monitor` reads nginx logs, it can also write paused addresses to a deny list: `beam monitor configure --deny-file /etc/nginx/beam/deny.conf --reload "nginx -s reload"`, plus `include /etc/nginx/beam/deny.conf;` in the `server` block. Ask before you change the web server's config, and run `nginx -t` after. `beam monitor pause <ip> --for 15m` then `beam monitor paused` proves it; `beam monitor unpause <ip>` lifts it.
 - **False positives:** tell the user they can use **Create rule** on a finding in the dashboard to ignore findings like it, or keep them without alerting. Don't change the app or the rules to hide findings yourself.
 - **Full guide:** https://docs.agentbeam.com/agent-cli/app-monitoring

@@ -102,7 +102,7 @@ describe("config layers: managed, user, project", () => {
     await writeFile(join(home, "app", "beam.monitor.json"), JSON.stringify({ version: 1, files: ["/var/log/app.log"], llm: { provider: "openai" } }));
     const resolved = await resolveMonitorSettings({ cwd: join(home, "app") });
     expect(resolved.settings).toMatchObject({ maxCpuPercent: 10, files: ["/var/log/app.log"], llm: { provider: "openai" } });
-    expect(resolved.origins).toEqual({ files: "project", app: "default", maxCpuPercent: "managed", llm: "project" });
+    expect(resolved.origins).toEqual({ files: "project", app: "default", maxCpuPercent: "managed", llm: "project", pause: "default" });
   });
   it("lets IT lock settings that nothing below, flags included, can change", async () => {
     const { resolveMonitorSettings } = await import("../src/monitor-config.js");

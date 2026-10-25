@@ -5,6 +5,7 @@ import { readIdentity, type Identity } from "./enroll.js";
 import { getDashboardUrl } from "./config.js";
 import type { InstalledPackage } from "./lockfiles.js";
 import type { RequestMeta, RequestOutcome } from "./monitor-rules.js";
+import type { PauseReport, PauseScope, PauseSettings } from "./monitor-pause.js";
 
 /** What the App monitoring API needs: where to send, and the secret to send with. */
 export type MonitorAuth = Pick<Identity, "apiBase" | "deviceSecret">;
@@ -33,6 +34,15 @@ export interface MonitorUsage { findings: number; cveChecks: number; llmChecks: 
 export interface MonitorConfig {
   enabled: true; app: string | null; level: MonitorLevel; llm: boolean; webhooks: number;
   usage: MonitorUsage; limits: MonitorUsage; resetAt: string; settingsUrl: string;
+  /** Pausing (workspaces that have it): the mode and allowlist, the pauses in force, and those an admin lifted. */
+  pausing?: PauseSettings;
+  pauses?: PauseEntry[];
+  lifted?: { target: string; scope: PauseScope; at: string }[];
+}
+/** A pause as the workspace lists it. */
+export interface PauseEntry {
+  id?: string; target: string; scope: PauseScope; until: string; reason: string; ruleId?: string;
+  source: "auto" | "manual"; dryRun?: boolean; createdAt?: string;
 }
 export interface MonitorFinding {
   id: string; ruleId: string; title: string; severity: MonitorSeverity; category?: string;
@@ -120,6 +130,33 @@ export async function sendFindings(identity: MonitorAuth, findings: MonitorFindi
   if (!result.ok) return result;
   const body = result.body as { accepted?: number; dropped?: number };
   return { ok: true, accepted: body.accepted ?? 0, dropped: body.dropped ?? 0 };
+}
+
+/** Sends pauses this instance made, or (from `beam monitor pause`) asks for one. */
+export async function sendPauses(
+  identity: MonitorAuth,
+  pauses: (PauseReport | { target: string; scope: PauseScope; until: string; reason: string; source: "manual" })[],
+): Promise<{ ok: true; accepted: number; skipped: { target: string; reason: string }[] } | ApiFailure> {
+  const result = await call(identity, "/v1/monitor/pauses", { method: "POST", body: JSON.stringify({ pauses }) });
+  if (!result.ok) return result;
+  const body = result.body as { accepted?: number; skipped?: { target: string; reason: string }[] };
+  return { ok: true, accepted: body.accepted ?? 0, skipped: Array.isArray(body.skipped) ? body.skipped : [] };
+}
+
+/** The pauses in force for this app, dry runs included. */
+export async function listPauses(identity: MonitorAuth): Promise<{ ok: true; pauses: PauseEntry[]; mode: string } | ApiFailure> {
+  const result = await call(identity, "/v1/monitor/pauses");
+  if (!result.ok) return result;
+  const body = result.body as { pauses?: PauseEntry[]; mode?: string };
+  return { ok: true, pauses: Array.isArray(body.pauses) ? body.pauses : [], mode: typeof body.mode === "string" ? body.mode : "off" };
+}
+
+/** Lifts a pause on this target (one scope, or every scope). */
+export async function liftPause(identity: MonitorAuth, target: string, scope?: PauseScope): Promise<{ ok: true; lifted: number } | ApiFailure> {
+  const query = new URLSearchParams({ target, ...(scope ? { scope } : {}) });
+  const result = await call(identity, `/v1/monitor/pauses?${query}`, { method: "DELETE" });
+  if (!result.ok) return result;
+  return { ok: true, lifted: (result.body as { lifted?: number }).lifted ?? 0 };
 }
 
 export async function checkPackages(identity: MonitorAuth, packages: InstalledPackage[]): Promise<{ ok: true; result: CveCheckResult } | ApiFailure> {

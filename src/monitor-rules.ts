@@ -209,12 +209,41 @@ export function clientIp(line: string): string | undefined {
   return line.match(JSON_CLIENT_IP)?.[1] ?? line.match(LEADING_IP)?.[1] ?? line.match(BARE_IPV4)?.[0];
 }
 
+// Only fields a web server or platform fills from the connection, never a forwarded-for header.
+const JSON_SOCKET_IP = /"(?:srcIp|src_ip|clientIp|client_ip|remoteAddr|remote_addr|remoteIp|remote_ip)"\s*:\s*"\[?([0-9a-fA-F:.]{3,45})/;
+/**
+ * The client address in an access-log line, only when the client couldn't have written it: the
+ * first token of common log format (nginx's $remote_addr, which the realip module sets only from
+ * trusted proxies) or a connection field in JSON logs. Never X-Forwarded-For, and never an address
+ * found elsewhere in the line. Used to decide pauses.
+ */
+export function trustedLineIp(line: string): string | undefined {
+  return line.match(JSON_SOCKET_IP)?.[1] ?? line.match(LEADING_IP)?.[1] ?? authFailureIp(line);
+}
+
+const KEY_IP = /\b(?:client_)?ip=\[?([0-9a-fA-F:.]{3,45})/g;
+/**
+ * The address on an app's own failed sign-in line ("login failed user=42 ip=203.0.113.7"): the
+ * last ip= field, since anything the client typed (a username) comes before the app's own fields.
+ * Only for failed sign-ins, the one app-log detection that pauses by address.
+ */
+function authFailureIp(line: string): string | undefined {
+  if (!AUTH_FAIL_TEXT.test(line)) return undefined;
+  let last: string | undefined;
+  for (const m of line.matchAll(KEY_IP)) last = m[1];
+  return last;
+}
+
 const AUTH_PATH = /\/(?:login|signin|sign-in|auth|oauth|token|session|api\/v\d+\/auth|wp-login\.php|admin)\b/i;
 const AUTH_FAIL_TEXT = /\b(?:login|authentication|auth|sign[- ]?in)\s+(?:failed|failure|denied)|\binvalid\s+(?:password|credentials|username or password|api key|token)|\bfailed\s+password\b|\bincorrect\s+password\b|\bunauthori[sz]ed\b/i;
 const REQUEST_LINE = /"([A-Z]+) (\S+) HTTP\/[\d.]+"/;
 const JSON_METHOD = /"(?:method|http_method|request_method)"\s*:\s*"([A-Z]+)"/;
 const JSON_PATH = /"(?:path|uri|url|request_uri|requestPath)"\s*:\s*"([^"]+)"/;
 const LLM_PATH = /\/(?:chat|completions?|generate|llm|ai|assistant|agents?|ask|prompt|inference|copilot)(?:[/?#]|$)|\/v1\/(?:messages|responses|embeddings)(?:[/?#]|$)/i;
+/** A sign-in, token or admin route: where a pause for password guessing applies. */
+export const isAuthPath = (path: string) => AUTH_PATH.test(path.split(/[?#]/)[0] || "/");
+/** An LLM route (chat, completions, generate…): where a pause for model abuse applies. */
+export const isLlmPath = (path: string) => LLM_PATH.test(path.split(/[?#]/)[0] || "/");
 /** A POST to what looks like an LLM endpoint (chat, completions, generate…), each one a paid model call. */
 export function isLlmRequest(line: string): boolean {
   const request = line.match(REQUEST_LINE);

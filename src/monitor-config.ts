@@ -9,8 +9,9 @@
 //             committed with the app, so keys are refused there.
 //   environment variables, then command-line flags.
 //
-// Each top-level setting (files, app, maxCpuPercent, llm) comes whole from the highest layer that
-// sets it, so a project can't half-override a managed LLM setup. `beam monitor configure` shows
+// Each top-level setting (files, app, maxCpuPercent, llm, pause) comes whole from the highest layer
+// that sets it, so a project can't half-override a managed LLM setup. Pausing (deny lists and the
+// command that reloads the web server) can't come from a project file: it runs a command. `beam monitor configure` shows
 // where every effective value came from.
 //
 // It's created the first time a monitor command runs after an upgrade, carrying over older
@@ -22,6 +23,7 @@ import { constants } from "node:fs";
 import { mkdir, open, rename, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { getBeamHome } from "./config.js";
+import { DENY_FORMATS, type DenyFormat, type DenyListSettings } from "./monitor-deny.js";
 
 export interface MonitorLlmSettings {
   /** beam (Beam's model, set in the dashboard), or a provider: openai, anthropic, gemini, ... */
@@ -42,11 +44,14 @@ export interface MonitorFileConfig {
   /** The most of one CPU core detection may use, in percent; past it, lines are skipped until the next minute. */
   maxCpuPercent: number;
   llm: MonitorLlmSettings;
+  /** Where paused addresses are written for the web server, and how to reload it (monitor-deny.ts). */
+  pause: DenyListSettings;
 }
 
 export const monitorConfigPath = () => join(getBeamHome(), "monitor.json");
 export const DEFAULT_MONITOR_CONFIG: MonitorFileConfig = {
   version: 1, files: [], app: null, maxCpuPercent: 25, llm: { provider: "beam", model: null, baseUrl: null, apiKeyEnv: null },
+  pause: { denyFile: null, authDenyFile: null, llmDenyFile: null, format: "nginx", reload: null },
 };
 
 const invalid = (why: string) => new Error(`${monitorConfigPath()} is invalid (${why}). Fix it, or run 'beam monitor configure' to rewrite it.`);
@@ -65,6 +70,12 @@ export function validateMonitorConfig(value: unknown): MonitorFileConfig {
   if (!optionalString(llm.baseUrl, 2000)) throw invalid("llm.baseUrl must be a URL");
   if (!optionalString(llm.apiKeyEnv, 100) || (typeof llm.apiKeyEnv === "string" && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(llm.apiKeyEnv))) throw invalid("llm.apiKeyEnv must be a variable name");
   if (llm.apiKey !== undefined && (typeof llm.apiKey !== "string" || !llm.apiKey.trim() || /\s/.test(llm.apiKey) || llm.apiKey.length > 4096)) throw invalid("llm.apiKey must be a single key");
+  const pause = isRecord(value.pause) ? value.pause : {};
+  if (value.pause !== undefined && value.pause !== null && !isRecord(value.pause)) throw invalid("pause must be an object");
+  for (const field of ["denyFile", "authDenyFile", "llmDenyFile"] as const)
+    if (!optionalString(pause[field], 4096) || pause[field] === "") throw invalid(`pause.${field} must be a path`);
+  if (pause.format !== undefined && !DENY_FORMATS.includes(pause.format as DenyFormat)) throw invalid(`pause.format must be ${DENY_FORMATS.join(" or ")}`);
+  if (!optionalString(pause.reload, 1000) || pause.reload === "") throw invalid("pause.reload must be a command");
   return {
     version: 1,
     files: [...((value.files as string[] | undefined) ?? [])],
@@ -76,6 +87,13 @@ export function validateMonitorConfig(value: unknown): MonitorFileConfig {
       baseUrl: (llm.baseUrl as string | null | undefined) ?? null,
       apiKeyEnv: (llm.apiKeyEnv as string | null | undefined) ?? null,
       ...(typeof llm.apiKey === "string" ? { apiKey: llm.apiKey } : {}),
+    },
+    pause: {
+      denyFile: (pause.denyFile as string | null | undefined) ?? null,
+      authDenyFile: (pause.authDenyFile as string | null | undefined) ?? null,
+      llmDenyFile: (pause.llmDenyFile as string | null | undefined) ?? null,
+      format: (pause.format as DenyFormat | undefined) ?? "nginx",
+      reload: (pause.reload as string | null | undefined) ?? null,
     },
   };
 }
@@ -147,8 +165,8 @@ export function describeMonitorConfig(config: MonitorFileConfig): Record<string,
 }
 
 export type Layer = "default" | "managed" | "user" | "project";
-export type SettingKey = "files" | "app" | "maxCpuPercent" | "llm";
-const SETTING_KEYS: SettingKey[] = ["files", "app", "maxCpuPercent", "llm"];
+export type SettingKey = "files" | "app" | "maxCpuPercent" | "llm" | "pause";
+const SETTING_KEYS: SettingKey[] = ["files", "app", "maxCpuPercent", "llm", "pause"];
 export type PartialSettings = Partial<Pick<MonitorFileConfig, SettingKey>>;
 
 export function managedConfigPath(env: NodeJS.ProcessEnv = process.env): string {
@@ -168,6 +186,8 @@ export function validateLayer(value: unknown, kind: "managed" | "project", path:
   if (!isRecord(value) || (value.version !== undefined && value.version !== 1)) throw bad("unsupported version");
   if (isRecord(value.llm) && value.llm.apiKey !== undefined)
     throw bad("keys don't belong in a shared file: name the variable that holds it with llm.apiKeyEnv");
+  if (kind === "project" && value.pause !== undefined)
+    throw bad("pause runs a reload command on this server, so it can't come from a project file: set it with 'beam monitor configure' or in the managed config");
   const locked = value.locked ?? [];
   if (!Array.isArray(locked) || !locked.every(k => SETTING_KEYS.includes(k as SettingKey))) throw bad(`locked must list settings: ${SETTING_KEYS.join(", ")}`);
   if (kind === "project" && locked.length) throw bad("only the managed config can lock settings");

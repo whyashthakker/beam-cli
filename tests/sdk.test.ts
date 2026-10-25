@@ -248,6 +248,113 @@ describe("edge runtime safety", () => {
     };
     walk(resolve("src/sdk.ts"));
     expect(bad).toEqual([]);
-    expect([...seen].map(f => f.split("/").pop()).sort()).toEqual(["monitor-llm.ts", "monitor-pipeline.ts", "monitor-rules.ts", "monitor-signals.ts", "monitor-stacks.ts", "prompt-attacks.ts", "rule-catalog.ts", "sdk.ts"]);
+    expect([...seen].map(f => f.split("/").pop()).sort()).toEqual(["monitor-llm.ts", "monitor-pause.ts", "monitor-pipeline.ts", "monitor-rules.ts", "monitor-signals.ts", "monitor-stacks.ts", "prompt-attacks.ts", "rule-catalog.ts", "sdk.ts"]);
+  });
+});
+
+describe("pausing", () => {
+  let config: Record<string, unknown>;
+  let pausesPosted: { pauses: { target: string; scope: string; dryRun: boolean; ruleId: string }[] }[];
+  beforeEach(() => {
+    pausesPosted = [];
+    config = { enabled: true, app: "bgremover", level: "standard", pausing: { mode: "auto", allowlist: [], maxActive: 500, burst: 50 }, pauses: [], lifted: [] };
+    global.fetch = jest.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/monitor/config")) return Response.json(config);
+      if (url.endsWith("/v1/monitor/pauses")) { pausesPosted.push(JSON.parse(String(init?.body))); return Response.json({ accepted: 1 }, { status: 202 }); }
+      return Response.json({ accepted: 1 }, { status: 202 });
+    }) as typeof fetch;
+  });
+  const walk = (monitor: ReturnType<typeof createAppMonitor>, ip: string, headers: Record<string, string> = {}, n = 100) => {
+    let last = monitor.request({ method: "GET", url: "/", ip, headers });
+    for (let i = 0; i < n; i++) last = monitor.request({ method: "GET", url: `/page-${i}`, ip, headers });
+    return last;
+  };
+
+  it("pauses an address that walks the app, from the request that tipped it, and reports it", async () => {
+    const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test" });
+    await tick();
+    expect(monitor.request({ method: "GET", url: "/", ip: "203.0.113.9" })).toEqual({ paused: false });
+    const verdict = walk(monitor, "203.0.113.9");
+    expect(verdict).toMatchObject({ paused: true, scope: "all", target: "203.0.113.9" });
+    expect(verdict.retryAfter).toBeGreaterThan(3500);
+    expect(monitor.check({ ip: "203.0.113.9", url: "/anything" }).paused).toBe(true);
+    expect(monitor.check({ ip: "198.51.100.1", url: "/anything" }).paused).toBe(false);
+    await monitor.flush({ force: true });
+    expect(pausesPosted[0]!.pauses[0]).toMatchObject({ target: "203.0.113.9", scope: "all", dryRun: false, ruleId: "signal.path_walk" });
+  });
+  it("only reports what it would pause in dry run", async () => {
+    config.pausing = { mode: "dry_run" };
+    const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test" });
+    await tick();
+    expect(walk(monitor, "203.0.113.9")).toMatchObject({ paused: false, wouldPause: true });
+    await monitor.flush({ force: true });
+    expect(pausesPosted[0]!.pauses[0]).toMatchObject({ dryRun: true });
+  });
+  it("never pauses an address the client wrote into X-Forwarded-For", async () => {
+    const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test" });
+    await tick();
+    // The app takes the first entry, which the client controls: pausing it could lock out a stranger.
+    const verdict = walk(monitor, "198.51.100.50", { "x-forwarded-for": "198.51.100.50, 203.0.113.9", host: "app.test" });
+    expect(verdict.paused).toBe(false);
+    expect(monitor.check({ ip: "198.51.100.50", url: "/" }).paused).toBe(false);
+  });
+  it("still refuses a paused address when it arrives in a forwarded header", async () => {
+    config.pauses = [{ target: "198.51.100.50", scope: "all", until: new Date(Date.now() + 600_000).toISOString(), reason: "x", source: "manual" }];
+    const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test" });
+    await tick();
+    const headers = { "x-forwarded-for": "198.51.100.50, 203.0.113.9" };
+    expect(monitor.request({ method: "GET", url: "/", ip: "198.51.100.50", headers }).paused).toBe(true);
+  });
+  it("enforces the workspace's pauses and builds the 429", async () => {
+    config.pausing = { mode: "off" };
+    config.pauses = [{ target: "203.0.113.50", scope: "all", until: new Date(Date.now() + 600_000).toISOString(), reason: "Paused in the dashboard", source: "manual" }];
+    const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test" });
+    await tick();
+    const verdict = monitor.request({ method: "GET", url: "/", ip: "203.0.113.50" });
+    expect(verdict.paused).toBe(true);
+    const response = monitor.pausedResponse(verdict);
+    expect(response.status).toBe(429);
+    expect(Number(response.headers.get("retry-after"))).toBeGreaterThan(500);
+    expect(await response.text()).not.toContain("dashboard");
+  });
+  it("refuses a paused user's prompts before they reach the model", async () => {
+    config.pauses = [{ target: "user:u_1", scope: "llm", until: new Date(Date.now() + 600_000).toISOString(), reason: "x", source: "manual" }];
+    const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test" });
+    await tick();
+    expect(monitor.prompt("hello", { user: "u_1" })).toMatchObject({ paused: true });
+    expect(monitor.prompt("hello", { user: "u_2" }).paused).toBeUndefined();
+  });
+  it("middleware() answers paused senders with a 429 and reports the rest after the response", async () => {
+    config.pauses = [{ target: "203.0.113.50", scope: "all", until: new Date(Date.now() + 600_000).toISOString(), reason: "x", source: "manual" }];
+    const monitor = createAppMonitor({ token: TOKEN, dashboardUrl: "https://dash.test" });
+    await tick();
+    const handler = monitor.middleware();
+    const res = () => {
+      const r = { statusCode: 200, headers: {} as Record<string, string>, body: "", finish: [] as (() => void)[],
+        setHeader(n: string, v: string) { r.headers[n] = v; }, end(b?: string) { r.body = b ?? ""; }, on(_e: "finish", l: () => void) { r.finish.push(l); } };
+      return r;
+    };
+    const paused = res();
+    let nexts = 0;
+    handler({ method: "GET", url: "/", ip: "203.0.113.50", headers: {} }, paused, () => { nexts++; });
+    expect(paused.statusCode).toBe(429);
+    expect(paused.headers["Retry-After"]).toBeDefined();
+    expect(nexts).toBe(0);
+    const ok = res();
+    handler({ method: "GET", url: "/api/items?id=1%20UNION%20SELECT%20password%20FROM%20users", ip: "198.51.100.1", headers: {} }, ok, () => { nexts++; });
+    expect(nexts).toBe(1);
+    ok.statusCode = 200;
+    ok.finish.forEach(f => f());
+    await monitor.flush({ force: true });
+    expect((global.fetch as jest.Mock).mock.calls.some(([u, i]) => String(u).endsWith("/findings") && String((i as RequestInit).body).includes("web.sql_injection"))).toBe(true);
+  });
+  it("is a pass-through without a token", () => {
+    const monitor = createAppMonitor({ token: "" });
+    expect(monitor.request({ method: "GET", url: "/" })).toEqual({ paused: false });
+    expect(monitor.check({ ip: "203.0.113.9" })).toEqual({ paused: false });
+    let called = false;
+    monitor.middleware()({ url: "/" }, { statusCode: 200, setHeader() {}, end() {} }, () => { called = true; });
+    expect(called).toBe(true);
   });
 });

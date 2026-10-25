@@ -120,6 +120,11 @@ export interface PipelineOptions {
    * are rolled up as not applicable, and its own framework's rules count in full.
    */
   stack?: Stack;
+  /**
+   * Called for every finding raised about a sender, new or a repeat folded into one already
+   * queued (the pause book decides whether to pause them). Errors are ignored.
+   */
+  onRaise?: (finding: MonitorFinding) => void;
 }
 
 const clock = () => (globalThis.performance?.now?.() ?? Date.now());
@@ -581,6 +586,7 @@ export class MonitorPipeline {
     const existing = this.seen.get(fp);
     if (existing && existing.bucket === bucket) {
       existing.finding.count++; // still queued: the batch carries the new count
+      this.notify(existing.finding);
       return;
     }
     const flood = Math.floor(now / FLOOD_WINDOW_MS);
@@ -592,12 +598,19 @@ export class MonitorPipeline {
     if (this.floodCount >= MAX_NEW_FINDINGS_PER_10_MIN) {
       const worst = this.suppressed && RANK[this.suppressed.severity] >= RANK[partial.severity] ? this.suppressed.severity : partial.severity;
       this.suppressed = { count: (this.suppressed?.count ?? 0) + 1, severity: worst };
+      // Not sent one by one, but a flood is exactly when pausing its senders matters.
+      this.notify({ id: `${fp}-${bucket}`, ...partial, count: 1, firstSeen: new Date(now).toISOString() });
       return;
     }
     this.floodCount++;
     const finding: MonitorFinding = { id: `${fp}-${bucket}`, ...partial, count: 1, firstSeen: new Date(now).toISOString() };
     this.seen.set(fp, { bucket, finding, at: now });
     this.enqueue(finding);
+    this.notify(finding);
+  }
+
+  private notify(finding: MonitorFinding): void {
+    try { this.opts.onRaise?.(finding); } catch { /* never let a hook break detection */ }
   }
 
   private emitSuppressed(): void {

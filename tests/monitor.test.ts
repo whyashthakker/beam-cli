@@ -632,3 +632,81 @@ describe("client addresses and JSON access logs", () => {
     expect(clientIp("worker connected to 10.0.0.5 ok")).toBe("10.0.0.5");
   });
 });
+
+describe("pausing in beam monitor", () => {
+  const originalEnv = { ...process.env };
+  const originalFetch = global.fetch;
+  const originalStdin = process.stdin;
+  let home: string;
+  let pauses: unknown[];
+  let mode: string;
+  beforeEach(async () => {
+    home = await mkdtemp(join(tmpdir(), "beam-pause-"));
+    process.env = { ...originalEnv, BEAM_HOME: home, BEAM_DATA_DIR: join(home, "data") };
+    await mkdir(join(home, "data"), { recursive: true });
+    await writeFile(join(home, "data", "identity.json"), JSON.stringify({ deviceId: "d1", deviceSecret: "secret", orgId: "o1", apiBase: "https://workspace.test" }));
+    pauses = [];
+    mode = "auto";
+    global.fetch = jest.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/monitor/config"))
+        return Response.json({
+          enabled: true, level: "standard", llm: false, webhooks: 0, usage: { findings: 0, cveChecks: 0, llmChecks: 0 }, limits: { findings: 1000, cveChecks: 100, llmChecks: 100 },
+          resetAt: "2026-11-01T00:00:00.000Z", settingsUrl: "https://workspace.test/dashboard/monitoring",
+          pausing: { mode, allowlist: [], maxActive: 500, burst: 50 },
+          pauses: [{ target: "198.51.100.0/24", scope: "all", until: new Date(Date.now() + 3_600_000).toISOString(), reason: "Paused in the dashboard", source: "manual" }],
+          lifted: [],
+        });
+      if (url.endsWith("/v1/monitor/pauses")) pauses.push(...(JSON.parse(String(init?.body)) as { pauses: unknown[] }).pauses);
+      return Response.json({ accepted: 1, dropped: 0 }, { status: 202 });
+    }) as typeof fetch;
+  });
+  afterEach(async () => {
+    process.env = { ...originalEnv };
+    global.fetch = originalFetch;
+    Object.defineProperty(process, "stdin", { value: originalStdin, configurable: true });
+    await rm(home, { recursive: true, force: true });
+  });
+  const walk = (ip: string) => Array.from({ length: 101 }, (_, i) => `${access(`/page-${i}`, ip, 404)}\n`);
+
+  it("writes paused addresses to the deny list, reloads, and empties it on the way out", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const deny = join(home, "beam-deny.conf");
+    const seen = join(home, "reloads.log");
+    const log = join(home, "access.log");
+    await writeFile(log, walk("203.0.113.9").join(""));
+    const logs: string[] = [];
+    const running = runMonitor({ files: [log], fromStart: true, denyFile: deny, reload: `echo reloaded >> "${seen}"` }, m => logs.push(m));
+    const read = () => readFile(deny, "utf8").catch(() => "");
+    for (let i = 0; i < 100 && !(await read()).includes("deny 203.0.113.9;"); i++) await new Promise(r => setTimeout(r, 50));
+    const during = await read();
+    process.emit("SIGTERM");
+    await running;
+    expect(during).toContain("deny 198.51.100.0/24;"); // the dashboard's pause
+    expect(during).toContain("deny 203.0.113.9;"); // this server's own, from the path walk
+    expect(await read()).not.toContain("deny "); // emptied at shutdown
+    expect((await readFile(seen, "utf8")).trim().split("\n").length).toBeGreaterThanOrEqual(2); // at start, and after emptying
+    expect(pauses).toEqual([expect.objectContaining({ target: "203.0.113.9", scope: "all", dryRun: false, ruleId: "signal.path_walk" })]);
+    expect(logs.join("\n")).toContain("Pausing: on");
+  });
+  it("only reports what it would pause when there's no deny list to enforce it", async () => {
+    Object.defineProperty(process, "stdin", { value: Readable.from(walk("203.0.113.9")), configurable: true });
+    const logs: string[] = [];
+    await runMonitor({ stdin: true, echo: false }, m => logs.push(m));
+    expect(pauses).toEqual([expect.objectContaining({ target: "203.0.113.9", dryRun: true })]);
+    expect(logs.join("\n")).toContain("only reports what it would pause");
+  });
+  it("pauses password guessing from the app's own failed sign-in lines, by the app's ip= field", async () => {
+    // The username is the client's text: an ip= inside it must not be what gets paused.
+    const lines = Array.from({ length: 25 }, () => "WARN login failed user=x ip=198.51.100.66 ip=203.0.113.9\n");
+    Object.defineProperty(process, "stdin", { value: Readable.from(lines), configurable: true });
+    await runMonitor({ stdin: true, echo: false, authDenyFile: join(home, "deny-auth.conf") }, () => {});
+    expect(pauses).toEqual([expect.objectContaining({ target: "203.0.113.9", scope: "auth", ruleId: "app.auth_bruteforce" })]);
+  });
+  it("never pauses an address read from X-Forwarded-For in a JSON log", async () => {
+    const lines = Array.from({ length: 101 }, (_, i) => `${JSON.stringify({ x_forwarded_for: "203.0.113.9", method: "GET", path: `/p-${i}`, status: 404 })}\n`);
+    Object.defineProperty(process, "stdin", { value: Readable.from(lines), configurable: true });
+    await runMonitor({ stdin: true, echo: false, denyFile: join(home, "deny.conf") }, () => {});
+    expect(pauses).toEqual([]);
+  });
+});

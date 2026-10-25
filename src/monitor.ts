@@ -3,7 +3,8 @@
 // workspace, which stores them, meters them and delivers them to the workspace's webhooks.
 //
 // It never blocks or alters the application: it reads log files (or a pipe it echoes straight
-// through) and does nothing else to the app. It is also inert until the workspace turns App
+// through) and does nothing else to the app. The one exception is opt-in: with --deny-file, the
+// senders the workspace pauses are written to a deny list for the web server in front of the app. It is also inert until the workspace turns App
 // monitoring on in the dashboard -- before that, and whenever it is turned off again or the
 // monthly allowance runs out, lines are read and discarded.
 import { createHash } from "node:crypto";
@@ -15,11 +16,14 @@ import { StringDecoder } from "node:string_decoder";
 import { readPolicy } from "./policy.js";
 import { readInstalledPackages } from "./lockfiles.js";
 import {
-  checkPackages, fetchMonitorConfig, monitorAuth, sendFindings,
-  type MonitorConfig, type MonitorFinding, type MonitorLevel, type MonitorSeverity, type Vulnerability,
+  checkPackages, fetchMonitorConfig, liftPause, listPauses, monitorAuth, sendFindings, sendPauses,
+  type MonitorAuth, type MonitorConfig, type MonitorFinding, type MonitorLevel, type MonitorSeverity, type Vulnerability,
 } from "./monitor-client.js";
+import { PAUSE_SCOPES, PauseBook, normalizeTarget, type PauseScope } from "./monitor-pause.js";
+import { DENY_FORMATS, DenyListWriter, type DenyFormat, type DenyListSettings } from "./monitor-deny.js";
+import { trustedLineIp } from "./monitor-rules.js";
 import { LLM_PROVIDERS, describeOwnLlm, detectedLlmKeys, judgeWithOwnLlm, ownLlmConfig, type OwnLlmConfig } from "./monitor-llm.js";
-import { ensureMonitorConfig, monitorConfigPath, resolveMonitorSettings, writeMonitorConfig, type MonitorFileConfig, type ResolvedSettings, type SettingKey } from "./monitor-config.js";
+import { DEFAULT_MONITOR_CONFIG, ensureMonitorConfig, monitorConfigPath, resolveMonitorSettings, writeMonitorConfig, type MonitorFileConfig, type ResolvedSettings, type SettingKey } from "./monitor-config.js";
 import type { CustomDetector } from "./data-detectors.js";
 
 export { BRUTE_FORCE_THRESHOLD, DEDUPE_WINDOW_MS, MAX_NEW_FINDINGS_PER_10_MIN, MonitorPipeline, meetsLevel, type PipelineOptions, type SendOutcome } from "./monitor-pipeline.js";
@@ -134,6 +138,31 @@ export interface MonitorOptions {
   config?: string;
   /** The app's framework (--stack). Default: detected from the --app directory. */
   stack?: string;
+  /** Deny lists for paused senders (--deny-file, --auth-deny-file, --llm-deny-file), their format and the reload command. */
+  denyFile?: string;
+  authDenyFile?: string;
+  llmDenyFile?: string;
+  denyFormat?: string;
+  reload?: string;
+}
+
+/** The deny-list settings after the config layers: flags replace the saved ones unless the managed config locks them. */
+function pauseFrom(resolved: ResolvedSettings, options: MonitorOptions, log?: (message: string) => void): DenyListSettings {
+  const flags = Boolean(options.denyFile || options.authDenyFile || options.llmDenyFile || options.denyFormat || options.reload);
+  if (options.denyFormat !== undefined && !DENY_FORMATS.includes(options.denyFormat as DenyFormat))
+    throw new Error(`--deny-format must be ${DENY_FORMATS.join(" or ")}.`);
+  if (!flags) return resolved.settings.pause;
+  if (resolved.locked.has("pause")) {
+    log?.("Your organization's managed config sets the deny lists; --deny-file and --reload don't apply.");
+    return resolved.settings.pause;
+  }
+  return {
+    denyFile: options.denyFile ? resolve(options.denyFile) : null,
+    authDenyFile: options.authDenyFile ? resolve(options.authDenyFile) : null,
+    llmDenyFile: options.llmDenyFile ? resolve(options.llmDenyFile) : null,
+    format: (options.denyFormat as DenyFormat | undefined) ?? resolved.settings.pause.format,
+    reload: options.reload ?? null,
+  };
 }
 
 const MAX_BACKOFF_MS = 5 * 60_000;
@@ -186,6 +215,35 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
   const identity = await monitorAuth();
   if (!identity) throw new Error("Set BEAM_APP_TOKEN to the app's token from App monitoring > Settings, apps and alerts in the dashboard, or connect this machine with 'beam connect'.");
   const custom = (await readPolicy())?.rules.customDetectors ?? [];
+  const denySettings = pauseFrom(resolved, options, log);
+  const denyLists = new DenyListWriter(denySettings, log);
+  // Who the finding being raised is about: only an address the client couldn't have written.
+  let who: { ip?: string } | null = null;
+  let pausesUnsupported = false;
+  let pauseNotice = "";
+  const book = new PauseBook({
+    onNotice: (message, kind) => {
+      log(`⚠ ${message}`);
+      if (kind === "breaker")
+        pipeline?.addFinding({
+          id: `pause-breaker-${Math.floor(Date.now() / 1_800_000)}`, ruleId: "beam.pause.breaker", title: "Automatic pausing stopped: too many senders at once",
+          severity: "high", category: "activity", source: "http", count: 1, firstSeen: new Date().toISOString(), evidence: message,
+        });
+    },
+  });
+  // Without a deny list nothing here can refuse a request, so an "auto" workspace gets a dry run from this server.
+  const configurePauses = (next: MonitorConfig | null) => {
+    const pausing = next?.pausing;
+    const mode = pausing?.mode === "auto" && !denyLists.enabled ? "dry_run" : pausing?.mode;
+    book.configure(pausing ? { ...pausing, mode } : null, next?.pauses ?? [], next?.lifted ?? []);
+    const notice = pausing?.mode === "auto" && !denyLists.enabled
+      ? "Pausing is on in the dashboard, but this server has no deny list, so it only reports what it would pause. Add --deny-file <path> (and --reload \"nginx -s reload\") to enforce it."
+      : pausing && pausing.mode !== "off" && denyLists.enabled ? `Pausing: ${pausing.mode === "auto" ? "on" : "dry run"}. Paused addresses go to ${[denySettings.denyFile, denySettings.authDenyFile, denySettings.llmDenyFile].filter(Boolean).join(", ")}.` : "";
+    if (notice && notice !== pauseNotice) log(notice);
+    pauseNotice = notice;
+    void denyLists.update(book.active());
+  };
+  let pipeline: MonitorPipeline | undefined;
 
   let config: MonitorConfig | null = null;
   let lastRefresh = 0;
@@ -211,12 +269,14 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
       config = result.config;
       offNotice = false;
       rejected = false;
+      configurePauses(config);
       return;
     }
     if (result.status === "disabled") {
       if (!offNotice) log(`${result.message}${options.wait === false ? "" : " Nothing is captured until then; checking again every minute."}`);
       offNotice = true;
       config = null;
+      configurePauses(null);
       return;
     }
     if (result.status === "revoked" || result.status === "unsupported") {
@@ -241,12 +301,20 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
     throw new Error(`--stack must be one of: ${STACKS.join(", ")}.`);
   const stack = isStack(options.stack) ? options.stack : appDir ? detectStack(appDir) ?? undefined : undefined;
   if (stack) log(`Stack: ${stack}${options.stack ? "" : ` (detected from ${appDir})`}. Attacks on other frameworks are rolled up.`);
-  const pipeline = new MonitorPipeline({
+  const monitorPipeline = new MonitorPipeline({
     stack,
     level: () => (config && Date.now() >= pausedUntil ? config.level : null),
     customDetectors: () => custom,
     cpuBudgetMsPerMinute: 600 * maxCpu, // 1% of a core = 600 ms per minute
+    onRaise: finding => {
+      if (who && book.consider(finding, who)) void denyLists.update(book.active());
+    },
   });
+  pipeline = monitorPipeline;
+  const ingest = (line: string, file: string) => {
+    who = { ip: trustedLineIp(line) };
+    try { monitorPipeline.ingestLine(line, file); } finally { who = null; }
+  };
   const send = async (batch: MonitorFinding[]): Promise<SendOutcome> => {
     if (ownLlm && config) await judgeWithOwnLlm(batch, config.level, ownLlm);
     const result = await sendFindings(identity, batch);
@@ -279,12 +347,22 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
     if (!result.ok) { log(`Dependency check skipped: ${result.message}`); return; }
     const { vulnerabilities, checked } = result.result;
     log(`Dependency check: ${vulnerabilities.length} known vulnerabilit${vulnerabilities.length === 1 ? "y" : "ies"} in ${checked} packages under ${appDir}.`);
-    for (const v of vulnerabilities) pipeline.addFinding(vulnerabilityFinding(v));
+    for (const v of vulnerabilities) monitorPipeline.addFinding(vulnerabilityFinding(v));
   };
 
-  const tailers = files.map(path => new FileTailer(path, line => pipeline.ingestLine(line, path), options.fromStart));
+  const tailers = files.map(path => new FileTailer(path, line => ingest(line, path), options.fromStart));
   for (const tailer of tailers) tailer.start();
   if (files.length) log(`Watching ${files.join(", ")}.`);
+
+  // Pauses this server made go to the workspace (the dashboard, and the app's other instances).
+  const reportPauses = async () => {
+    if (pausesUnsupported || !book.size.reports) return;
+    const batch = book.takeReports().slice(-100);
+    const result = await sendPauses(identity, batch);
+    if (result.ok) return;
+    if (result.status === "unsupported") pausesUnsupported = true;
+    else if (result.status === "unreachable") book.returnReports(batch);
+  };
 
   // When AgentBeam is unreachable or erroring, sends back off (with jitter, up to 5 minutes) instead
   // of retrying every few seconds; findings wait in a queue capped at 1,000.
@@ -296,11 +374,12 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
     flushing = true;
     let retry = false;
     try {
-      await pipeline.flush(async batch => {
+      await monitorPipeline.flush(async batch => {
         const outcome = await send(batch);
         retry = outcome === "retry";
         return outcome;
       }, { force });
+      await reportPauses();
     } finally {
       flushing = false;
       if (retry) nextSendAt = Date.now() + backoff(++sendFailures);
@@ -318,7 +397,7 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
   let draining = false;
   const drain = () => {
     const until = performance.now() + 20;
-    while (backlogHead < backlog.length && performance.now() < until) pipeline.ingestLine(backlog[backlogHead++]!, "stdin");
+    while (backlogHead < backlog.length && performance.now() < until) ingest(backlog[backlogHead++]!, "stdin");
     if (backlogHead > 1000) { backlog.splice(0, backlogHead); backlogHead = 0; }
     if (backlogHead < backlog.length) setImmediate(drain);
     else draining = false;
@@ -331,11 +410,13 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
       if (Date.now() - lastRefresh >= every) void refresh().catch(e => { fatal = e as Error; });
     }, 15_000),
     setInterval(() => {
-      const skipped = (pipeline.budget?.takeSkipped() ?? 0) + pipedSkipped;
+      const skipped = (monitorPipeline.budget?.takeSkipped() ?? 0) + pipedSkipped;
       pipedSkipped = 0;
       if (skipped) log(`Skipped ${skipped} lines in the last minute to stay under ${maxCpu}% of a CPU (--max-cpu).`);
     }, 60_000),
     setInterval(() => void checkDependencies(), 24 * 60 * 60_000),
+    // Pauses end on their own: the lists drop them as they expire.
+    setInterval(() => void denyLists.update(book.active()), 15_000),
   ];
   for (const timer of timers) timer.unref?.();
   void checkDependencies();
@@ -371,14 +452,86 @@ export async function runMonitor(options: MonitorOptions, log: (message: string)
   process.removeListener("SIGINT", stop);
   process.removeListener("SIGTERM", stop);
   // What's left of the piped backlog, then a last flush, bounded so a dead network can't hold up shutdown.
-  while (backlogHead < backlog.length) pipeline.ingestLine(backlog[backlogHead++]!, "stdin");
+  while (backlogHead < backlog.length) ingest(backlog[backlogHead++]!, "stdin");
   let giveUp: NodeJS.Timeout | undefined;
   await Promise.race([flush(true), new Promise(r => { giveUp = setTimeout(r, 5_000); })]);
   clearTimeout(giveUp);
+  // A deny list nobody keeps current would refuse those addresses forever.
+  if (denyLists.enabled) await denyLists.clear();
   if (fatal) throw fatal;
 }
 
 const fmt = (n: number) => (n >= 2_147_483_647 ? "unlimited" : n.toLocaleString("en-US"));
+const MODE_LABELS: Record<string, string> = { off: "off", dry_run: "dry run (reports what it would pause)", auto: "on" };
+
+function pausingLine(config: MonitorConfig, resolved: ResolvedSettings | null): string {
+  if (!config.pausing) return "not available on this workspace yet";
+  const active = (config.pauses ?? []).filter(p => !p.dryRun).length;
+  const lists = resolved ? [resolved.settings.pause.denyFile, resolved.settings.pause.authDenyFile, resolved.settings.pause.llmDenyFile].filter(Boolean) : [];
+  return `${MODE_LABELS[config.pausing.mode] ?? config.pausing.mode}, ${active} paused now${lists.length ? ` · deny lists ${lists.join(", ")}` : " · this server has no deny list (the SDK enforces in-app)"}`;
+}
+
+/** "15m", "2h", "1d" as milliseconds: at least a minute, at most 7 days. */
+export function parseDuration(text: string): number | null {
+  const m = text.trim().match(/^(\d+)\s*(m|min|h|d)$/i);
+  if (!m) return null;
+  const ms = Number(m[1]) * ({ m: 60_000, min: 60_000, h: 3_600_000, d: 86_400_000 } as Record<string, number>)[m[2]!.toLowerCase()]!;
+  return ms >= 60_000 && ms <= 7 * 86_400_000 ? ms : null;
+}
+
+async function pauseAuth(write: (line: string) => void): Promise<MonitorAuth | null> {
+  let identity;
+  try { identity = await monitorAuth(); } catch (error) { write(`✖ ${(error as Error).message}`); return null; }
+  if (!identity) write("✖ Set BEAM_APP_TOKEN to the app's token from App monitoring > Settings, apps and alerts in the dashboard, or connect this machine with 'beam connect'.");
+  return identity;
+}
+
+/** `beam monitor pause <target>`: pause an address, range or user:<id> for this app, in every mode. */
+export async function monitorPause(target: string, options: { for?: string; scope?: string; reason?: string }, write: (line: string) => void = console.log): Promise<number> {
+  const normalized = normalizeTarget(target);
+  if (!normalized) { write("✖ Give an IPv4 or IPv6 address, a range no wider than /16 (IPv6: /32), or user:<id>."); return 1; }
+  const scope = (options.scope ?? "all") as PauseScope;
+  if (!PAUSE_SCOPES.includes(scope)) { write(`✖ --scope must be one of ${PAUSE_SCOPES.join(", ")}.`); return 1; }
+  const ms = parseDuration(options.for ?? "1h");
+  if (!ms) { write("✖ --for takes a duration like 15m, 2h or 1d (up to 7d)."); return 1; }
+  const identity = await pauseAuth(write);
+  if (!identity) return 1;
+  const until = new Date(Date.now() + ms).toISOString();
+  const reason = (options.reason?.trim() || "Paused with beam monitor pause").slice(0, 200);
+  const result = await sendPauses(identity, [{ target: normalized, scope, until, reason, source: "manual" }]);
+  if (!result.ok) { write(`✖ ${result.status === "unsupported" ? "This workspace doesn't support pausing yet." : result.message}`); return 1; }
+  if (!result.accepted) { write(`✖ Not paused: ${result.skipped[0]?.reason ?? "the workspace refused it"}.`); return 1; }
+  write(`✔ Paused ${normalized}${scope === "all" ? "" : ` from ${scope === "auth" ? "sign-in" : "LLM"} routes`} until ${until.slice(0, 16).replace("T", " ")} UTC.`);
+  write("  Apps using the SDK refuse it within 5 minutes; beam monitor with --deny-file writes it to the deny list.");
+  return 0;
+}
+
+/** `beam monitor unpause <target>`: lift a pause now (it isn't remade automatically for a day). */
+export async function monitorUnpause(target: string, options: { scope?: string }, write: (line: string) => void = console.log): Promise<number> {
+  const normalized = normalizeTarget(target);
+  if (!normalized) { write("✖ Give the address, range or user:<id> that's paused."); return 1; }
+  if (options.scope && !PAUSE_SCOPES.includes(options.scope as PauseScope)) { write(`✖ --scope must be one of ${PAUSE_SCOPES.join(", ")}.`); return 1; }
+  const identity = await pauseAuth(write);
+  if (!identity) return 1;
+  const result = await liftPause(identity, normalized, options.scope as PauseScope | undefined);
+  if (!result.ok) { write(`✖ ${result.status === "unsupported" ? "This workspace doesn't support pausing yet." : result.message}`); return 1; }
+  write(result.lifted ? `✔ Lifted ${result.lifted} pause${result.lifted === 1 ? "" : "s"} on ${normalized}. It won't be paused automatically again for a day.` : `${normalized} wasn't paused.`);
+  return 0;
+}
+
+/** `beam monitor paused`: the pauses in force for this app, and the dry runs. */
+export async function monitorPaused(options: { json?: boolean }, write: (line: string) => void = console.log): Promise<number> {
+  const identity = await pauseAuth(write);
+  if (!identity) return 1;
+  const result = await listPauses(identity);
+  if (!result.ok) { write(`✖ ${result.status === "unsupported" ? "This workspace doesn't support pausing yet." : result.message}`); return 1; }
+  if (options.json) { write(JSON.stringify(result, null, 2)); return 0; }
+  write(`Pausing: ${MODE_LABELS[result.mode] ?? result.mode}`);
+  if (!result.pauses.length) { write("Nothing is paused."); return 0; }
+  for (const p of result.pauses)
+    write(`${p.dryRun ? "would pause" : "paused     "}  ${p.target.padEnd(24)} ${p.scope.padEnd(4)}  until ${p.until.slice(0, 16).replace("T", " ")} UTC  ${p.source === "manual" ? "by a person" : "automatic"}: ${p.reason}`);
+  return 0;
+}
 
 export async function monitorStatus(write: (line: string) => void = console.log, llm?: string): Promise<number> {
   let identity;
@@ -400,6 +553,7 @@ export async function monitorStatus(write: (line: string) => void = console.log,
     `Level:          ${level}`,
     `LLM checks:     ${own ? describeOwnLlm(own) : ownError ? `misconfigured: ${ownError}` : `${beamLlm ? "Beam's model" : "off"}${llmKeyHint(own)}`}`,
     `Webhooks:       ${webhooks}`,
+    `Pausing:        ${pausingLine(result.config, resolved)}`,
     `This month:     ${fmt(usage.findings)} / ${fmt(limits.findings)} findings · ${fmt(usage.cveChecks)} / ${fmt(limits.cveChecks)} dependency checks · ${fmt(usage.llmChecks)} / ${fmt(limits.llmChecks)} LLM checks (resets ${resetAt.slice(0, 10)})`,
     `Settings:       ${settingsUrl}`,
     `This server:    ${resolved ? originSummary(resolved) : monitorConfigPath()}`,
@@ -442,7 +596,7 @@ export async function monitorTest(write: (line: string) => void = console.log, l
   return 0;
 }
 
-const SETTING_LABELS: Record<SettingKey, string> = { files: "log files", app: "app directory", maxCpuPercent: "CPU cap", llm: "LLM check" };
+const SETTING_LABELS: Record<SettingKey, string> = { files: "log files", app: "app directory", maxCpuPercent: "CPU cap", llm: "LLM check", pause: "deny lists" };
 /** Where each setting came from, for status and configure output. */
 function originSummary(resolved: ResolvedSettings): string {
   return (Object.keys(SETTING_LABELS) as SettingKey[])
@@ -453,6 +607,7 @@ function originSummary(resolved: ResolvedSettings): string {
 export interface ConfigureOptions {
   llm?: string; model?: string; baseUrl?: string; keyEnv?: string; key?: string; forgetKey?: boolean;
   files?: string[]; noFiles?: boolean; app?: string; noApp?: boolean; maxCpu?: number;
+  denyFile?: string; authDenyFile?: string; llmDenyFile?: string; denyFormat?: string; reload?: string; noDeny?: boolean;
   /** Validate every config layer and exit 1 on a problem (for CI). */
   check?: boolean;
 }
@@ -492,8 +647,11 @@ export async function monitorConfigure(options: ConfigureOptions, write: (line: 
     key === "llm" ? Boolean(options.llm || options.model || options.baseUrl || options.keyEnv || options.key)
       : key === "files" ? Boolean(options.files?.length || options.noFiles)
       : key === "app" ? Boolean(options.app || options.noApp)
+      : key === "pause" ? Boolean(options.denyFile || options.authDenyFile || options.llmDenyFile || options.denyFormat || options.reload || options.noDeny)
       : options.maxCpu !== undefined));
   if (lockedEdits.length) write(`⚠ Your organization's managed config locks the ${lockedEdits.map(k => SETTING_LABELS[k]).join(" and ")}; saved values for ${lockedEdits.length === 1 ? "it" : "them"} won't apply.`);
+  if (options.denyFormat !== undefined && !DENY_FORMATS.includes(options.denyFormat as DenyFormat))
+    throw new Error(`--deny-format must be ${DENY_FORMATS.join(" or ")}.`);
   const provider = options.llm?.trim().toLowerCase();
   if (provider && provider !== "beam" && !(provider in LLM_PROVIDERS))
     throw new Error(`Unknown LLM provider "${provider}". Use one of ${Object.keys(LLM_PROVIDERS).join(", ")}, or beam for Beam's model.`);
@@ -503,6 +661,13 @@ export async function monitorConfigure(options: ConfigureOptions, write: (line: 
     files: options.noFiles ? [] : options.files?.length ? options.files.map(f => resolve(f)) : current.files,
     app: options.noApp ? null : options.app ? resolve(options.app) : current.app,
     maxCpuPercent: options.maxCpu ?? current.maxCpuPercent,
+    pause: options.noDeny ? { ...DEFAULT_MONITOR_CONFIG.pause } : {
+      denyFile: options.denyFile ? resolve(options.denyFile) : current.pause.denyFile,
+      authDenyFile: options.authDenyFile ? resolve(options.authDenyFile) : current.pause.authDenyFile,
+      llmDenyFile: options.llmDenyFile ? resolve(options.llmDenyFile) : current.pause.llmDenyFile,
+      format: (options.denyFormat as DenyFormat | undefined) ?? current.pause.format,
+      reload: options.reload ?? current.pause.reload,
+    },
     llm: {
       provider: provider ?? current.llm.provider,
       // A new provider starts from its own defaults rather than the old provider's model and endpoint.
@@ -521,5 +686,7 @@ export async function monitorConfigure(options: ConfigureOptions, write: (line: 
     write(`⚠ ${(error as Error).message} (Saved anyway: that may be set only where beam monitor runs.)`);
   }
   if (next.files.length || next.app) write(`Watches: ${[...next.files, ...(next.app ? [`dependencies in ${next.app}`] : [])].join(", ")}. Start with 'beam monitor'.`);
+  const lists = [next.pause.denyFile, next.pause.authDenyFile, next.pause.llmDenyFile].filter(Boolean);
+  if (lists.length) write(`Paused senders go to ${lists.join(", ")} (${next.pause.format})${next.pause.reload ? `, then '${next.pause.reload}' runs` : ""}. Pausing itself is turned on in the dashboard.`);
   return 0;
 }
