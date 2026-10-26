@@ -700,7 +700,7 @@ function emitAllow(agent: string, reason?: string, event = "PreToolUse"): void {
 // content", separately from the exit-0 hookSpecificOutput.permissionDecision path). Setting this
 // alongside the JSON is belt-and-suspenders, not a replacement -- the JSON still carries the
 // clean reason text; exit 2 just guarantees the block itself isn't silently skipped.
-const EXIT_2_FAILS_CLOSED = new Set(["claude-code", "codex", "cursor", "copilot-cli", "gemini", "opencode"]);
+const EXIT_2_FAILS_CLOSED = new Set(["claude-code", "codex", "cursor", "copilot-cli", "gemini", "opencode", "openclaw", "hermes"]);
 
 // Claude Code / Codex hook contract: a JSON decision on stdout denies the tool call or prompt.
 // Other agents get a stderr note only (their block contracts differ and aren't verified), except
@@ -727,8 +727,11 @@ function emitDeny(agent: string, reason: string, event = "PreToolUse"): void {
     process.stdout.write(JSON.stringify({ permissionDecision: "deny", permissionDecisionReason: `Beam: ${reason}` }));
   } else if (agent === "gemini") {
     process.stdout.write(JSON.stringify({ decision: "deny", reason: `Beam: ${reason}` }));
-  } else if (agent === "opencode") {
+  } else if (agent === "opencode" || agent === "openclaw") {
     process.stdout.write(JSON.stringify({ decision: "deny", reason: `Beam: ${reason}` }));
+  } else if (agent === "hermes") {
+    // Hermes shell hooks block with {"decision": "block", "reason"} (or exit 2, set below).
+    process.stdout.write(JSON.stringify({ decision: "block", reason: `Beam: ${reason}` }));
   } else {
     // OpenCode has no installed hook/plugin path in this repository. A message cannot block it.
     process.stderr.write(`\n✖ Beam cannot block this agent (${agent}): no verified enforcement adapter is installed.\n`);

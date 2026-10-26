@@ -91,6 +91,8 @@ AgentBeam is not Claude-specific. Setup discovers the agents actually installed 
 | Gemini CLI | Before-tool protection and activity capture |
 | GitHub Copilot CLI | Pre-tool protection and activity capture |
 | Cursor | Pre-tool protection and activity capture |
+| Hermes Agent | Pre-tool shell hook in `~/.hermes/config.yaml`; asks for approval on first use |
+| OpenClaw | `before_tool_call` plugin, registered with `openclaw plugins install --link` |
 | OpenCode | Shim-based protection where supported |
 | Jev (TypeSafe AI) | Discovery only — config/artifact presence; ecosystem is too fragmented across third-party CLIs (`jev-cli`, `jev-axi`, `jev-guard`) for a single hook contract yet |
 

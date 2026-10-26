@@ -2,9 +2,10 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { CUSTOM_INSTALLERS } from "./agent-installers.js";
 import { AGENTS, findAgent, hookConfigFullPath, type AgentDefinition, type Obj } from "./agents.js";
 
-export interface InstallResult { agent: string; path: string; alreadyInstalled: boolean }
+export interface InstallResult { agent: string; path: string; alreadyInstalled: boolean; note?: string }
 const OPEN_CODE_PLUGIN = `import { spawnSync } from "node:child_process";
 
 export const BeamPlugin = async () => ({
@@ -17,6 +18,15 @@ export const BeamPlugin = async () => ({
   },
 });
 `;
+
+// True when beam can wire this agent: a JSON hook file, the OpenCode plugin, or a custom installer.
+function canInstall(agent: AgentDefinition): boolean {
+  return agent.id === "opencode" || Boolean(agent.customInstall) || Boolean(agent.hookConfigPath && agent.mergeHookConfig);
+}
+
+function hookTarget(agentId: string) {
+  return { nodePath: process.execPath, cliPath: fileURLToPath(new URL("./cli.js", import.meta.url)), agentId };
+}
 
 // A bare "beam" command relies on beam's global bin symlink being resolvable on PATH -- but the
 // shell that runs an agent's hooks (e.g. Claude Code's own PreToolUse child process) doesn't
@@ -62,6 +72,10 @@ export async function installHook(agentId: string, home = homedir()): Promise<In
     if (!existing) { await mkdir(dirname(path), { recursive: true }); await writeFile(path, OPEN_CODE_PLUGIN, { mode: 0o600 }); }
     return { agent: agent.id, path, alreadyInstalled: Boolean(existing) };
   }
+  if (agent.customInstall) {
+    const result = await CUSTOM_INSTALLERS[agent.id].install(home, hookTarget(agent.id));
+    return { agent: agent.id, ...result };
+  }
   if (!agent.hookConfigPath || !agent.mergeHookConfig || !agent.unmergeHookConfig) throw new Error(`${agent.name} has no supported hook install path yet; see 'beam agent list' for its status.`);
 
   const path = hookConfigFullPath(agent, home);
@@ -91,7 +105,7 @@ export async function installHook(agentId: string, home = homedir()): Promise<In
   return { agent: agent.id, path, alreadyInstalled };
 }
 
-export interface UninstallResult { agent: string; path: string; removed: boolean }
+export interface UninstallResult { agent: string; path: string; removed: boolean; note?: string }
 
 // Reverse of installHook: strips beam's hook entry back out of the agent's config file, leaving
 // any other hooks untouched. A missing config file or one that never had beam installed is a
@@ -104,6 +118,10 @@ export async function uninstallHook(agentId: string, home = homedir()): Promise<
     const path = join(home, agent.pluginPath); const existing = await readFile(path, "utf8").catch(() => "");
     if (existing === OPEN_CODE_PLUGIN) { const { rm } = await import("node:fs/promises"); await rm(path, { force: true }); return { agent: agent.id, path, removed: true }; }
     return { agent: agent.id, path, removed: false };
+  }
+  if (agent.customInstall) {
+    const result = await CUSTOM_INSTALLERS[agent.id].uninstall(home);
+    return { agent: agent.id, ...result };
   }
   if (!agent.hookConfigPath || !agent.unmergeHookConfig) throw new Error(`${agent.name} has no supported hook path yet; see 'beam agent list' for its status.`);
 
@@ -134,7 +152,7 @@ export async function uninstallHook(agentId: string, home = homedir()): Promise<
 export async function uninstallAllHooks(home = homedir()): Promise<UninstallResult[]> {
   const results: UninstallResult[] = [];
   for (const agent of AGENTS) {
-    if (agent.id !== "opencode" && (!agent.hookConfigPath || !agent.unmergeHookConfig)) continue;
+    if (!canInstall(agent)) continue;
     results.push(await uninstallHook(agent.id, home));
   }
   return results;
@@ -151,6 +169,7 @@ export async function isHookInstalled(agentId: string, home = homedir()): Promis
     const existing = await readFile(join(home, agent.pluginPath), "utf8").catch(() => "");
     return existing === OPEN_CODE_PLUGIN;
   }
+  if (agent.customInstall) return CUSTOM_INSTALLERS[agent.id].isInstalled(home);
   if (!agent.hookConfigPath || !agent.unmergeHookConfig) return false;
   let existing: Obj = {};
   try {
@@ -168,7 +187,7 @@ export async function isHookInstalled(agentId: string, home = homedir()): Promis
 export async function installedHookAgentIds(home = homedir()): Promise<string[]> {
   const ids: string[] = [];
   for (const agent of AGENTS) {
-    if (agent.id !== "opencode" && (!agent.hookConfigPath || !agent.unmergeHookConfig)) continue;
+    if (!canInstall(agent)) continue;
     if (await isHookInstalled(agent.id, home)) ids.push(agent.id);
   }
   return ids;
@@ -192,7 +211,7 @@ export async function detectAgents(home = homedir()): Promise<AgentDefinition[]>
 }
 
 export type InstallAllStatus = "installed" | "already-installed" | "not-detected" | "not-supported" | "error";
-export interface InstallAllResult { agent: string; name: string; status: InstallAllStatus; path?: string; error?: string }
+export interface InstallAllResult { agent: string; name: string; status: InstallAllStatus; path?: string; error?: string; note?: string }
 
 // Detects which agents are actually present on this machine (via agents.ts's real, non-circular
 // config-presence signals — never the hook file beam itself would write) and installs beam's
@@ -201,10 +220,10 @@ export async function installAllDetectedHooks(home = homedir()): Promise<Install
   const results: InstallAllResult[] = [];
   for (const agent of AGENTS) {
     if (!(await isDetected(agent, home))) { results.push({ agent: agent.id, name: agent.name, status: "not-detected" }); continue; }
-    if (agent.id !== "opencode" && (!agent.hookConfigPath || !agent.mergeHookConfig)) { results.push({ agent: agent.id, name: agent.name, status: "not-supported" }); continue; }
+    if (!canInstall(agent)) { results.push({ agent: agent.id, name: agent.name, status: "not-supported" }); continue; }
     try {
       const result = await installHook(agent.id, home);
-      results.push({ agent: agent.id, name: agent.name, status: result.alreadyInstalled ? "already-installed" : "installed", path: result.path });
+      results.push({ agent: agent.id, name: agent.name, status: result.alreadyInstalled ? "already-installed" : "installed", path: result.path, note: result.note });
     } catch (e) {
       results.push({ agent: agent.id, name: agent.name, status: "error", error: e instanceof Error ? e.message : String(e) });
     }

@@ -58,7 +58,14 @@ function gemini(raw: Obj): Obj {
   };
 }
 
-const adapters = { passthrough, "copilot-camel": copilotCamel, generic, gemini };
+// Hermes Agent (pre_tool_call) and OpenClaw (before_tool_call) send the Claude-style fields but
+// name the event in their own words; core.normalize only marks an action "proposed" for PreToolUse.
+function preToolAlias(raw: Obj): Obj {
+  const name = typeof raw.hook_event_name === "string" ? raw.hook_event_name.toLowerCase() : "";
+  return name === "pre_tool_call" || name === "before_tool_call" ? { ...raw, hook_event_name: "PreToolUse" } : raw;
+}
+
+const adapters = { passthrough, "copilot-camel": copilotCamel, generic, gemini, "pre-tool-alias": preToolAlias };
 
 export function adaptHookPayload(sourceAgent: string, raw: Obj): Obj {
   const agent = findAgent(sourceAgent);

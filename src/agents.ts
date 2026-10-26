@@ -32,7 +32,7 @@ export interface AgentDefinition {
    */
   unmergeHookConfig: ((existing: Obj, isOwnCommand: (command: string) => boolean) => Obj) | null;
   /** Payload adapter id used by src/hook-adapters.ts to normalize this agent's stdin JSON. */
-  adapter: "passthrough" | "copilot-camel" | "generic" | "gemini";
+  adapter: "passthrough" | "copilot-camel" | "generic" | "gemini" | "pre-tool-alias";
   /** Whether the AGENT ITSELF (not just this entry's payload verification) is unverified — the
    * ecosystem around it is too new or too fragmented (e.g. many competing third-party CLIs with
    * no single canonical hook contract) to trust as a merge target yet. Detection-only. */
@@ -40,6 +40,8 @@ export interface AgentDefinition {
   /** Whether the adapter above was verified against vendor documentation (vs. best-effort). */
   verifiedPayload: boolean;
   notes: string;
+  /** Agents whose hook is not a mergeable JSON file; src/agent-installers.ts installs them. */
+  customInstall?: boolean;
 }
 
 function obj(v: unknown): Obj { return v && typeof v === "object" && !Array.isArray(v) ? v as Obj : {}; }
@@ -195,6 +197,22 @@ export const AGENTS: AgentDefinition[] = [
     hookConfigPath: null, pluginPath: ".opencode/plugins/beam.ts", hookEventName: "tool.execute.before",
     mergeHookConfig: null, unmergeHookConfig: null, adapter: "passthrough", verifiedPayload: true,
     notes: "Uses OpenCode's native tool.execute.before plugin hook."
+  },
+  {
+    id: "hermes", name: "Hermes Agent",
+    configs: [".hermes"], artifacts: [],
+    hookConfigPath: ".hermes/config.yaml", hookEventName: "pre_tool_call",
+    mergeHookConfig: null, unmergeHookConfig: null, customInstall: true,
+    adapter: "pre-tool-alias", verifiedPayload: true,
+    notes: "Installs a shell hook under hooks.pre_tool_call in ~/.hermes/config.yaml (default profile), between beam:begin/beam:end comments. Stdin fields (hook_event_name, tool_name, tool_input, session_id, cwd) and the block contract ({decision: \"block\", reason} or exit 2) verified against hermes-agent.nousresearch.com/docs/user-guide/features/hooks; tool_input shapes per Hermes tool are not. Hermes asks you to approve the hook on first use, and a hook that errors or times out fails open unless fail_closed is set."
+  },
+  {
+    id: "openclaw", name: "OpenClaw",
+    configs: [".openclaw"], artifacts: [],
+    hookConfigPath: null, hookEventName: "before_tool_call",
+    mergeHookConfig: null, unmergeHookConfig: null, customInstall: true,
+    adapter: "pre-tool-alias", verifiedPayload: false,
+    notes: "OpenClaw has no hook config file: beam writes a small plugin that registers api.on(\"before_tool_call\") and links it with 'openclaw plugins install --link' and 'openclaw plugins enable'. Registration and the { block, blockReason } return follow docs.openclaw.ai/plugins/hooks and published plugins, but the event field names are not printed in a reference, so the plugin reads them defensively; treat enforcement as unverified until you see a real event."
   },
   {
     id: "jev", name: "Jev (TypeSafe AI)",

@@ -809,6 +809,7 @@ agent.command("install")
     const result = await installHook(agentId);
     await recordExpectedHooks();
     console.log(result.alreadyInstalled ? `✔ Already installed for ${result.agent}\n  → ${result.path}` : `✔ Installed beam hook for ${result.agent}\n  → ${result.path}`);
+    if (result.note) console.log(`  ${result.note}`);
   });
 
 agent.command("uninstall")
@@ -826,6 +827,7 @@ agent.command("uninstall")
     const result = await uninstallHook(agentId);
     await recordExpectedHooks();
     console.log(result.removed ? `✔ Detached beam's hook from ${result.agent}\n  → ${result.path}` : `— No beam hook found for ${result.agent}.`);
+    if (result.note) console.log(`  ${result.note}`);
   });
 
 agent.command("extract")
@@ -851,7 +853,7 @@ agent.command("install-all")
     const results = await installAllDetectedHooks();
     await recordExpectedHooks();
     for (const r of results) {
-      if (r.status === "installed") console.log(`✔ Installed for ${r.name}\n  → ${r.path}`);
+      if (r.status === "installed") console.log(`✔ Installed for ${r.name}\n  → ${r.path}${r.note ? `\n  ${r.note}` : ""}`);
       else if (r.status === "already-installed") console.log(`✔ Already installed for ${r.name}`);
       else if (r.status === "not-supported") console.log(`— ${r.name} detected, but hook install isn't built for it yet`);
       else if (r.status === "error") console.log(`✖ ${r.name}: ${r.error}`);

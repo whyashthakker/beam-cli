@@ -107,7 +107,7 @@ export function normalize(raw: Obj): Event {
   const url = str(raw.url ?? input.url);
   let type = str(raw.event_type ?? raw.observed_event_type);
   if (!type) {
-    if (["Bash", "bash", "Shell", "shell", "exec_command", "shell_command", "exec"].includes(tool) && command) type = "command.exec";
+    if (["Bash", "bash", "Shell", "shell", "exec_command", "shell_command", "exec", "terminal"].includes(tool) && command) type = "command.exec";
     else if (["Read", "read_file"].includes(tool)) type = "file.read";
     else if (["Write", "Edit", "write_file", "apply_patch"].includes(tool)) type = "file.write";
     else if (["browser.navigate", "browser_navigate"].includes(tool)) type = "browser.navigate";
