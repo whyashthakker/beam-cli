@@ -11,6 +11,7 @@ import { syncPolicy } from "./forward.js";
 import { installAllDetectedHooks, type InstallAllResult } from "./install.js";
 import { startOsMonitor } from "./os-monitor.js";
 import { checkSkillsIfDue } from "./skill-watch.js";
+import { runSkillActions } from "./skill-remote.js";
 import { checkForTampering, recordExpectedHooks } from "./tamper.js";
 
 function toWebRequest(req: IncomingMessage): Promise<Request> {
@@ -113,7 +114,14 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
   let policyTimer: NodeJS.Timeout | undefined;
   const identity = await readIdentity();
   if (identity) {
-    const poll = () => { void syncPolicy().catch(() => {}); };
+    // The same minute-long poll also picks up skill removals and file requests queued in the dashboard (skill-remote.ts).
+    let skillActionsBusy = false;
+    const poll = () => {
+      void syncPolicy().catch(() => {});
+      if (skillActionsBusy) return;
+      skillActionsBusy = true;
+      void runSkillActions().catch(() => {}).finally(() => { skillActionsBusy = false; });
+    };
     poll();
     policyTimer = setInterval(poll, 60_000);
     policyTimer.unref?.();

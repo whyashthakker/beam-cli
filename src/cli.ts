@@ -29,6 +29,7 @@ import { scanSkillDir, type SkillScan } from "./skill-scan.js";
 import { syncSkillInventory } from "./skill-sync.js";
 import { agentSkillRoots, deviceSkillsScore, indexSkills, inventoryFile, readInventory, trustedHashes } from "./skill-inventory.js";
 import { readTrustedSkills, trustSkill, untrustSkill } from "./trusted-skills.js";
+import { runSkillActions } from "./skill-remote.js";
 import { runAgent } from "./run.js";
 import { AGENT_BINARIES, installShims, listShims, pathExportLine, shimDir, uninstallShims } from "./shims.js";
 import { runMcpProxy } from "./mcp-proxy.js";
@@ -627,13 +628,18 @@ skills.command("list")
   });
 
 skills.command("sync")
-  .description("Send skill names and risk scores (never contents) to your workspace, if they changed since the last send")
+  .description("Send skill names and risk scores to your workspace, if they changed since the last send, and carry out removals or file requests an administrator queued (skill text is sent only on request; BEAM_SKILL_REMOTE_ACTIONS=0 turns that off)")
   .option("--force", "send even if nothing changed")
   .action(async (options: { force?: boolean }) => {
     // Refreshes only the agents' own folders, so this never triggers a macOS folder-access prompt.
     // Run 'beam skills index' first if you want project folders included.
     const roots = await agentSkillRoots();
     if (roots.length || !await readInventory()) await indexSkills({ roots });
+    // Removals and file requests queued in the dashboard run first, so the report below already reflects them.
+    const actions = await runSkillActions().catch(() => null);
+    if (actions?.removed.length) console.log(`${green("✔")} Removed ${actions.removed.length} skill${actions.removed.length === 1 ? "" : "s"} requested from your workspace.`);
+    if (actions?.sent.length) console.log(`${green("✔")} Sent ${actions.sent.length} skill file${actions.sent.length === 1 ? "" : "s"} requested from your workspace.`);
+    for (const skipped of actions?.skipped ?? []) console.error(`✖ Skipped skill ${skipped.id}: ${skipped.reason}`);
     const result = await syncSkillInventory({ force: options.force });
     if (result.status === "sent") console.log(`${green("✔")} Sent ${result.skills} skills to your workspace.`);
     else if (result.status === "unchanged") console.log("Nothing changed since the last send. Use --force to send anyway.");
