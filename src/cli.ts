@@ -11,7 +11,7 @@ import { configuredPort, installService, serviceLogPaths, serviceStatus, startSe
 import { waitForCollectorUp } from "./collector-health.js";
 import { getBeamHome, getCollectorUrl, getDataDirectory, getIdentityPath } from "./config.js";
 import { clearIdentity, readIdentity } from "./enroll.js";
-import { startConnect } from "./connect.js";
+import { PlanLimitError, startConnect } from "./connect.js";
 import { runSetup, promptYesNo } from "./setup.js";
 import { installEnterprisePackage } from "./enterprise-install.js";
 import { fetchAccount, revokeDevice } from "./account.js";
@@ -426,7 +426,18 @@ program.command("connect")
     console.log(`Connect Beam CLI to Agentbeam:\n${cyan(session.url)}\n`);
     openBrowser(session.url);
 
-    const identity = await withSpinner("Waiting for you to finish in the browser", () => session.poll());
+    let identity;
+    try {
+      identity = await withSpinner("Waiting for you to finish in the browser", () => session.poll());
+    } catch (error) {
+      if (!(error instanceof PlanLimitError)) throw error;
+      console.error(`✖ ${error.message}`);
+      console.error(existing
+        ? "  This device stays connected as before."
+        : "  Beam keeps protecting this machine locally. Run 'beam connect' again once there's room.");
+      process.exitCode = 1;
+      return;
+    }
     console.log(
       `${green("✔")} Connected device ${identity.deviceId}\n` +
       `  org:      ${identity.orgId}\n` +

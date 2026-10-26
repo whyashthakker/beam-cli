@@ -2,7 +2,7 @@ import path from "node:path";
 import os from "node:os";
 import fs from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
-import { startConnect } from "../src/connect.js";
+import { PlanLimitError, startConnect } from "../src/connect.js";
 import { readIdentity } from "../src/enroll.js";
 
 const temporaryDirectories: string[] = [];
@@ -100,6 +100,24 @@ describe("startConnect", () => {
 
       const session = await startConnect();
       await expect(session.poll({ intervalMs: 1 })).rejects.toThrow("expired");
+    });
+
+    it("stops with the dashboard's reason when the plan has no room (402)", async () => {
+      process.env.BEAM_DASHBOARD_URL = "http://localhost:3001";
+      process.env.BEAM_HOME = await tempDir("beam-connect-home-");
+
+      const reason = "Every seat on this workspace's plan is taken (3). An admin can upgrade at https://app.agentbeam.com/dashboard/billing/plans.";
+      const fetchMock = jest.fn(async (url: string) => {
+        if (url.endsWith("/api/connect/start")) return { ok: true, json: async () => ({ ok: true }) } as Response;
+        return { ok: false, status: 402, json: async () => ({ status: "limit", error: reason }) } as Response;
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      const session = await startConnect();
+      const failure = session.poll({ intervalMs: 1 });
+      await expect(failure).rejects.toBeInstanceOf(PlanLimitError);
+      await expect(failure).rejects.toThrow(reason);
+      await expect(readIdentity()).resolves.toBeNull();
     });
 
     it("times out if never authorized within the given window", async () => {

@@ -14,6 +14,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * The workspace's plan has no room for this device (HTTP 402). The message is the dashboard's own,
+ * naming the limit and where an admin can upgrade; local protection keeps working without a workspace.
+ */
+export class PlanLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PlanLimitError";
+  }
+}
+
 async function readError(response: Response, fallback: string): Promise<string> {
   try {
     const body = (await response.json()) as { error?: string };
@@ -72,6 +83,8 @@ export async function startConnect(): Promise<ConnectSession> {
 
       if (pollResponse.status === 202) { await sleep(intervalMs); continue; }
       if (pollResponse.status === 404) throw new Error("Connection request expired. Run 'beam connect' again.");
+      if (pollResponse.status === 402)
+        throw new PlanLimitError(await readError(pollResponse, "This workspace's plan has no room for another device. Ask an admin to upgrade."));
       if (!pollResponse.ok) throw new Error(await readError(pollResponse, `Connection request failed (${pollResponse.status}).`));
 
       const data = (await pollResponse.json()) as {

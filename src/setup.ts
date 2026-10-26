@@ -1,6 +1,6 @@
 import { detectAgents, installHook } from "./install.js";
 import { readIdentity } from "./enroll.js";
-import { startConnect } from "./connect.js";
+import { PlanLimitError, startConnect } from "./connect.js";
 import { installEnterprisePackage } from "./enterprise-install.js";
 import { installService } from "./service.js";
 import { waitForCollectorUp } from "./collector-health.js";
@@ -125,14 +125,24 @@ export async function runSetup(): Promise<void> {
     const session = await startConnect();
     openBrowser(session.url);
     console.log(`  ${dim("Didn't open? Visit:")} ${cyan(session.url)}`);
-    identity = await withSpinner("Waiting for you to finish in the browser", () => session.poll());
-    ok(`Connected device ${identity.deviceId} (org ${identity.orgId})`);
-    dashboardStatus = `connected (${identity.deviceId})`;
+    // A full plan isn't a setup failure: say why, keep any existing connection, and carry on with
+    // local protection so the machine is covered either way.
+    const connected = await withSpinner("Waiting for you to finish in the browser", () => session.poll()).catch((error: unknown) => {
+      if (!(error instanceof PlanLimitError)) throw error;
+      fail(error.message);
+      skip(identity ? "Keeping this device's existing connection." : "Continuing with local protection. Run 'beam connect' once there's room.");
+      return null;
+    });
+    if (connected) {
+      identity = connected;
+      ok(`Connected device ${identity.deviceId} (org ${identity.orgId})`);
+      dashboardStatus = `connected (${identity.deviceId})`;
 
-    const enterprise = await withSpinner("Checking for beam-enterprise", () => installEnterprisePackage(identity!));
-    if (enterprise.status === "installed") ok("beam-enterprise installed (OS-level monitoring enabled).");
-    else if (enterprise.status === "error") fail(`Could not install beam-enterprise: ${enterprise.message}`);
-    // "not-entitled": org isn't on the enterprise plan -- nothing to print, this is the normal case.
+      const enterprise = await withSpinner("Checking for beam-enterprise", () => installEnterprisePackage(identity!));
+      if (enterprise.status === "installed") ok("beam-enterprise installed (OS-level monitoring enabled).");
+      else if (enterprise.status === "error") fail(`Could not install beam-enterprise: ${enterprise.message}`);
+      // "not-entitled": org isn't on the enterprise plan -- nothing to print, this is the normal case.
+    }
   } else if (!identity) {
     skip("Skipped. Run 'beam connect' whenever you're ready.");
   }
