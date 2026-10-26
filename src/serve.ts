@@ -12,6 +12,7 @@ import { installAllDetectedHooks, type InstallAllResult } from "./install.js";
 import { startOsMonitor } from "./os-monitor.js";
 import { checkSkillsIfDue } from "./skill-watch.js";
 import { runSkillActions } from "./skill-remote.js";
+import { runRemoteUpdate, supervised } from "./remote-update.js";
 import { checkForTampering, recordExpectedHooks } from "./tamper.js";
 
 function toWebRequest(req: IncomingMessage): Promise<Request> {
@@ -120,7 +121,12 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
       void syncPolicy().catch(() => {});
       if (skillActionsBusy) return;
       skillActionsBusy = true;
-      void runSkillActions().catch(() => {}).finally(() => { skillActionsBusy = false; });
+      // An update an administrator queued installs here; a supervised service then exits so its manager starts the new version.
+      void (async () => {
+        const update = await runRemoteUpdate().catch(() => null);
+        await runSkillActions().catch(() => {});
+        if (update?.status === "updated" && supervised()) process.exit(0);
+      })().finally(() => { skillActionsBusy = false; });
     };
     poll();
     policyTimer = setInterval(poll, 60_000);

@@ -5,6 +5,7 @@ import { redact } from "./core.js";
 import { readIdentity } from "./enroll.js";
 import { agentSkillRoots, indexSkills, readInventory, type InventorySkill } from "./skill-inventory.js";
 import { syncSkillInventory } from "./skill-sync.js";
+import { versionHeaders } from "./version.js";
 
 // What an administrator can ask this device to do with a skill from the dashboard: delete it, or
 // send its SKILL.md once. Both are polled from the workspace (GET /v1/skills/actions), named by the
@@ -54,7 +55,7 @@ export async function runSkillActions(options: { home?: string } = {}): Promise<
   if (!remoteActionsEnabled()) return null;
   const identity = await readIdentity();
   if (!identity) return null;
-  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${identity.deviceSecret}` };
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${identity.deviceSecret}`, ...versionHeaders() };
   let actions: { remove?: Array<{ id: string }>; read?: Array<{ id: string }> };
   try {
     const response = await fetch(`${identity.apiBase}/v1/skills/actions`, { headers, signal: AbortSignal.timeout(8000) });

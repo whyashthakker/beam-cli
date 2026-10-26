@@ -6,6 +6,7 @@ import { readIdentity } from "./enroll.js";
 import type { Event, Scan } from "./core.js";
 import type { McpInventory } from "./mcp-config.js";
 import type { SkillReport } from "./skill-sync.js";
+import { versionHeaders } from "./version.js";
 
 function policyPath(): string {
   return join(getDataDirectory(), "policy.json");
@@ -179,7 +180,7 @@ export async function syncPolicy(): Promise<PolicySyncResult> {
   let response: Response;
   try {
     response = await fetch(`${identity.apiBase}/v1/policy`, {
-      headers: { Authorization: `Bearer ${identity.deviceSecret}` },
+      headers: { Authorization: `Bearer ${identity.deviceSecret}`, ...versionHeaders() },
       signal: AbortSignal.timeout(5000),
     });
   } catch {

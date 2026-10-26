@@ -31,6 +31,8 @@ export interface UpdateState {
   installed?: { version: string; from: string; at: string };
   failed?: { version: string; at: string; reason: string };
   noticeShownAt?: string;
+  /** Last update an administrator requested from the dashboard, so a failing install isn't retried every minute. */
+  remoteAttempt?: { version: string; at: string };
 }
 
 export const updateStatePath = () => join(getBeamHome(), "update-state.json");
@@ -184,7 +186,7 @@ export async function runAutoUpdateWorker(deps: WorkerDeps): Promise<void> {
   }
 }
 
-function npmInstall(version: string): Promise<void> {
+export function npmInstall(version: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn("npm", ["install", "-g", `${PACKAGE}@${version}`, "--no-audit", "--no-fund", "--loglevel=error"], {
       stdio: "ignore",
