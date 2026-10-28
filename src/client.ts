@@ -414,15 +414,13 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
       environment: typeof data.environment === "string" ? data.environment : undefined,
       time: typeof data.timestamp === "string" ? data.timestamp : undefined,
     });
-    if ((decision.action === "allow" || decision.action === "warn") && isEnvironmentAccess(String(data.tool_name ?? ""), command, String(toolInput.file_path ?? toolInput.path ?? data.file_path ?? ""), toolInput)) {
-      // Sensitive data (.env, credentials, secrets) is never left at a soft, easy-to-miss
-      // stderr warning -- it's always promoted to a real approval gate, regardless of what the
-      // matched policy rule or risk mapping would otherwise have produced.
-      decision = {
-        ...decision,
-        action: "ask",
-        reason: "Reading environment variables or .env files requires approval.",
-      };
+    const readsEnvironment = isEnvironmentAccess(String(data.tool_name ?? ""), command, String(toolInput.file_path ?? toolInput.path ?? data.file_path ?? ""), toolInput);
+    if (readsEnvironment && decision.mode === "observe" && decision.action === "allow") {
+      // Allow-all still records this sensitive read as a risk, without turning it into an approval gate.
+      decision = { ...decision, riskScore: Math.max(decision.riskScore, 35), riskLevel: decision.riskScore >= 70 ? decision.riskLevel : "MEDIUM", riskFactors: [...new Set([...decision.riskFactors, "sensitive environment data"])], reason: "Sensitive environment data access was allowed and flagged for review." };
+    } else if (decision.mode !== "observe" && (decision.action === "allow" || decision.action === "warn") && readsEnvironment) {
+      // Sensitive data is always promoted to an approval gate in protective policy modes.
+      decision = { ...decision, action: "ask", reason: "Reading environment variables or .env files requires approval." };
     }
     const workspace = String(data.cwd ?? "");
     const targetPath = String(toolInput.file_path ?? toolInput.path ?? data.file_path ?? "");
@@ -435,8 +433,12 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
       };
     }
     const policyMode = decision.mode;
-    if (decision.action === "allow" && policyMode !== "observe" && workspace) {
+    if (decision.action === "allow" && workspace) {
       const escaping = outsideWorkspacePaths(workspace, targetPath, command);
+      if (policyMode === "observe" && escaping.length) {
+        decision = { ...decision, riskScore: Math.max(decision.riskScore, 35), riskLevel: decision.riskScore >= 70 ? decision.riskLevel : "MEDIUM", riskFactors: [...new Set([...decision.riskFactors, "access outside the current workspace"])], reason: "Access outside the current workspace was allowed and flagged for review." };
+      }
+      if (policyMode !== "observe") {
       if (escaping.length) {
         // A human can pre-approve specific outside-workspace paths with `beam trust <path>`
         // (~/.beam/data/trusted-paths.json) so this ask doesn't fire again for them. The agent
@@ -450,6 +452,7 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
           decision = { ...decision, action: "ask", reason: "This action accesses a path outside the current workspace." };
         }
       }
+      }
     }
 
     // Skill gate: any call that loads a skill (the Skill tool, or a read of SKILL.md / skills.md)
@@ -460,7 +463,7 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
         const skill = await gateSkill(String(data.tool_name ?? ""), toolInput, workspace, policyMode === "enforce");
         if (skill) {
           decision = { ...decision, riskScore: Math.max(decision.riskScore, skill.scan.score), riskLevel: skill.scan.level, riskFactors: [...decision.riskFactors, ...skill.scan.findings.slice(0, 5).map(f => f.title)] };
-          if (skill.action !== "allow") decision = { ...decision, action: skill.action, rule: "beam.skill-scan", reason: skill.reason };
+          if (skill.action !== "allow" && policyMode !== "observe") decision = { ...decision, action: skill.action, rule: "beam.skill-scan", reason: skill.reason };
           else if (skill.reason) process.stderr.write(`\n⚠ Beam skill scan: ${skill.reason}\n`);
         }
       } catch { /* best-effort: an unreadable skill never blocks the agent by itself */ }
