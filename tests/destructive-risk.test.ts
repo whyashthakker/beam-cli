@@ -11,6 +11,8 @@ describe("contextual destructive-operation severity", () => {
     'rm -fr -- /var/tmp/scratch-build',
     'rm -rf "/tmp/test-fixture"',
     'rm -rf /tmp/test-one /tmp/test-two',
+    'bash -c "rm -rf /tmp/test"',
+    "/bin/zsh -lc 'mkdir -p /tmp/beam-test-cleanup; echo dummy > /tmp/beam-test-cleanup/file; rm -rf /tmp/beam-test-cleanup'",
     'cd /repo\nmkdir -p /tmp/beam-anomaly-test\nbun /tmp/verify-anomaly.ts\nrm /tmp/verify-anomaly.ts\nrm -rf /tmp/beam-anomaly-test',
   ])("still reports narrow temporary test cleanup at MEDIUM: %s", input => {
     expect(deletion(input)?.severity).toBe("medium");
@@ -29,7 +31,7 @@ describe("contextual destructive-operation severity", () => {
     'sudo rm -rf /tmp/test', 'rm -rf ./test',
     'rm -rf /tmp/test-credentials', 'rm -rf /tmp/test/backups',
     'rm -rf /tmp/unclassified-data',
-    'bash -c "rm -rf /tmp/test"',
+    'bash -c "rm -rf /"',
   ])("retains HIGH for broad, uncertain or mixed destruction: %s", input => {
     expect(deletion(input)?.severity).toBe("high");
   });

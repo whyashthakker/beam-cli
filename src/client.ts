@@ -1,3 +1,5 @@
+import { classifyActionContext } from "./action-context.js";
+import { environmentRisk } from "./access-risk.js";
 import { mkdir, open, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -641,10 +643,14 @@ async function resolveWarnInteractively(decision: Decision, targetPath: string, 
 
 function isEnvironmentAccess(tool: string, command: string, path: string, input: Record<string, unknown>): boolean {
   const text = `${tool} ${command} ${path} ${Object.values(input).filter(value => typeof value === "string").join(" ")}`;
+  const context=classifyActionContext(tool,{...input,file_path:path},"",command,v=>v,false);
+  const scoped=environmentRisk(context);
+  if(context.actions.length && context.actions.every(a=>a.operation==="source-search"))return false;
   // File reads: .env, .env.local, .env.prod, etc. Also catch common env/config
   // locations that contain exported credentials.
   if (/(^|[\\/\s"'])\.env(?:\.[\w.-]+)?(?:$|[\\/\s"'])/i.test(text)) return true;
   if (/(^|[\\/\s"'])\.aws[\\/]credentials(?:$|[\\/\s"'])|(^|[\\/\s"'])\.config[\\/]gcloud(?:$|[\\/\s"'])/i.test(text)) return true;
+  if(scoped && ("suppress" in scoped || "severity" in scoped && scoped.severity==="info"))return false;
   // Shell/process environment reads: env, printenv, set, export -p, $FOO,
   // process.env, os.environ and equivalent tool arguments.
   return /\b(?:printenv|env|export\s+-p|process\.env|os\.environ|System\.getenv)\b/i.test(text)

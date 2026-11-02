@@ -8,6 +8,7 @@ export type ClassifiedAction = {
   target?: string; resolvedPath?: string; variableNames?: string[];
   scope?: "file-content" | "requested-lines" | "matching-output" | "named-variables" | "all-exported";
   lineStart?: number; lineEnd?: number; executable?: string;
+  origin?: "inline-assignment" | "inherited-environment";
   privileged?: boolean; insecureTransport?: boolean;
 };
 export type ActionContext = {
@@ -44,8 +45,9 @@ function repositoryAt(cwd: string, safe: (s: string) => string): ActionContext["
 
 /** Describe requested operations only. No command execution, secret-file reads,
  * output inspection, or inferred successful key access occurs here. */
-export function classifyActionContext(tool: string, input: Record<string,unknown>, cwd: string, command: string, safe: (s:string)=>string): ActionContext {
+export function classifyActionContext(tool: string, input: Record<string,unknown>, cwd: string, command: string, safe: (s:string)=>string, includeRepository = true, depth = 0): ActionContext {
   const actions: ClassifiedAction[]=[];let working=cwd;let omitted=false;
+  if(depth>4)return {schemaVersion:1,actions:[],truncated:true};
   const add=(action:ClassifiedAction)=> { if(actions.length>=12){omitted=true;return;} actions.push(action); };
   const file=(operation:ActionOperation,target:string,extra:Partial<ClassifiedAction>={})=>add({operation,evidence:command?"shell-syntax":"tool-arguments",target:safe(target),resolvedPath:!isDynamic(target)&&working&&isAbsolute(working)?safe(resolve(working,target)):isAbsolute(target)&&!isDynamic(target)?safe(target):undefined,...extra});
   const path=asString(input.file_path??input.path??input.filePath);
@@ -57,17 +59,35 @@ export function classifyActionContext(tool: string, input: Record<string,unknown
   else if(/^mcp(?:__|:|\.)/i.test(tool))add({operation:"mcp-call",evidence:"tool-arguments",target:safe(tool)});
   else if(!command && /^web(?:__|\.)|^(?:webfetch|websearch|fetch|browse)$/i.test(tool))add({operation:"network-request",evidence:"tool-arguments",target:safe(asString(input.url)||tool)});
   if(command) for(const c of shellActionCommands(command)) {
-    const tokens=c.tokens;let at=0;let privileged=false;
-    while(/^[A-Za-z_]\w*=/.test(tokens[at]?.value??""))at++;
+    const tokens=c.tokens;let at=0;let privileged=false;const inlineNames=new Set<string>();
+    while(/^[A-Za-z_]\w*=/.test(tokens[at]?.value??"")) {
+      const token=tokens[at]; const name=token.value.split("=",1)[0];
+      if(!/[$`]/.test(token.raw))inlineNames.add(name);
+      at++;
+    }
     if(tokens[at]?.value==="sudo"){privileged=true;at++;if(tokens[at]?.value.startsWith("-")){add({operation:"command",evidence:"shell-syntax",executable:"sudo",privileged:true});continue;}}
     const cmd=basename(tokens[at]?.value??"").toLowerCase();const args=tokens.slice(at+1).map(t=>t.value);
     if(!cmd)continue;
+    if(/^(?:bash|sh|zsh)$/.test(cmd) && args.length===2 && /^-[a-z]*c[a-z]*$/.test(args[0])) {
+      const code=tokens[at+2];
+      if(code && (code.raw.startsWith("'") || code.raw.startsWith('"')&&!/[$`]/.test(code.raw))) {
+        const nested=classifyActionContext("Bash",{},working,code.value,safe,false,depth+1);
+        for(const action of nested.actions)add(action.operation==="environment-lookup" && action.variableNames?.every(name=>inlineNames.has(name))?{...action,origin:"inline-assignment"}:action);
+        omitted ||= nested.truncated;continue;
+      }
+    }
     if(cmd==="cd"){working=args[0]&&!isDynamic(args[0])&&!c.pipe?resolve(working||cwd,args[0]):"";continue;}
+    if(/^(?:echo|printf)$/.test(cmd)) {
+      const redirect=args.findIndex(a=>a===">"||a===">>");
+      const target=redirect>=0?args[redirect+1]:args.find(a=>/^>/.test(a))?.replace(/^>+/,"");
+      if(target)file("file-write",target,{executable:cmd,privileged});
+      continue;
+    }
     if(cmd==="env"||cmd==="printenv"||cmd==="export"&&args.includes("-p")) {
       const names=args.filter(a=>!a.startsWith("-")&&a.length<=128&&ENV_NAME.test(a));
       if(args.some(a=>/^(?:--help|--version|-h)$/.test(a)) || cmd==="printenv" && args.some(a=>!a.startsWith("-")&&!names.includes(a))){add({operation:"command",evidence:"shell-syntax",executable:cmd,privileged});continue;}
       if(cmd==="env"&&args.length) { add({operation:"command",evidence:"shell-syntax",executable:cmd,privileged});continue; }
-      add({operation:names.length?"environment-lookup":"environment-dump",evidence:"shell-syntax",target:"process environment",variableNames:names.length?names.slice(0,12):undefined,scope:names.length?"named-variables":"all-exported",executable:cmd,privileged});continue;
+      add({operation:names.length?"environment-lookup":"environment-dump",evidence:"shell-syntax",target:"process environment",variableNames:names.length?names.slice(0,12):undefined,origin:names.length&&names.every(name=>inlineNames.has(name))?"inline-assignment":"inherited-environment",scope:names.length?"named-variables":"all-exported",executable:cmd,privileged});continue;
     }
     if(/^(?:node|bun|python[23]?)$/.test(cmd)) {
       const flag=args.findIndex(a=>/^(?:-e|-p|--eval|--print|-c)$/.test(a));
@@ -75,7 +95,7 @@ export function classifyActionContext(tool: string, input: Record<string,unknown
       const js=/^(?:console\.(?:log|info)\(\s*)?process\.env(?:\.([A-Za-z_][A-Za-z0-9_]{0,127})|\[['"]([A-Za-z_][A-Za-z0-9_]{0,127})['"]\])\s*\)?;?$/.exec(code);
       const py=/^import\s+os\s*;\s*print\(\s*os\.(?:environ\[['"]([A-Za-z_][A-Za-z0-9_]{0,127})['"]\]|getenv\(['"]([A-Za-z_][A-Za-z0-9_]{0,127})['"]\))\s*\)\s*;?$/.exec(code);
       const key=/^(?:node|bun)$/.test(cmd)?js?.[1]??js?.[2]:py?.[1]??py?.[2];
-      if(key){add({operation:"environment-lookup",evidence:"shell-syntax",target:"process environment",variableNames:[key],scope:"named-variables",executable:cmd,privileged});continue;}
+      if(key){add({operation:"environment-lookup",evidence:"shell-syntax",target:"process environment",variableNames:[key],origin:inlineNames.has(key)?"inline-assignment":"inherited-environment",scope:"named-variables",executable:cmd,privileged});continue;}
     }
     if(/^(?:grep|rg)$/.test(cmd)) {
       let pattern:string|undefined;const paths:string[]=[];
@@ -104,5 +124,5 @@ export function classifyActionContext(tool: string, input: Record<string,unknown
     if(cmd==="git"&&/^(?:push|reset|clean|filter-branch|filter-repo)$/.test(args[0]??"")){add({operation:"git-change",evidence:"shell-syntax",target:safe(args[0]),executable:cmd,privileged});continue;}
     if(!/^(?:echo|printf|ls|mkdir|true|head|wc)$/.test(cmd))add({operation:"command",evidence:"shell-syntax",executable:safe(cmd),privileged});
   }
-  return {schemaVersion:1,workingDirectory:cwd?safe(cwd):undefined,repository:repositoryAt(cwd,safe),actions,truncated:omitted};
+  return {schemaVersion:1,workingDirectory:cwd?safe(cwd):undefined,repository:includeRepository?repositoryAt(cwd,safe):undefined,actions,truncated:omitted};
 }

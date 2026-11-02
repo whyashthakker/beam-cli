@@ -1,3 +1,4 @@
+import { assessAccessFinding } from "./access-risk.js";
 import { classifyActionContext, type ActionContext } from "./action-context.js";
 import { createHash, randomUUID } from "node:crypto";
 import { beamVersion } from "./version.js";
@@ -45,8 +46,13 @@ function activeRules(): Rule[] { return [...builtinRules, ...customRules]; }
 export function ruleCatalog(): Omit<Rule, "match" | "severityFor">[] {
   return activeRules().map(({ match: _, severityFor: _severityFor, ...rule }) => rule);
 }
-export function detect(text: string): Finding[] {
-  return activeRules().filter(r => r.match(text)).map(r => {
+export function detect(text: string, request?: {tool:string;input:Record<string,unknown>;cwd:string;command:string}): Finding[] {
+  const rules=activeRules().filter(r=>r.match(text));
+  const access=rules.some(r=>["credentials.environment","source.private_files","credentials.access"].includes(r.id)) ? classifyActionContext(request?.tool??"Bash",request?.input??{},request?.cwd??"",request?.command??text,s=>s,false) : undefined;
+  return rules.flatMap(r => {
+    const assessment=access?assessAccessFinding(r.id,access):undefined;
+    if(assessment && "suppress" in assessment)return [];
+    const calibrated=assessment && "severity" in assessment?assessment:undefined;
     const spans = r.match.spans?.(text) ?? [];
     const indicators = spans.filter(span => Number.isSafeInteger(span.start) && Number.isSafeInteger(span.end) && span.start >= 0 && span.end > span.start && span.end <= text.length).slice(0, 8).map((span, index): DetectionIndicator => {
       const before = text.slice(0, span.start); const through = text.slice(0, span.end);
@@ -57,9 +63,9 @@ export function detect(text: string): Finding[] {
         column: span.start - before.lastIndexOf("\n"), endLine: through.split("\n").length,
         endColumn: span.end - through.lastIndexOf("\n"), coordinateSpace: "inspected-input" };
     });
-    return { id: r.id, title: r.title, category: r.category, severity: r.severityFor?.(text) ?? r.severity,
-      explanation: r.explanation, evidence: redact(text).slice(0, 600), indicators,
-      detector: { name: "beam-cli", version: beamVersion(), schemaVersion: 1 as const, evidenceStatus: indicators.length ? "exact" as const : "unavailable" as const } };
+    return [{ id: r.id, title: r.title, category: r.category, severity: calibrated?.severity ?? r.severityFor?.(text) ?? r.severity,
+      explanation: calibrated?.explanation ?? r.explanation, evidence: redact(text).slice(0, 600), indicators,
+      detector: { name: "beam-cli", version: beamVersion(), schemaVersion: 1 as const, evidenceStatus: indicators.length ? "exact" as const : "unavailable" as const } }];
   });
 }
 export function scanText(name: string, content: string, kind: "skill" | "mcp"): Scan {
@@ -148,7 +154,7 @@ export function normalize(raw: Obj): Event {
     else throw new Error("Record needs event_type or tool_name. Raw transcripts are not supported; normalize them first.");
   }
   const detail = command || path || url || str(raw.content_preview ?? raw.observed_content_preview ?? raw.summary) || tool || type;
-  const findings = /(?:result|message|telemetry)/.test(type) ? [] : detect(detail);
+  const findings = /(?:result|message|telemetry)/.test(type) ? [] : detect(detail,{tool,input,cwd:str(raw.cwd??raw.project_path),command});
   if (raw.record_type === "finding") {
     findings.push({ id: str(raw.rule_id, "imported.finding"), title: redact(str(raw.title, "Imported finding")), severity: ["critical", "high", "medium", "info"].includes(str(raw.severity)) ? raw.severity as Severity : "medium", explanation: "Imported rule match. It indicates a pattern, not proof of compromise or action completion.", evidence: redact(detail).slice(0, 600) });
   }

@@ -1,6 +1,12 @@
+import { shellActionCommands } from "./credential-egress.js";
 // Deliberately lexical: an explicit, narrow test/scratch path can lower the
 // severity, but does not establish ownership or inspect symlinks on the host.
-export function isScopedTemporaryCleanup(text: string): boolean {
+export function isScopedTemporaryCleanup(text: string, depth=0): boolean {
+  if(depth>4)return false;
+  const commands=shellActionCommands(text);
+  if(commands.length===1){const tokens=commands[0].tokens;
+    if(tokens.length===3 && /(?:^|\/)(?:bash|sh|zsh)$/.test(tokens[0].value) && /^-[a-z]*c[a-z]*$/.test(tokens[1].value) && /^['"]/.test(tokens[2].raw))return isScopedTemporaryCleanup(tokens[2].value,depth+1);
+  }
   let found = false;
   for (const segment of text.split(/[;&|\n]/)) {
     if (!/\brm\b/.test(segment)) continue;
