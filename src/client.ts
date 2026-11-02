@@ -9,6 +9,7 @@ import { evaluate, readPolicy, type Decision } from "./policy.js";
 import { extractAgent } from "./extract.js";
 import { loadCustomRules } from "./custom-rules.js";
 import { redactSensitive } from "./data-detectors.js";
+import { redactWithSessionEntities } from "./entity-redaction.js";
 import { applyJevHook } from "./jev.js";
 import { applyJudgeHook } from "./judge.js";
 import { isPathTrusted, readTrustedPaths } from "./trusted-paths.js";
@@ -357,6 +358,20 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     let data = adaptHookPayload(sourceAgent, raw);
     data.source_agent = sourceAgent;
     data.source_type = "hook";
+
+    // PostToolUse: the tool already ran, so there is nothing to block -- only redact a secret
+    // that showed up in its *output* (not its input, which PreToolUse redaction below already
+    // covers) before Claude reads it. A separate, minimal path: no policy enforcement, no
+    // telemetry capture, no workspace/skill checks apply to an action that's already completed.
+    if (data.hook_event_name === "PostToolUse") {
+      try {
+        const bundle = await readPolicy().catch(() => null);
+        const sessionId = String(data.session_id ?? data.sessionId ?? "");
+        await emitRedactedOutput(sourceAgent, data.tool_response, sessionId, bundle?.rules.customDetectors);
+      } catch { /* best-effort: must never throw and block the agent on a completed action */ }
+      return;
+    }
+
     if (data.hook_event_name === "UserPromptSubmit" && typeof data.prompt === "string") {
       data.event_type = data.event_type ?? "prompt.submit";
       data.tool_name = data.tool_name ?? "UserPromptSubmit";
@@ -526,7 +541,7 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     } else if (decision.action === "ask") {
       emitAsk(sourceAgent, decision.reason ?? "This action requires approval.", hookEvent);
     } else if (decision.action === "redact") {
-      const transformed = redactPayload(data, decision);
+      const transformed = await redactPayload(data, decision, String(data.session_id ?? data.sessionId ?? ""));
       if (!transformed.changed) {
         emitAllow(sourceAgent, decision.reason, hookEvent);
       } else {
@@ -649,22 +664,45 @@ function blockedFinding(reason = "Blocked by workspace policy."): Event["finding
   return { id: "policy.blocked", title: "Blocked by workspace policy", severity: "high", explanation: reason, evidence: "" };
 }
 
-function redactPayload(data: Record<string, unknown>, decision: { customDetectors?: Array<{ name: string; pattern: string; replacement: string }> }): { data: Record<string, unknown>; changed: boolean } {
+async function redactPayload(data: Record<string, unknown>, decision: { customDetectors?: Array<{ name: string; pattern: string; replacement: string }> }, sessionId: string): Promise<{ data: Record<string, unknown>; changed: boolean }> {
   const copy = structuredClone(data); let changed = false;
-  const redactValue = (value: unknown): unknown => {
-    if (typeof value === "string") { const result = redactSensitive(value, decision.customDetectors); changed ||= result.text !== value; return result.text; }
-    if (Array.isArray(value)) return value.map(redactValue);
-    if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactValue(v)]));
+  const redactValue = async (value: unknown): Promise<unknown> => {
+    if (typeof value === "string") { const result = await redactWithSessionEntities(value, sessionId, decision.customDetectors); changed ||= result.text !== value; return result.text; }
+    if (Array.isArray(value)) return Promise.all(value.map(redactValue));
+    if (value && typeof value === "object") return Object.fromEntries(await Promise.all(Object.entries(value).map(async ([k, v]) => [k, await redactValue(v)])));
     return value;
   };
-  return { data: redactValue(copy) as Record<string, unknown>, changed };
+  const redacted = await redactValue(copy) as Record<string, unknown>;
+  return { data: redacted, changed };
 }
 
 // Claude Code and Codex use the same hookSpecificOutput.permissionDecision contract for every
 // hook event -- only the echoed hookEventName differs per event (verified against
-// code.claude.com/docs/en/hooks for both PreToolUse and UserPromptSubmit).
+// code.claude.com/docs/en/hooks for PreToolUse, UserPromptSubmit, and PostToolUse).
 function claudeStyleHookEventName(event: string): string {
-  return event === "UserPromptSubmit" ? "UserPromptSubmit" : "PreToolUse";
+  return event === "UserPromptSubmit" || event === "PostToolUse" ? event : "PreToolUse";
+}
+
+// A tool has already run by the time PostToolUse fires -- there is nothing left to block, only
+// what Claude sees afterward to rewrite (hookSpecificOutput.updatedToolOutput). This is the
+// counterpart to redactPayload()/emitRedacted() below, which redact a secret that was already in
+// the *command text* before it runs; this instead catches a secret that only appears in a
+// command's *output* (`cat .env` holding a real, un-migrated value; an app echoing its own
+// resolved config) -- the input had nothing to redact, so PreToolUse redaction never saw it.
+// Only wired for claude-code (see agents.ts notes): Codex's PostToolUse payload shape and
+// updatedToolOutput support are unverified, and sending a rewrite a client doesn't honor would
+// silently do nothing while looking like protection.
+async function emitRedactedOutput(agent: string, toolResponse: unknown, sessionId: string, customDetectors?: Array<{ name: string; pattern: string; replacement: string }>): Promise<void> {
+  if (agent !== "claude-code" || toolResponse === null || typeof toolResponse !== "object") return;
+  const redactValue = async (value: unknown): Promise<unknown> => {
+    if (typeof value === "string") return (await redactWithSessionEntities(value, sessionId, customDetectors)).text;
+    if (Array.isArray(value)) return Promise.all(value.map(redactValue));
+    if (value && typeof value === "object") return Object.fromEntries(await Promise.all(Object.entries(value).map(async ([k, v]) => [k, await redactValue(v)])));
+    return value;
+  };
+  const redacted = await redactValue(toolResponse);
+  if (JSON.stringify(redacted) === JSON.stringify(toolResponse)) return; // nothing to rewrite
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: redacted } }));
 }
 
 function emitAsk(agent: string, reason: string, event = "PreToolUse"): void {

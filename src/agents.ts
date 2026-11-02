@@ -137,10 +137,10 @@ export const AGENTS: AgentDefinition[] = [
     id: "claude-code", name: "Claude Code",
     configs: [".claude/settings.json"], artifacts: [".claude/projects"],
     hookConfigPath: ".claude/settings.json", hookEventName: "PreToolUse",
-    mergeHookConfig: mergeAll([mergeClaudeStyleHooks("PreToolUse"), mergeClaudeStyleHooks("UserPromptSubmit")]),
-    unmergeHookConfig: unmergeAll([unmergeClaudeStyleHooks("PreToolUse"), unmergeClaudeStyleHooks("UserPromptSubmit")]),
+    mergeHookConfig: mergeAll([mergeClaudeStyleHooks("PreToolUse"), mergeClaudeStyleHooks("UserPromptSubmit"), mergeClaudeStyleHooks("PostToolUse")]),
+    unmergeHookConfig: unmergeAll([unmergeClaudeStyleHooks("PreToolUse"), unmergeClaudeStyleHooks("UserPromptSubmit"), unmergeClaudeStyleHooks("PostToolUse")]),
     adapter: "passthrough", verifiedPayload: true,
-    notes: "Payload verified against code.claude.com/docs/en/hooks. Also installs UserPromptSubmit (same hookSpecificOutput.permissionDecision contract, just hookEventName: \"UserPromptSubmit\") so a disabled agent is stopped before the prompt is processed, not only at its first tool call."
+    notes: "Payload verified against code.claude.com/docs/en/hooks. Also installs UserPromptSubmit (same hookSpecificOutput.permissionDecision contract, just hookEventName: \"UserPromptSubmit\") so a disabled agent is stopped before the prompt is processed, not only at its first tool call. Also installs PostToolUse: a tool has already run by the time this fires, so it can only rewrite what Claude sees afterward (hookSpecificOutput.updatedToolOutput, field confirmed against the same docs), not block -- used to redact a secret a command's own output exposed (e.g. `cat .env`) that PreToolUse redaction of the *input* can't catch, since the secret was never in the command text to begin with. Codex is not given this entry: its PostToolUse payload/updatedToolOutput support is unverified."
   },
   {
     id: "codex", name: "Codex",

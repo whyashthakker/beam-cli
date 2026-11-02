@@ -497,6 +497,75 @@ describe("captureHook", () => {
     expect(process.exitCode).toBe(2);
     output.mockRestore();
   });
+
+  describe("PostToolUse output redaction", () => {
+    it("redacts a real secret a command's output exposed, and rewrites it via updatedToolOutput for claude-code", async () => {
+      withStdin(JSON.stringify({
+        hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "cat .env" },
+        tool_response: { stdout: "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstu\nPORT=3000\n", stderr: "", interrupted: false },
+      }));
+      const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+      await captureHook("claude-code");
+      expect(output).toHaveBeenCalledTimes(1);
+      const written = JSON.parse(String(output.mock.calls[0]![0]));
+      expect(written.hookSpecificOutput.hookEventName).toBe("PostToolUse");
+      expect(written.hookSpecificOutput.updatedToolOutput.stdout).not.toContain("ghp_abcdefghijklmnopqrstu");
+      expect(written.hookSpecificOutput.updatedToolOutput.stdout).toContain("PORT=3000"); // ordinary vars pass through untouched
+      output.mockRestore();
+    });
+
+    it("does not touch output that already uses the credential-reference convention", async () => {
+      withStdin(JSON.stringify({
+        hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "cat .env" },
+        tool_response: { stdout: "STRIPE_SECRET_KEY=op://vault/stripe/credential\n", stderr: "", interrupted: false },
+      }));
+      const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+      await captureHook("claude-code");
+      expect(output).not.toHaveBeenCalled(); // nothing changed -- no JSON written at all
+      output.mockRestore();
+    });
+
+    it("writes nothing for a PostToolUse call with no secret in its output (no-op, not a block)", async () => {
+      withStdin(JSON.stringify({
+        hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "ls" },
+        tool_response: { stdout: "README.md\npackage.json\n", stderr: "", interrupted: false },
+      }));
+      const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+      await captureHook("claude-code");
+      expect(output).not.toHaveBeenCalled();
+      output.mockRestore();
+    });
+
+    it("never rewrites output for agents other than claude-code (unverified updatedToolOutput support)", async () => {
+      withStdin(JSON.stringify({
+        hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "cat .env" },
+        tool_response: { stdout: "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstu\n", stderr: "", interrupted: false },
+      }));
+      const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+      await captureHook("codex");
+      expect(output).not.toHaveBeenCalled();
+      output.mockRestore();
+    });
+
+    it("never runs policy enforcement (no /ingest call, no block) for a completed PostToolUse action", async () => {
+      process.env.BEAM_TOKEN = "t";
+      const policyDir = process.env.BEAM_DATA_DIR!;
+      // A policy that would BLOCK this exact command at PreToolUse must have no effect here --
+      // the command already ran; PostToolUse can only redact what's shown, never block.
+      await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: ["Bash"], blockedCommandPatterns: [], disabledAgents: [] } }));
+      withStdin(JSON.stringify({
+        hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "cat .env" },
+        tool_response: { stdout: "ready\n", stderr: "", interrupted: false },
+      }));
+      const fetchMock = jest.fn(async () => new Response("{}", { status: 200 }));
+      global.fetch = fetchMock as unknown as typeof fetch;
+      const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+      await captureHook("claude-code");
+      expect(output).not.toHaveBeenCalled(); // nothing to redact, and no block JSON either
+      expect(fetchMock).not.toHaveBeenCalled(); // no telemetry capture for this minimal path
+      output.mockRestore();
+    });
+  });
 });
 
 async function writeJsonl(filePath: string, rows: unknown[]): Promise<void> {
