@@ -1,18 +1,20 @@
+import type { MatchSpan } from "./rule-matches.js";
 // A bounded, dependency-free shell heuristic, shared by the CLI and edge SDK.
 // Unlike a whole-text keyword conjunction, only transfer arguments / connected
 // stdin are sinks. This is not a general shell or JavaScript taint analyzer.
 const SENSITIVE = /(?:\.env(?:\b|[./])|\.ssh[\\/]|id_(?:rsa|ed25519)|\.aws[\\/]credentials|\.pgpass\b|\.docker[\\/]config\.json|credentials\.json|\b(?:printenv|process\.env|os\.environ)\b|(?:api[_-]?key|access[_-]?token|password|secret)\b|\$\{?[\w]*(?:TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL)[\w]*\}?)/i;
-type Token = { value: string; raw: string };
-type Command = { tokens: Token[]; pipe: boolean };
+type Token = { value: string; raw: string; start: number; end: number };
+type Command = { tokens: Token[]; pipe: boolean; start: number; end: number };
 
 // Preserve quoted arguments as one token. Separators inside quotes cannot join
 // unrelated fixtures into a command. Keep raw quotes for recursive shell -c.
 function commands(text: string): Command[] {
-  const out: Command[] = []; let tokens: Token[] = []; let value = "", raw = "", quote = "";
-  const word = () => { if (raw) tokens.push({ value, raw }); value = raw = ""; };
-  const end = (pipe: boolean) => { word(); if (tokens.length) out.push({ tokens, pipe }); tokens = []; };
+  const out: Command[] = []; let tokens: Token[] = []; let value = "", raw = "", quote = "", tokenStart = 0;
+  const word = () => { if (raw) tokens.push({ value, raw, start: tokenStart, end: tokenStart + raw.length }); value = raw = ""; };
+  const end = (pipe: boolean) => { word(); if (tokens.length) out.push({ tokens, pipe, start: tokens[0].start, end: tokens[tokens.length - 1].end }); tokens = []; };
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
+    if (!raw && !/\s/.test(c)) tokenStart = i;
     if (!quote && c === "$" && text[i + 1] === "(") {
       let level = 1; const start = i; i++;
       while (++i < text.length && level) { if (text[i] === "(") level++; else if (text[i] === ")") level--; }
@@ -152,4 +154,44 @@ export function possibleCredentialExposure(text: string): boolean {
   // an explicit sensitive read followed by a referring delivery instruction.
   // Do not correlate arbitrary prose, URLs, code strings or separate fixtures.
   return /(?:^|\n)\s*(?:read|collect|extract)\b[^\n]{0,200}(?:\.env\b|\bAPI_KEY\b|\bcredentials?\b)[^\n]*\n\s*(?:send|upload|exfiltrate)\s+(?:it|them|the\s+(?:credentials?|contents?|secrets?))\b[^\n]{0,200}https?:\/\//i.test(text);
+}
+
+/** Locate only original executable command/pipeline ranges independently
+ * accepted by the detector. Do not scan inert heredoc bodies as commands. */
+function heredocDataRanges(text: string): {start:number;end:number}[] {
+  const hidden: {start:number;end:number}[] = []; const lines = text.split("\n"); let offset = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]; const doc = /<<(-)?\s*(?:'([^']+)'|"([^"]+)"|([\w]+))/.exec(line);
+    let quote = "";
+    if (doc) for (let j = 0; j < doc.index; j++) {
+      const c=line[j]; if(c === "\\" && quote !== "'"){j++;continue;}
+      if(quote){if(c===quote)quote="";} else if(c === "'" || c === '"')quote=c; else if(c==="#"){quote="#";break;}
+    }
+    offset += line.length + 1;
+    if (!doc || quote) continue;
+    const start=offset; const delimiter=doc[2]??doc[3]??doc[4];
+    while (++i < lines.length) { offset += lines[i].length + 1; if((doc[1]?lines[i].replace(/^\t+/,""):lines[i])===delimiter) break; }
+    hidden.push({start,end:offset});
+  }
+  return hidden;
+}
+export function shellActionCommands(text: string) {
+  const hidden = heredocDataRanges(text);
+  return commands(text).filter(command => !hidden.some(range => command.start < range.end && command.end > range.start));
+}
+export function credentialExposureSpans(text: string): MatchSpan[] {
+  const hidden = heredocDataRanges(text);
+  const spans: MatchSpan[] = []; let groupStart: number | undefined;
+  for (const command of commands(text)) {
+    if (hidden.some(range => command.start < range.end && command.end > range.start)) { groupStart=undefined; continue; }
+    groupStart ??= command.start;
+    const candidate=text.slice(groupStart,command.end);
+    if (possibleCredentialExposure(candidate)) {
+      spans.push({start:groupStart,end:command.end,label:"Sensitive outbound transfer"});
+      if(spans.length===8)break;
+    }
+    const assignment=/^[A-Za-z_]\w*=/.test(command.tokens[0]?.value??"");
+    if(!command.pipe && !assignment)groupStart=undefined;
+  }
+  return spans;
 }

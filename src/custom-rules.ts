@@ -1,3 +1,4 @@
+import { patternMatch } from "./rule-matches.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { getBeamHome } from "./config.js";
@@ -46,7 +47,7 @@ export async function loadCustomRules(home = getBeamHome()): Promise<CustomRuleL
       severity: e.severity as Severity,
       category: (typeof e.category === "string" && e.category ? e.category : "custom") as RuleCategory,
       explanation: typeof e.explanation === "string" && e.explanation ? e.explanation : "User-defined rule.",
-      match: (s: string) => regex.test(s),
+      match: patternMatch(regex),
     });
   });
 

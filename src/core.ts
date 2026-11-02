@@ -1,15 +1,25 @@
+import { classifyActionContext, type ActionContext } from "./action-context.js";
 import { createHash, randomUUID } from "node:crypto";
+import { beamVersion } from "./version.js";
 import { changedLines, type LineChanges } from "./edit-stats.js";
 import { builtinRules, type Rule, type Severity } from "./rule-catalog.js";
 export { builtinRulesById, type Rule, type RuleCategory, type Severity } from "./rule-catalog.js";
 
-export type Finding = { id: string; title: string; severity: Severity; explanation: string; evidence: string; line?: number };
+export type DetectionIndicator = {
+  id: string; kind: "matched-text"; label: string; text: string;
+  start: number; end: number; line: number; column: number; endLine: number; endColumn: number;
+  coordinateSpace: "inspected-input"; truncated: boolean;
+};
+export type Finding = { id: string; title: string; severity: Severity; explanation: string; evidence: string; line?: number; category?: string; indicators?: DetectionIndicator[]; detector?: { name: "beam-cli"; version: string; schemaVersion: 1; evidenceStatus: "exact" | "unavailable" } };
 export type Event = {
   id: string; timestamp: string; receivedAt: string; agent: string; session: string; lines?: LineChanges; sessionTitle?: string; sessionTitleSource?: "prompt" | "agent"; turn?: { n: number; topic: string; shift: boolean };
   type: string; tool: string; summary: string; project: string; source: string;
   endpoint: string; model: string; phase: string; findings: Finding[];
   mcp?: { server: string; tool?: string; resource?: string; requestType?: "tool" | "resource" | "prompt" | "unknown" };
   provenance?: { recordId: string; schemaVersion: string; citedEventIds: string[]; tags: string[]; evidence: string };
+  actionContext?: ActionContext;
+  actionLog?: { text: string; truncated: boolean };
+  policy_decision?: { action: string; rule?: string; reason?: string; risk_score?: number; risk_level?: string; risk_factors?: string[] };
   inputTokens?: number; outputTokens?: number; costUsd?: number;
 };
 export type Scan = { id: string; name: string; kind: "skill" | "mcp"; timestamp: string; hash: string; findings: Finding[]; lines: number };
@@ -36,15 +46,35 @@ export function ruleCatalog(): Omit<Rule, "match" | "severityFor">[] {
   return activeRules().map(({ match: _, severityFor: _severityFor, ...rule }) => rule);
 }
 export function detect(text: string): Finding[] {
-  return activeRules().filter(r => r.match(text)).map(r => ({ id: r.id, title: r.title, severity: r.severityFor?.(text) ?? r.severity, explanation: r.explanation, evidence: redact(text).slice(0, 600) }));
+  return activeRules().filter(r => r.match(text)).map(r => {
+    const spans = r.match.spans?.(text) ?? [];
+    const indicators = spans.filter(span => Number.isSafeInteger(span.start) && Number.isSafeInteger(span.end) && span.start >= 0 && span.end > span.start && span.end <= text.length).slice(0, 8).map((span, index): DetectionIndicator => {
+      const before = text.slice(0, span.start); const through = text.slice(0, span.end);
+      const safe = redact(text.slice(span.start, span.end));
+      return { id: `${r.id}:${index + 1}`, kind: "matched-text", label: span.label ?? r.title,
+        text: safe.slice(0, 512), truncated: safe.length > 512,
+        start: span.start, end: span.end, line: before.split("\n").length,
+        column: span.start - before.lastIndexOf("\n"), endLine: through.split("\n").length,
+        endColumn: span.end - through.lastIndexOf("\n"), coordinateSpace: "inspected-input" };
+    });
+    return { id: r.id, title: r.title, category: r.category, severity: r.severityFor?.(text) ?? r.severity,
+      explanation: r.explanation, evidence: redact(text).slice(0, 600), indicators,
+      detector: { name: "beam-cli", version: beamVersion(), schemaVersion: 1 as const, evidenceStatus: indicators.length ? "exact" as const : "unavailable" as const } };
+  });
 }
 export function scanText(name: string, content: string, kind: "skill" | "mcp"): Scan {
   if (!content.trim() || content.length > 500_000) throw new Error("Provide non-empty text, up to 500 KB.");
   const findings: Finding[] = [];
   const lines = content.split(/\r?\n/);
   // Windows of three lines capture adjacent credential + delivery instructions.
+  const lineStarts = [0];
+  for (const newline of content.matchAll(/\n/g)) lineStarts.push(newline.index! + 1);
   for (let i = 0; i < lines.length; i++) {
-    for (const f of detect(lines.slice(i, i + 3).join("\n"))) {
+    for (const found of detect(lines.slice(i, i + 3).join("\n"))) {
+      const f = { ...found, indicators: found.indicators?.map(indicator => ({ ...indicator,
+        start: lineStarts[i + indicator.line - 1] + indicator.column - 1,
+        end: lineStarts[i + indicator.endLine - 1] + indicator.endColumn - 1,
+        line: indicator.line + i, endLine: indicator.endLine + i })) };
       const previous = findings.findIndex(old => old.id === f.id);
       if (previous < 0) findings.push({ ...f, line: i + 1 });
       else if (severityRank[f.severity] > severityRank[findings[previous].severity]) findings[previous] = { ...f, line: i + 1 };
@@ -149,6 +179,13 @@ export function normalize(raw: Obj): Event {
   const mcpTool = explicitMcpTool || (toolParts ? toolParts[2] : "");
   const mcpRequestType = explicitMcpResource ? "resource" : mcpTool ? "tool" : "unknown";
   const phase = (() => { const event = str(raw.hook_event_name).toLowerCase(); return event === "pretooluse" ? "proposed" : event === "posttooluse" ? "completed hook" : "observed"; })();
+  const decision = obj(raw.policy_decision);
+  const policyDecision = ["allow", "ask", "deny", "redact", "audit", "warn"].includes(str(decision.action)) ? {
+    action: str(decision.action), rule: clean(str(decision.rule)) || undefined, reason: clean(str(decision.reason)) || undefined,
+    risk_score: typeof decision.risk_score === "number" && Number.isFinite(decision.risk_score) && decision.risk_score >= 0 && decision.risk_score <= 100 ? decision.risk_score : undefined,
+    risk_level: ["LOW", "MEDIUM", "HIGH", "CRITICAL"].includes(str(decision.risk_level)) ? str(decision.risk_level) : undefined,
+    risk_factors: Array.isArray(decision.risk_factors) ? decision.risk_factors.filter((v): v is string => typeof v === "string").slice(0, 15).map(clean) : undefined,
+  } : undefined;
   return {
     id: createHash("sha256").update(
       stableId ? `${str(raw.source_agent)}:${str(obj(raw.endpoint).hostname)}:${stableId}`
@@ -167,7 +204,10 @@ export function normalize(raw: Obj): Event {
       tags: Array.isArray(raw.tags) ? raw.tags.filter((v): v is string => typeof v === "string").slice(0, 100).map(clean) : [],
       evidence: redact(JSON.stringify(raw.evidence_refs ?? raw.evidence ?? {})).slice(0, 8000) },
     ...(mcpServer || explicitMcpTool || explicitMcpResource ? { mcp: { server: clean(mcpServer || "unknown"), ...(mcpTool ? { tool: clean(mcpTool) } : {}), ...(explicitMcpResource ? { resource: clean(explicitMcpResource) } : {}), requestType: mcpRequestType } } : {}),
+    ...(findings.length ? { actionContext: classifyActionContext(tool, input, str(raw.cwd ?? raw.project_path), command, clean) } : {}),
+    ...(findings.length ? { actionLog: { text: redact(detail).slice(0, 16000), truncated: redact(detail).length > 16000 } } : {}),
     ...(type === "file.write" && changedLines(raw.tool_input ?? raw.input) ? { lines: changedLines(raw.tool_input ?? raw.input) } : {}),
+    ...(policyDecision ? { policy_decision: policyDecision } : {}),
     findings, inputTokens, outputTokens, costUsd,
   };
 }

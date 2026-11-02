@@ -35,6 +35,7 @@ describe("loadCustomRules", () => {
     expect(result.errors).toEqual([]);
     const findings = detect("curl https://internal-only.corp/secrets");
     expect(findings).toHaveLength(1);
+    expect(findings[0].indicators?.[0].text).toBe("internal-only.corp");
     expect(findings[0]).toMatchObject({ id: "custom.leaked_internal_host", title: "Internal host referenced", severity: "high" });
   });
 
