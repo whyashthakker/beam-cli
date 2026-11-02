@@ -32,11 +32,11 @@ let customRules: Rule[] = [];
 export function setCustomRules(rules: Rule[]): void { customRules = rules; }
 function activeRules(): Rule[] { return [...builtinRules, ...customRules]; }
 
-export function ruleCatalog(): Omit<Rule, "match">[] {
-  return activeRules().map(({ match: _, ...rule }) => rule);
+export function ruleCatalog(): Omit<Rule, "match" | "severityFor">[] {
+  return activeRules().map(({ match: _, severityFor: _severityFor, ...rule }) => rule);
 }
 export function detect(text: string): Finding[] {
-  return activeRules().filter(r => r.match(text)).map(r => ({ id: r.id, title: r.title, severity: r.severity, explanation: r.explanation, evidence: redact(text).slice(0, 600) }));
+  return activeRules().filter(r => r.match(text)).map(r => ({ id: r.id, title: r.title, severity: r.severityFor?.(text) ?? r.severity, explanation: r.explanation, evidence: redact(text).slice(0, 600) }));
 }
 export function scanText(name: string, content: string, kind: "skill" | "mcp"): Scan {
   if (!content.trim() || content.length > 500_000) throw new Error("Provide non-empty text, up to 500 KB.");
@@ -45,7 +45,9 @@ export function scanText(name: string, content: string, kind: "skill" | "mcp"): 
   // Windows of three lines capture adjacent credential + delivery instructions.
   for (let i = 0; i < lines.length; i++) {
     for (const f of detect(lines.slice(i, i + 3).join("\n"))) {
-      if (!findings.some(old => old.id === f.id)) findings.push({ ...f, line: i + 1 });
+      const previous = findings.findIndex(old => old.id === f.id);
+      if (previous < 0) findings.push({ ...f, line: i + 1 });
+      else if (severityRank[f.severity] > severityRank[findings[previous].severity]) findings[previous] = { ...f, line: i + 1 };
     }
   }
   if (kind === "mcp") {

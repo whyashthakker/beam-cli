@@ -248,7 +248,7 @@ describe("edge runtime safety", () => {
     };
     walk(resolve("src/sdk.ts"));
     expect(bad).toEqual([]);
-    expect([...seen].map(f => f.split("/").pop()).sort()).toEqual(["monitor-llm.ts", "monitor-pause.ts", "monitor-pipeline.ts", "monitor-rules.ts", "monitor-signals.ts", "monitor-stacks.ts", "prompt-attacks.ts", "rule-catalog.ts", "sdk.ts"]);
+    expect([...seen].map(f => f.split("/").pop()).sort()).toEqual(["credential-egress.ts", "destructive-risk.ts", "monitor-llm.ts", "monitor-pause.ts", "monitor-pipeline.ts", "monitor-rules.ts", "monitor-signals.ts", "monitor-stacks.ts", "prompt-attacks.ts", "rule-catalog.ts", "sdk.ts"]);
   });
 });
 

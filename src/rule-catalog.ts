@@ -2,17 +2,15 @@
 // the same catalog backs agent hooks (core.ts) and the in-app SDK (sdk.ts), which can run in
 // edge runtimes.
 import { promptAttack } from "./prompt-attacks.js";
+import { isScopedTemporaryCleanup } from "./destructive-risk.js";
+import { possibleCredentialExposure } from "./credential-egress.js";
 
 export type Severity = "critical" | "high" | "medium" | "info";
 
 export type RuleCategory = "exec" | "exfil" | "impact" | "integrity" | "persistence" | "privilege" | "recon" | "secrets" | "source_control" | "custom";
-export type Rule = { id: string; title: string; severity: Severity; category: RuleCategory; explanation: string; match: (s: string) => boolean };
+export type Rule = { id: string; title: string; severity: Severity; category: RuleCategory; explanation: string; match: (s: string) => boolean; severityFor?: (s: string) => Severity };
 
 const secret = /(?:\.env(?:\b|[./])|\.ssh[\\/]|id_rsa|id_ed25519|\.aws[\\/]credentials|\.pgpass\b|\.docker[\\/]config\.json|\.gnupg[\\/]|credentials\.json|(?:api[_-]?key|access[_-]?token|password|secret)\b)/i;
-// https/curl/wget/etc, plus a bare IP used as a destination, scp/rsync to a remote host, a Python
-// HTTP client call, or DNS exfiltration (nslookup/dig on a command-substituted hostname).
-const egress = /(?:https?:\/\/|\bcurl\b|\bwget\b|\bupload\b|\bwebhook\b|\bsend\b|\bexfiltrat\w*|\bscp\b|\brsync\b[^\n]{0,100}?\S+@\S+:|\brequests\.(?:post|put)\s*\(|\b(?:nslookup|dig)\b[^\n]{0,80}?\$\(|(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\/)/i;
-
 // Linear checks for "something | sh" or "something | <interpreter>". As regexes
 // (/curl[^\n]*\|\s*sh/) they backtrack quadratically or worse on long hostile lines, and these
 // rules also run on attacker-written text inside customer apps (App monitoring). Each line's
@@ -75,6 +73,10 @@ const FORK_BOMB = /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
 // Dropping an entire datastore instead of rows in it: Redis/Mongo have no SQL DROP/TRUNCATE syntax.
 const DATASTORE_WIPE = /\bFLUSHALL\b|\bFLUSHDB\b|db\.dropDatabase\s*\(\)/i;
 
+function otherDestructiveOperation(s: string): boolean {
+  return /\bfind\b[^\n]{0,300}?-delete\b|\brsync\b[^\n]{0,300}?--delete\b|\bshred\b[^\n]{0,100}?-\w*u|\bshutil\.rmtree\s*\(|(?:\bfs\.)?\brm(?:dir)?Sync\s*\([^\n]{0,200}?recursive\s*:\s*true|\brd\s+\/s\s+\/q\b|\bRemove-Item\b[^\n]{0,1000}?(?:-Recurse|-Force)|\b(?:drop\s+(?:table|database)|truncate\s+(?:table\s+)?\w+)|\bgit\s+(?:reset\s+--hard|clean\s+-[^\n]{0,1000}?f)/i.test(s) || DATASTORE_WIPE.test(s);
+}
+
 // A vault/secret-manager reference (op://, Azure Key Vault, HashiCorp Vault, Infisical, Doppler,
 // a GitHub Actions secrets expression, or a generic broker placeholder) typed literally into a
 // live command instead of being resolved by its own CLI/platform first. An agent can't resolve
@@ -87,7 +89,7 @@ const DATASTORE_WIPE = /\bFLUSHALL\b|\bFLUSHDB\b|db\.dropDatabase\s*\(\)/i;
 const UNRESOLVED_REFERENCE = /\bop:\/\/|@Microsoft\.KeyVault\(|\bvault:[\w/-]|\binfisical:\/\/|\bdoppler:\/\/|\$\{\{\s*secrets\.|__[A-Z][A-Z0-9_]*_REF_[\w-]+__/i;
 
 export const builtinRules: Rule[] = [
-  { id: "destructive.delete", title: "Destructive operation", severity: "high", category: "impact", explanation: "Review the target and backups before allowing a recursive delete or destructive data operation.", match: s => rmRecursiveForce(s) || /\bfind\b[^\n]{0,300}?-delete\b|\brsync\b[^\n]{0,300}?--delete\b|\bshred\b[^\n]{0,100}?-\w*u|\bshutil\.rmtree\s*\(|(?:\bfs\.)?\brm(?:dir)?Sync\s*\([^\n]{0,200}?recursive\s*:\s*true|\brd\s+\/s\s+\/q\b|\bRemove-Item\b[^\n]{0,1000}?(?:-Recurse|-Force)|\b(?:drop\s+(?:table|database)|truncate\s+(?:table\s+)?\w+)|\bgit\s+(?:reset\s+--hard|clean\s+-[^\n]{0,1000}?f)/i.test(s) || DATASTORE_WIPE.test(s) },
+  { id: "destructive.delete", title: "Destructive operation", severity: "high", category: "impact", explanation: "Recursive deletion or a destructive data operation. Scoped temporary test cleanup is MEDIUM; broad or uncertain targets remain HIGH. Review the target before allowing it.", match: s => rmRecursiveForce(s) || otherDestructiveOperation(s), severityFor: s => !otherDestructiveOperation(s) && isScopedTemporaryCleanup(s) ? "medium" : "high" },
   { id: "destructive.disk_wipe", title: "Disk or partition wipe", severity: "critical", category: "impact", explanation: "This targets an entire disk, partition or filesystem rather than individual files, and is unrecoverable. Confirm this is an authorized, intentional wipe.", match: s => DISK_WIPE.test(s) },
   { id: "destructive.fork_bomb", title: "Fork bomb", severity: "critical", category: "impact", explanation: "This pattern spawns processes exponentially and can make the machine unresponsive.", match: s => FORK_BOMB.test(s) },
   { id: "destructive.audit_trail", title: "Audit trail or recovery point erased", severity: "critical", category: "integrity", explanation: "This clears shadow copies, event logs or shell history. It is also the standard precursor to covering up a destructive or malicious action; confirm the reason before allowing it.", match: s => /\bvssadmin\b[^\n]{0,100}?delete\s+shadows|\bwevtutil\b[^\n]{0,50}?\bcl\b|\bClear-EventLog\b|\bhistory\s+-c\b|\bunset\s+HISTFILE\b|\bHISTSIZE\s*=\s*0\b|\bbcdedit\b[^\n]{0,50}?\/deletevalue/i.test(s) },
@@ -109,7 +111,7 @@ export const builtinRules: Rule[] = [
   { id: "credentials.access", title: "Sensitive credential reference", severity: "medium", category: "secrets", explanation: "This action or instruction references a credential location. Confirm the agent needs access.", match: s => secret.test(s) },
   { id: "source.private_files", title: "Private source or configuration access", severity: "high", category: "secrets", explanation: "This action accesses a private credential or configuration file. Confirm that the agent needs the contents.", match: s => /(?:\.env(?:\.[\w.-]+)?|\.ssh[\\/]|\.aws[\\/]credentials|id_(?:rsa|ed25519)|\.npmrc|\.netrc|kubeconfig|private.?key|\.pgpass\b|\.docker[\\/]config\.json|\.gnupg[\\/]|credentials\.json)/i.test(s) },
   { id: "mcp.write", title: "MCP write operation", severity: "high", category: "impact", explanation: "The MCP tool appears to modify data or send an external side effect. Require approval before allowing it.", match: s => /\bmcp(?:__|:)[^\s]*(?:create|update|delete|write|send|post|put|patch|execute|run|publish|deploy|remove|save|insert|add|grant|revoke|assign)\b/i.test(s) },
-  { id: "credentials.egress", title: "Possible credential exposure", severity: "critical", category: "exfil", explanation: "Credential references and outbound delivery appear together. Inspect the destination and data before running this.", match: s => secret.test(s) && egress.test(s) },
+  { id: "credentials.egress", title: "Possible credential exposure", severity: "critical", category: "exfil", explanation: "A transfer command carries a sensitive payload, or sensitive output feeds an outbound command. This is a possible exposure, not proof of delivery; check the destination and authorization.", match: possibleCredentialExposure },
   { id: "secrets.unresolved_reference_launch", title: "Vault reference used directly instead of resolved", severity: "medium", category: "secrets", explanation: "This command includes a secret-manager reference (op://, Azure Key Vault, Vault, Infisical, Doppler, a GitHub Actions secrets expression, or a broker placeholder) typed in literally rather than resolved by its own CLI or platform. The agent cannot resolve it into the real value -- have a human or CI process start the real service instead, with its existing resolver already wired up.", match: s => UNRESOLVED_REFERENCE.test(s) },
   { id: "execution.remote", title: "Remote code execution pattern", severity: "high", category: "exec", explanation: "Downloaded content is fetched and run without review: piped into a shell or interpreter, fetched and executed in one step, or downloaded and run as separate chained commands.", match: s => pipesIntoShell(s, downloads) || DOWNLOAD_THEN_EXEC.test(s) || POWERSHELL_DOWNLOAD_EXEC.test(s) || PYTHON_FETCH_EXEC.test(s) },
   { id: "execution.obfuscated", title: "Encoded execution", severity: "high", category: "exec", explanation: "Encoded content is decoded for execution. Review the decoded payload separately; Beam never executes it.", match: s => pipesIntoShell(s, decodes) || /\b(?:powershell|pwsh)\b[^\n]{0,500}?\s-(?:enc|encodedcommand)\b/i.test(s) },
