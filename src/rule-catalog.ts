@@ -1,25 +1,30 @@
 // The built-in detection rules: pure data and regular expressions, with no Node.js built-ins, so
 // the same catalog backs agent hooks (core.ts) and the in-app SDK (sdk.ts), which can run in
 // edge runtimes.
+import { promptAttack } from "./prompt-attacks.js";
+
 export type Severity = "critical" | "high" | "medium" | "info";
 
 export type RuleCategory = "exec" | "exfil" | "impact" | "integrity" | "persistence" | "privilege" | "recon" | "secrets" | "source_control" | "custom";
 export type Rule = { id: string; title: string; severity: Severity; category: RuleCategory; explanation: string; match: (s: string) => boolean };
 
-const secret = /(?:\.env(?:\b|[./])|\.ssh[\\/]|id_rsa|id_ed25519|\.aws[\\/]credentials|(?:api[_-]?key|access[_-]?token|password|secret)\b)/i;
-const egress = /(?:https?:\/\/|\bcurl\b|\bwget\b|\bupload\b|\bwebhook\b|\bsend\b|\bexfiltrat\w*)/i;
+const secret = /(?:\.env(?:\b|[./])|\.ssh[\\/]|id_rsa|id_ed25519|\.aws[\\/]credentials|\.pgpass\b|\.docker[\\/]config\.json|\.gnupg[\\/]|credentials\.json|(?:api[_-]?key|access[_-]?token|password|secret)\b)/i;
+// https/curl/wget/etc, plus a bare IP used as a destination, scp/rsync to a remote host, a Python
+// HTTP client call, or DNS exfiltration (nslookup/dig on a command-substituted hostname).
+const egress = /(?:https?:\/\/|\bcurl\b|\bwget\b|\bupload\b|\bwebhook\b|\bsend\b|\bexfiltrat\w*|\bscp\b|\brsync\b[^\n]{0,100}?\S+@\S+:|\brequests\.(?:post|put)\s*\(|\b(?:nslookup|dig)\b[^\n]{0,80}?\$\(|(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\/)/i;
 
-// Linear checks for "something | sh". As regexes (/curl[^\n]*\|\s*sh/) they backtrack
-// quadratically or worse on long hostile lines, and these rules also run on attacker-written
-// text inside customer apps (App monitoring). Each line's pipes are split once and scanned in order.
-const SHELL_AFTER_PIPE = /^\s*(?:sudo\s+)?(?:ba|z|fi)?sh\b/i;
+// Linear checks for "something | sh" or "something | <interpreter>". As regexes
+// (/curl[^\n]*\|\s*sh/) they backtrack quadratically or worse on long hostile lines, and these
+// rules also run on attacker-written text inside customer apps (App monitoring). Each line's
+// pipes are split once and scanned in order.
+const EXEC_AFTER_PIPE = /^\s*(?:sudo\s+)?(?:(?:ba|z|fi)?sh|python3?|node|ruby|perl|pwsh|powershell)\b/i;
 function pipesIntoShell(s: string, newArmer: () => (segment: string) => boolean): boolean {
   for (const line of s.split("\n")) {
     if (!line.includes("|")) continue;
     const arms = newArmer();
     let armed = false;
     for (const [i, segment] of line.split("|").entries()) {
-      if (i > 0 && armed && SHELL_AFTER_PIPE.test(segment)) return true;
+      if (i > 0 && armed && EXEC_AFTER_PIPE.test(segment)) return true;
       armed = arms(segment) || armed;
     }
   }
@@ -37,24 +42,65 @@ const decodes = () => {
   };
 };
 
+// "rm" with recursive-force intent, however the flags are written: combined (-rf, -fr), split
+// (-r -f), long-form (--recursive --force), or mixed (-r --force). A single regex over the whole
+// command missed the split-flag case entirely (an easy, common bypass), so each command segment
+// (split on ; && || | and newlines, the points a shell actually starts a new command) is checked
+// for "rm" plus both an r-flag and an f-flag anywhere in that segment, in any order.
+const CMD_SPLIT = /[;&|\n]|&&|\|\|/;
+function rmRecursiveForce(s: string): boolean {
+  for (const segment of s.split(CMD_SPLIT)) {
+    if (!/\brm\b/i.test(segment)) continue;
+    const hasR = /(?:^|\s)-[a-z]*r[a-z]*(?:\s|$)/i.test(segment) || /--recursive\b/i.test(segment);
+    const hasF = /(?:^|\s)-[a-z]*f[a-z]*(?:\s|$)/i.test(segment) || /--force\b/i.test(segment);
+    if (hasR && hasF) return true;
+  }
+  return false;
+}
+
+// Download-then-execute split across a command chain instead of a pipe: `curl -o x.sh ... && chmod
+// +x x.sh && ./x.sh`. One segment fetches, a later segment (joined by && or ;) runs what it fetched.
+const DOWNLOAD_THEN_EXEC = /\b(?:curl|wget)\b[^\n]{0,300}?(?:\s-[oO]\s|--output\b)[^\n]{0,300}?(?:&&|;)[^\n]{0,300}?(?:chmod\s+\+x|\.\/\S|(?:ba|z)?sh\b|python3?\b|node\b)/i;
+// PowerShell's `IEX (New-Object Net.WebClient).DownloadString(...)` / `iwr ... | iex`, the
+// single most common Windows download-and-run one-liner; and a Python process that fetches and
+// executes in the same call instead of piping to a shell.
+const POWERSHELL_DOWNLOAD_EXEC = /\bdownloadstring\s*\(|\b(?:iex|invoke-expression)\b[^\n]{0,300}?(?:iwr|invoke-webrequest|downloadstring)\b|\b(?:iwr|invoke-webrequest)\b[^\n]{0,300}?\|\s*(?:iex|invoke-expression)\b/i;
+const PYTHON_FETCH_EXEC = /\b(?:exec|eval)\s*\(\s*(?:compile\s*\(\s*)?(?:urllib\.request\.urlopen|urlopen|requests\.get|urlretrieve)\b/i;
+
+// Disk, partition and filesystem-level wipes: destroy an entire volume rather than files inside
+// it, and are unrecoverable even with the deleted file still referenced elsewhere.
+const DISK_WIPE = /\bdd\b[^\n]{0,300}?\bof=\/dev\/(?:[sh]d|nvme|disk)\w*|\bmkfs\b|\bmke2fs\b|\bwipefs\b|\bblkdiscard\b|\b(?:fdisk|gdisk|sgdisk|parted)\b|\bdiskutil\s+(?:eraseDisk|eraseVolume|reformat)\b|\bdiskpart\b[\s\S]{0,200}?\bclean\b|\bClear-Disk\b[^\n]{0,300}?-RemoveData|\bRemove-Partition\b|\bcipher\s+\/w:|\bformat\s+[a-z]:\s*\/y\b/i;
+// The classic bash fork bomb and close variants (whitespace and function-name tolerant).
+const FORK_BOMB = /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
+// Dropping an entire datastore instead of rows in it: Redis/Mongo have no SQL DROP/TRUNCATE syntax.
+const DATASTORE_WIPE = /\bFLUSHALL\b|\bFLUSHDB\b|db\.dropDatabase\s*\(\)/i;
+
 export const builtinRules: Rule[] = [
-  { id: "destructive.delete", title: "Destructive operation", severity: "high", category: "impact", explanation: "Review the target and backups before allowing a recursive delete or destructive data operation.", match: s => /\brm\s+[^\n]{0,1000}?(?:-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|--recursive)|\b(?:drop\s+(?:table|database)|truncate\s+(?:table\s+)?\w+)|\bRemove-Item\b[^\n]{0,1000}?(?:-Recurse|-Force)|\bgit\s+(?:reset\s+--hard|clean\s+-[^\n]{0,1000}?f)/i.test(s) },
-  { id: "destructive.production", title: "Production change", severity: "high", category: "impact", explanation: "This action targets a production environment. Confirm the scope and rollback plan before proceeding.", match: s => /\b(?:production|prod)\b/i.test(s) && /\b(?:deploy|delete|drop|truncate|migrate|apply|destroy|restart|rollback|scale)\b/i.test(s) },
-  { id: "credentials.environment", title: "Environment variable access", severity: "high", category: "secrets", explanation: "The action reads exported environment variables that may contain credentials or private configuration.", match: s => /\b(?:printenv|env|export\s+-p|process\.env|os\.environ|System\.getenv)\b|\$\{?[A-Z][A-Z0-9_]*\}?/i.test(s) },
+  { id: "destructive.delete", title: "Destructive operation", severity: "high", category: "impact", explanation: "Review the target and backups before allowing a recursive delete or destructive data operation.", match: s => rmRecursiveForce(s) || /\bfind\b[^\n]{0,300}?-delete\b|\brsync\b[^\n]{0,300}?--delete\b|\bshred\b[^\n]{0,100}?-\w*u|\bshutil\.rmtree\s*\(|(?:\bfs\.)?\brm(?:dir)?Sync\s*\([^\n]{0,200}?recursive\s*:\s*true|\brd\s+\/s\s+\/q\b|\bRemove-Item\b[^\n]{0,1000}?(?:-Recurse|-Force)|\b(?:drop\s+(?:table|database)|truncate\s+(?:table\s+)?\w+)|\bgit\s+(?:reset\s+--hard|clean\s+-[^\n]{0,1000}?f)/i.test(s) || DATASTORE_WIPE.test(s) },
+  { id: "destructive.disk_wipe", title: "Disk or partition wipe", severity: "critical", category: "impact", explanation: "This targets an entire disk, partition or filesystem rather than individual files, and is unrecoverable. Confirm this is an authorized, intentional wipe.", match: s => DISK_WIPE.test(s) },
+  { id: "destructive.fork_bomb", title: "Fork bomb", severity: "critical", category: "impact", explanation: "This pattern spawns processes exponentially and can make the machine unresponsive.", match: s => FORK_BOMB.test(s) },
+  { id: "destructive.audit_trail", title: "Audit trail or recovery point erased", severity: "critical", category: "integrity", explanation: "This clears shadow copies, event logs or shell history. It is also the standard precursor to covering up a destructive or malicious action; confirm the reason before allowing it.", match: s => /\bvssadmin\b[^\n]{0,100}?delete\s+shadows|\bwevtutil\b[^\n]{0,50}?\bcl\b|\bClear-EventLog\b|\bhistory\s+-c\b|\bunset\s+HISTFILE\b|\bHISTSIZE\s*=\s*0\b|\bbcdedit\b[^\n]{0,50}?\/deletevalue/i.test(s) },
+  { id: "destructive.orchestration", title: "Destroys infrastructure or a deployed workload", severity: "high", category: "impact", explanation: "This tears down a namespace, persistent volume, release, or an entire infrastructure stack. Confirm the environment and that nothing else depends on it.", match: s => /\bkubectl\s+delete\s+(?:namespace|pvc|persistentvolumeclaim)\b|\bhelm\s+uninstall\b|\bterraform\s+(?:destroy|apply\s+[^\n]{0,100}?-destroy)\b|\bdocker\s+system\s+prune\s+-a[^\n]{0,50}?--volumes|\bdocker\s+rm\s+-f\s+\$\(\s*docker\s+ps\s+-aq\s*\)/i.test(s) },
+  { id: "destructive.cloud_resource", title: "Deletes a cloud resource", severity: "high", category: "impact", explanation: "This permanently removes a cloud resource (instance, database, bucket, or repository). Confirm this isn't a production or shared resource before allowing it.", match: s => /\baws\s+(?:ec2\s+terminate-instances|rds\s+delete-db-instance|s3\s+rb\b[^\n]{0,100}?--force)\b|\bgcloud\s+(?:compute\s+instances|sql\s+instances)\s+delete\b|\baz\s+(?:vm|group)\s+delete\b|\bgh\s+repo\s+delete\b|\bvercel\s+remove\b[^\n]{0,50}?--yes|\bnetlify\s+sites:delete\b/i.test(s) },
+  { id: "destructive.account", title: "Deletes a system account", severity: "high", category: "impact", explanation: "This removes a user or group account, which can include its home directory and files. Confirm the account is no longer needed.", match: s => /\buserdel\s+-r\b|\bgroupdel\b|\bRemove-LocalUser\b|\bnet\s+user\s+\S+\s+\/delete\b|\bdscl\s+\.\s+-delete\s+\/Users\//i.test(s) },
+  { id: "integrity.protection_disabled", title: "OS security control disabled", severity: "critical", category: "integrity", explanation: "This turns off a platform security control (System Integrity Protection, Gatekeeper, execution policy, or System Restore), which weakens the machine's security posture beyond this one action.", match: s => /\bcsrutil\s+disable\b|\bspctl\s+--master-disable\b|\bsecurity\s+delete-keychain\b|\bSet-ExecutionPolicy\s+Unrestricted\b|\bDisable-WindowsOptionalFeature\b|\bDisable-ComputerRestore\b/i.test(s) },
+  { id: "network.firewall_disabled", title: "Firewall rules flushed or disabled", severity: "high", category: "integrity", explanation: "This removes or disables firewall protection on the host. Confirm the host doesn't need it, or that replacement rules are applied immediately.", match: s => /\biptables\s+-F\b|\bufw\s+(?:--force\s+reset|disable)\b|\bnetsh\s+advfirewall\s+set\s+allprofiles\s+state\s+off\b/i.test(s) },
+  { id: "destructive.production", title: "Production change", severity: "high", category: "impact", explanation: "This action targets a production environment. Confirm the scope and rollback plan before proceeding.", match: s => /\b(?:production|prod|prd)\b/i.test(s) && /\b(?:deploy|delete|drop|truncate|migrate|apply|destroy|restart|rollback|scale)\b/i.test(s) },
+  { id: "credentials.environment", title: "Environment variable access", severity: "high", category: "secrets", explanation: "The action reads exported environment variables that may contain credentials or private configuration.", match: s => /\b(?:printenv|env|export\s+-p|process\.env|os\.environ|System\.getenv|declare\s+-x|Get-ChildItem\s+env:)\b|\/proc\/self\/environ\b|(?:^|[;&|]\s*)set(?:\s*$|\s+-o\b)|\$\{?[A-Z][A-Z0-9_]*\}?/i.test(s) },
   { id: "credentials.access", title: "Sensitive credential reference", severity: "medium", category: "secrets", explanation: "This action or instruction references a credential location. Confirm the agent needs access.", match: s => secret.test(s) },
-  { id: "source.private_files", title: "Private source or configuration access", severity: "high", category: "secrets", explanation: "This action accesses a private credential or configuration file. Confirm that the agent needs the contents.", match: s => /(?:\.env(?:\.[\w.-]+)?|\.ssh[\\/]|\.aws[\\/]credentials|id_(?:rsa|ed25519)|\.npmrc|\.netrc|kubeconfig|private.?key)/i.test(s) },
-  { id: "mcp.write", title: "MCP write operation", severity: "high", category: "impact", explanation: "The MCP tool appears to modify data or send an external side effect. Require approval before allowing it.", match: s => /\bmcp(?:__|:)[^\s]*(?:create|update|delete|write|send|post|put|patch|execute|run|publish|deploy|remove)\b/i.test(s) },
+  { id: "source.private_files", title: "Private source or configuration access", severity: "high", category: "secrets", explanation: "This action accesses a private credential or configuration file. Confirm that the agent needs the contents.", match: s => /(?:\.env(?:\.[\w.-]+)?|\.ssh[\\/]|\.aws[\\/]credentials|id_(?:rsa|ed25519)|\.npmrc|\.netrc|kubeconfig|private.?key|\.pgpass\b|\.docker[\\/]config\.json|\.gnupg[\\/]|credentials\.json)/i.test(s) },
+  { id: "mcp.write", title: "MCP write operation", severity: "high", category: "impact", explanation: "The MCP tool appears to modify data or send an external side effect. Require approval before allowing it.", match: s => /\bmcp(?:__|:)[^\s]*(?:create|update|delete|write|send|post|put|patch|execute|run|publish|deploy|remove|save|insert|add|grant|revoke|assign)\b/i.test(s) },
   { id: "credentials.egress", title: "Possible credential exposure", severity: "critical", category: "exfil", explanation: "Credential references and outbound delivery appear together. Inspect the destination and data before running this.", match: s => secret.test(s) && egress.test(s) },
-  { id: "execution.remote", title: "Remote code execution pattern", severity: "high", category: "exec", explanation: "Downloaded content is piped directly into a shell without review.", match: s => pipesIntoShell(s, downloads) },
+  { id: "execution.remote", title: "Remote code execution pattern", severity: "high", category: "exec", explanation: "Downloaded content is fetched and run without review: piped into a shell or interpreter, fetched and executed in one step, or downloaded and run as separate chained commands.", match: s => pipesIntoShell(s, downloads) || DOWNLOAD_THEN_EXEC.test(s) || POWERSHELL_DOWNLOAD_EXEC.test(s) || PYTHON_FETCH_EXEC.test(s) },
   { id: "execution.obfuscated", title: "Encoded execution", severity: "high", category: "exec", explanation: "Encoded content is decoded for execution. Review the decoded payload separately; Beam never executes it.", match: s => pipesIntoShell(s, decodes) || /\b(?:powershell|pwsh)\b[^\n]{0,500}?\s-(?:enc|encodedcommand)\b/i.test(s) },
   { id: "recon.network_sweep", title: "Network sweep", severity: "medium", category: "recon", explanation: "A scanner targets a network range. Verify scope and authorization before the agent probes other systems (ATT&CK T1046).", match: s => /\b(?:nmap|masscan|rustscan)\b/i.test(s) && /(?:\d{1,3}\.){3}\d{1,3}\/\d{1,2}|(?:\d{1,3}\.){3}\d{1,3}-\d{1,3}/.test(s) },
-  { id: "privilege.elevation", title: "Elevated privileges", severity: "medium", category: "privilege", explanation: "The action requests elevated privileges or broad write permissions.", match: s => /\bsudo\s|\bchmod\s+(?:-R\s+)?777\b/i.test(s) },
-  { id: "network.metadata", title: "Cloud metadata access", severity: "high", category: "secrets", explanation: "Cloud metadata endpoints can expose temporary instance credentials.", match: s => /169\.254\.169\.254|metadata\.google\.internal/i.test(s) },
+  { id: "privilege.elevation", title: "Elevated privileges", severity: "medium", category: "privilege", explanation: "The action requests elevated privileges or broad write permissions.", match: s => /\bsudo\s|\bdoas\s|(?:^|[\s;&|`(])su\s+(?:-\s*\w*|root)\b|\bpkexec\b|\brunas\s+\/user:|\bchmod\s+(?:-R\s+)?(?:777\b|[ugoa]*\+s\b|[2467][0-7]{3}\b)/i.test(s) },
+  { id: "network.metadata", title: "Cloud metadata access", severity: "high", category: "secrets", explanation: "Cloud metadata endpoints can expose temporary instance credentials.", match: s => /169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200/i.test(s) },
   { id: "persistence.config", title: "Security-sensitive configuration", severity: "high", category: "persistence", explanation: "A persistence or agent configuration target is referenced. Check the intended change and trust boundary.", match: s => /authorized_keys|\bcrontab\b|LaunchAgents[\\/]|ANTHROPIC_BASE_URL/i.test(s) },
-  { id: "network.reverse-shell", title: "Reverse shell pattern", severity: "critical", category: "exec", explanation: "This pattern can connect a command shell to another machine.", match: s => /\/dev\/tcp\/|\bnc\b[^\n]{0,300}?\s-e\s|socket[\s\S]{0,200}?subprocess/i.test(s) },
-  { id: "instructions.override", title: "Instruction override attempt", severity: "high", category: "integrity", explanation: "Instructions attempt to override existing safeguards or conceal activity from the user.", match: s => /ignore\s+(?:all\s+)?(?:previous|prior|system|safety)\s+(?:instructions|rules|prompts)|(?:do not|don't|never)\s+(?:tell|inform|notify)\s+(?:the\s+)?user|disable\s+(?:security|safety|logging|audit)/i.test(s) },
+  { id: "network.reverse-shell", title: "Reverse shell pattern", severity: "critical", category: "exec", explanation: "This pattern can connect a command shell to another machine.", match: s => /\/dev\/tcp\/|\bnc\b[^\n]{0,300}?\s-e\s|socket[\s\S]{0,200}?subprocess|\bNew-Object\s+(?:System\.)?Net\.Sockets\.TCPClient\b|\bsocat\b[^\n]{0,300}?\bexec[:=]|\bsocket\([^\n]{0,150}?getprotobyname\(["']tcp["']\)[\s\S]{0,200}?\bconnect\(/i.test(s) },
+  { id: "instructions.override", title: "Instruction override attempt", severity: "high", category: "integrity", explanation: "Instructions attempt to override existing safeguards or conceal activity from the user. Checked against the same folded view used for prompt-injection monitoring (Unicode/width normalization and base64 decoding), not a literal-text match, so stylized or encoded phrasing is caught too.", match: s => promptAttack.override(s) },
   { id: "source_control.history_rewrite", title: "Git history rewrite", severity: "medium", category: "source_control", explanation: "Force-pushing or rewriting shared history can silently discard other people's commits. Confirm the branch isn't shared before proceeding.", match: s => /\bgit\s+push\s+[^\n]{0,1000}?(?:--force(?:-with-lease)?|-f\b)|\bgit\s+filter-(?:branch|repo)\b/i.test(s) },
-  { id: "integrity.tls_bypass", title: "Certificate or signature verification disabled", severity: "medium", category: "integrity", explanation: "Disabling TLS/certificate verification removes protection against a tampered or impersonated destination.", match: s => /\bcurl\b[^\n]{0,1000}?(?:-k\b|--insecure)|\bwget\b[^\n]{0,1000}?--no-check-certificate|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*['"]?0|\bgit\b[^\n]{0,1000}?-c\s+http\.sslVerify=false/i.test(s) },
+  { id: "integrity.tls_bypass", title: "Certificate or signature verification disabled", severity: "medium", category: "integrity", explanation: "Disabling TLS/certificate verification removes protection against a tampered or impersonated destination.", match: s => /\bcurl\b[^\n]{0,1000}?(?:-k\b|--insecure)|\bwget\b[^\n]{0,1000}?--no-check-certificate|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*['"]?0|\bgit\b[^\n]{0,1000}?-c\s+http\.sslVerify=false|\bverify\s*=\s*False\b|\brejectUnauthorized\s*:\s*false\b/i.test(s) },
 ];
 
 /** Built-in rules by id, for callers (like `beam monitor`) that reuse a subset of the catalog. */

@@ -33,7 +33,7 @@ export const codeRules: CodeRule[] = [
     find: regex(/discord(?:app)?\.com\/api\/webhooks\/\d{15,20}\/[\w-]{30,}|api\.telegram\.org\/bot\d{6,12}:[\w-]{30,}|\bwebhook\.site\/[\w-]{8,}|\.m\.pipedream\.net\b|\b(?:interact\.sh|oast\.(?:fun|live|me|online|pro|site)|burpcollaborator\.net|requestbin\.(?:net|com)|requestcatcher\.com|canarytokens\.com)\b|\b[\w-]+\.ngrok(?:-free)?\.(?:io|app)\b|\btransfer\.sh\b|\bpastebin\.com\/raw\b/) },
   { id: "pkg.env_harvest", title: "Serializes the whole environment", severity: "high", explanation: "Every environment variable, which on a developer machine or CI runner includes API keys and tokens, is turned into one string. Ordinary code reads the variables it needs by name.",
     hints: ["process.env", "os.environ"],
-    find: regex(/JSON\.stringify\(\s*process\.env\b|json\.dumps\(\s*(?:dict\(\s*)?os\.environ\b|\bstr\(\s*os\.environ\s*\)/) },
+    find: regex(/JSON\.stringify\(\s*process\.env\b|json\.dumps\(\s*(?:dict\(\s*)?os\.environ\b|\bstr\(\s*os\.environ\s*\)|Object\.(?:entries|keys|values|assign)\(\s*process\.env\b/) },
   { id: "pkg.obfuscated", title: "Obfuscated code", severity: "high", explanation: "The file looks like javascript-obfuscator output or a long run of hex escapes. Published libraries are minified, not obfuscated; obfuscation exists to stop a reviewer from reading the code.",
     hints: ["_0x", "\\x"],
     find: content => Math.max(many(/\b_0x[0-9a-f]{4,6}\b/g, 40)(content), regex(/(?:\\x[2-7][0-9a-fA-F]){40,}/)(content)) },
@@ -54,7 +54,7 @@ export const codeRules: CodeRule[] = [
     } },
   { id: "pkg.network", title: "Makes network calls", severity: "info", explanation: "The file sends requests or opens sockets.", signal: true,
     hints: ["http", "fetch", "axios", "XMLHttpRequest", "net", "dns", "WebSocket", "requests.", "urlopen", "socket.", "curl", "wget"],
-    find: regex(/\brequire\(\s*["'](?:node:)?(?:https?|net|dns|tls|dgram)["']\s*\)\.\w+\s*\(|\bhttps?\.(?:request|get)\s*\(|\bfetch\s*\(|\baxios(?:\.\w+)?\s*\(|\bXMLHttpRequest\b|\bnet\.(?:connect|createConnection)\s*\(|\bdns\.(?:lookup|resolve\w*)\s*\(|\bnew\s+WebSocket\s*\(|\brequests\.(?:get|post|put)\s*\(|\burlopen\s*\(|\burllib\.request\.Request\b|\bhttp\.client\.HTTPS?Connection\b|\bsocket\.(?:socket|create_connection)\s*\(|\bhttpx\.(?:get|post|Client)\b|\b(?:curl|wget)\s[^\n]{0,80}https?:\/\//) },
+    find: regex(/\brequire\(\s*["'](?:node:)?(?:https?|net|dns|tls|dgram)["']\s*\)\.\w+\s*\(|\bhttps?\.(?:request|get)\s*\(|\bfetch\s*\(|\baxios(?:\.\w+)?\s*\(|\bXMLHttpRequest\b|\bnet\.(?:connect|createConnection)\s*\(|\bnew\s+(?:net\.)?Socket\s*\(|\bdns\.(?:lookup|resolve\w*)\s*\(|\bnew\s+WebSocket\s*\(|\brequests\.(?:get|post|put)\s*\(|\burlopen\s*\(|\burllib\.request\.Request\b|\bhttp\.client\.HTTPS?Connection\b|\bsocket\.(?:socket|create_connection)\s*\(|\bhttpx\.(?:get|post|Client)\b|\b(?:curl|wget)\s[^\n]{0,80}https?:\/\//) },
 ];
 
 // Shell-shaped rules borrowed from the skill scanner. They only run on code that executes at
