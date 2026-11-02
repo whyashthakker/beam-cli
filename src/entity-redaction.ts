@@ -15,6 +15,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { getDataDirectory } from "./config.js";
 import { detectSensitive, type CustomDetector, type DataFinding } from "./data-detectors.js";
+import { withFileLock } from "./file-lock.js";
 
 interface SessionEntities { updatedAt: string; counters: Record<string, number>; entries: Record<string, string> }
 type EntityMapFile = Record<string, SessionEntities>;
@@ -55,35 +56,41 @@ export async function redactWithSessionEntities(
   const findings = detectSensitive(text, custom);
   if (findings.length === 0) return { text, findings: [] };
 
-  const map = await readMap(home);
-  const now = new Date().toISOString();
-  const cutoff = Date.now() - SESSION_TTL_MS;
-  for (const [id, session] of Object.entries(map)) if (Date.parse(session.updatedAt) < cutoff) delete map[id];
+  // Locked end-to-end so concurrent tool calls in the same turn -- each spawning its own
+  // `beam hook` process -- can't both read the same pre-update counter and independently assign
+  // the same next id to two different values (see file-lock.ts / behavioral-anomaly.ts, which
+  // has the identical read-modify-write race).
+  return withFileLock(entityMapPath(home), async () => {
+    const map = await readMap(home);
+    const now = new Date().toISOString();
+    const cutoff = Date.now() - SESSION_TTL_MS;
+    for (const [id, session] of Object.entries(map)) if (Date.parse(session.updatedAt) < cutoff) delete map[id];
 
-  const session: SessionEntities = map[sessionId] ?? { updatedAt: now, counters: {}, entries: {} };
-  session.updatedAt = now;
+    const session: SessionEntities = map[sessionId] ?? { updatedAt: now, counters: {}, entries: {} };
+    session.updatedAt = now;
 
-  // detectSensitive() returns findings sorted start-descending (last match first) specifically so
-  // a splice-based replace loop can apply them right-to-left without later offsets shifting --
-  // this loop relies on that same ordering.
-  let result = text;
-  const entityFindings: DataFinding[] = [];
-  for (const finding of findings) {
-    const value = text.slice(finding.start, finding.end);
-    const hash = hashValue(value);
-    let id = session.entries[hash];
-    if (!id) {
-      session.counters[finding.kind] = (session.counters[finding.kind] ?? 0) + 1;
-      id = `${finding.kind}_${String(session.counters[finding.kind]).padStart(3, "0")}`;
-      session.entries[hash] = id;
+    // detectSensitive() returns findings sorted start-descending (last match first) specifically
+    // so a splice-based replace loop can apply them right-to-left without later offsets shifting
+    // -- this loop relies on that same ordering.
+    let result = text;
+    const entityFindings: DataFinding[] = [];
+    for (const finding of findings) {
+      const value = text.slice(finding.start, finding.end);
+      const hash = hashValue(value);
+      let id = session.entries[hash];
+      if (!id) {
+        session.counters[finding.kind] = (session.counters[finding.kind] ?? 0) + 1;
+        id = `${finding.kind}_${String(session.counters[finding.kind]).padStart(3, "0")}`;
+        session.entries[hash] = id;
+      }
+      const replacement = `[${id}]`;
+      result = result.slice(0, finding.start) + replacement + result.slice(finding.end);
+      entityFindings.push({ ...finding, replacement });
     }
-    const replacement = `[${id}]`;
-    result = result.slice(0, finding.start) + replacement + result.slice(finding.end);
-    entityFindings.push({ ...finding, replacement });
-  }
 
-  map[sessionId] = session;
-  await writeMap(map, home).catch(() => { /* best-effort: redaction must still succeed if persistence fails */ });
+    map[sessionId] = session;
+    await writeMap(map, home).catch(() => { /* best-effort: redaction must still succeed if persistence fails */ });
 
-  return { text: result, findings: entityFindings };
+    return { text: result, findings: entityFindings };
+  });
 }

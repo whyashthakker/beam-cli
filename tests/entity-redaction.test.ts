@@ -71,4 +71,16 @@ describe("redactWithSessionEntities", () => {
     const result = await redactWithSessionEntities("AWS_SECRET_ACCESS_KEY=op://vault/aws/secret", "session-A", [], home);
     expect(result.text).toBe("AWS_SECRET_ACCESS_KEY=op://vault/aws/secret");
   });
+
+  it("regression: concurrent redactions of two different values in the same session never collide on the same id", async () => {
+    const home = await tempHome();
+    // Fired together, not awaited one at a time -- this is what used to let both calls read the
+    // same pre-update counter and independently assign the same next number to different values.
+    const [a, b] = await Promise.all([
+      redactWithSessionEntities("SECRET_A=valueOneAbc123", "session-A", [], home),
+      redactWithSessionEntities("SECRET_B=valueTwoXyz789", "session-A", [], home),
+    ]);
+    expect(a.text).not.toBe(b.text);
+    expect([a.text, b.text].sort()).toEqual(["SECRET_A=[SECRET_001]", "SECRET_B=[SECRET_002]"]);
+  });
 });

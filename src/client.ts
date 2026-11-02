@@ -10,6 +10,7 @@ import { extractAgent } from "./extract.js";
 import { loadCustomRules } from "./custom-rules.js";
 import { redactSensitive } from "./data-detectors.js";
 import { redactWithSessionEntities } from "./entity-redaction.js";
+import { recordAndCheckAnomaly } from "./behavioral-anomaly.js";
 import { applyJevHook } from "./jev.js";
 import { applyJudgeHook } from "./judge.js";
 import { isPathTrusted, readTrustedPaths } from "./trusted-paths.js";
@@ -447,6 +448,24 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
         reason: "Beam protection cannot be disabled, removed, or modified by an agent.",
       };
     }
+
+    // Behavioral anomaly: a burst of high/critical-severity actions from one session, independent
+    // of whether any single one was individually blocked -- the shape an agent shows when it's
+    // been talked into a chain of risky actions (injection, a compromised skill, a confused
+    // multi-step plan), even if each step alone only ever rated "ask". Recorded regardless of this
+    // action's own decision (a blocked/asked action still happened and still counts), but only
+    // ever escalates a decision that's currently allow/warn -- never downgrades an existing ask/deny.
+    try {
+      const anomaly = await recordAndCheckAnomaly(String(data.session_id ?? data.sessionId ?? ""), decision.riskLevel);
+      if (anomaly.triggered) {
+        const reason = `${anomaly.count} high/critical-severity actions from this session in the last ${anomaly.windowMinutes} minutes.`;
+        if (decision.mode === "observe" && decision.action === "allow") {
+          decision = { ...decision, riskFactors: [...new Set([...decision.riskFactors, "behavioral anomaly: action burst"])], reason };
+        } else if (decision.mode !== "observe" && (decision.action === "allow" || decision.action === "warn")) {
+          decision = { ...decision, action: "ask", rule: "beam.behavioral-anomaly", reason };
+        }
+      }
+    } catch { /* best-effort: must never block the agent on anomaly-tracking failure */ }
     const policyMode = decision.mode;
     if (decision.action === "allow" && workspace) {
       const escaping = outsideWorkspacePaths(workspace, targetPath, command);
