@@ -178,9 +178,10 @@ export async function runSetup(): Promise<void> {
     if (skills.total) ok(`Found ${skills.total} skill${skills.total === 1 ? "" : "s"}${risky}${searchProjects ? "" : " in your agents' skill folders"}.`);
     else skip("No skills found.");
     if (skills.sync.status === "sent") ok("Reported skill names and risk scores to the dashboard.");
+    else if (skills.sync.status === "queued") ok("Queued skill batches for background upload.");
     else if (skills.sync.status === "unchanged") ok("Dashboard already has this skill list.");
     else if (skills.sync.status === "failed") fail(`Could not report skills (${skills.sync.reason ?? "unknown reason"}); it will be retried by the daily check.`);
-    skillsStatus = `${skills.total} found${risky}${skills.sync.status === "sent" || skills.sync.status === "unchanged" ? ", reported" : ""}`;
+    skillsStatus = `${skills.total} found${risky}${skills.sync.status === "sent" || skills.sync.status === "unchanged" ? ", reported" : skills.sync.status === "queued" ? ", queued" : ""}`;
     if (!searchProjects && skills.total) skip("Project folders weren't searched. Run 'beam skills index' any time to include them.");
   } catch (err) {
     skillsStatus = `failed: ${(err as Error).message}`;

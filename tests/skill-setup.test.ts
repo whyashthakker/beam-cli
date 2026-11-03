@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { writeIdentity } from "../src/enroll.js";
 import { readInventory } from "../src/skill-inventory.js";
 import { indexAndReportSkills } from "../src/skill-setup.js";
+import { drainSkillInventoryOutbox } from "../src/skill-sync.js";
 
 let home: string, data: string, server: Server, received: any[];
 const saved = { data: process.env.BEAM_DATA_DIR, api: process.env.BEAM_API_URL };
@@ -34,7 +35,9 @@ describe("beam setup: index and report skills", () => {
   it("covers the agents' folders and reports them, without touching project folders", async () => {
     await enroll();
     const result = await indexAndReportSkills({ searchProjects: false, home });
-    expect(result).toMatchObject({ total: 2, highRisk: 1, searchedHome: false, sync: { status: "sent", skills: 2 } });
+    expect(result).toMatchObject({ total: 2, highRisk: 1, searchedHome: false, sync: { status: "queued", skills: 2 } });
+    expect(received).toHaveLength(0); // setup never waits for workspace delivery
+    expect((await drainSkillInventoryOutbox()).status).toBe("sent");
     expect(names(received[0])).toEqual(["global-one", "risky"]); // the Desktop skill was never looked for
     expect((await readInventory())?.lastFullScanAt ?? null).toBeNull();
   });
@@ -42,7 +45,9 @@ describe("beam setup: index and report skills", () => {
   it("when asked to search the home folder too, finds project skills, reports everything, and enables the daily full rescan", async () => {
     await enroll();
     const result = await indexAndReportSkills({ searchProjects: true, home });
-    expect(result).toMatchObject({ total: 3, searchedHome: true, sync: { status: "sent", skills: 3 } });
+    expect(result).toMatchObject({ total: 3, searchedHome: true, sync: { status: "queued", skills: 3 } });
+    expect(received).toHaveLength(0);
+    expect((await drainSkillInventoryOutbox()).status).toBe("sent");
     expect(names(received[0])).toEqual(["global-one", "in-project", "risky"]);
     expect((await readInventory())?.lastFullScanAt).toBeTruthy();
   });
@@ -50,6 +55,7 @@ describe("beam setup: index and report skills", () => {
   it("re-running setup with nothing new doesn't resend", async () => {
     await enroll();
     await indexAndReportSkills({ searchProjects: false, home });
+    expect((await drainSkillInventoryOutbox()).status).toBe("sent");
     expect((await indexAndReportSkills({ searchProjects: false, home })).sync.status).toBe("unchanged");
     expect(received).toHaveLength(1);
   });

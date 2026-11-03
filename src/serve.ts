@@ -13,6 +13,7 @@ import { syncPolicy } from "./forward.js";
 import { installAllDetectedHooks, type InstallAllResult } from "./install.js";
 import { startOsMonitor } from "./os-monitor.js";
 import { checkSkillsIfDue } from "./skill-watch.js";
+import { drainSkillInventoryOutbox } from "./skill-sync.js";
 import { runSkillActions } from "./skill-remote.js";
 import { runRemoteUpdate, supervised } from "./remote-update.js";
 import { checkForTampering, recordExpectedHooks } from "./tamper.js";
@@ -183,6 +184,21 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
   // the moment it was due still catches up soon after waking. A report is sent only if names or
   // scores changed (skill-sync.ts); see skill-watch.ts for what gets scanned.
   let skillTimer: NodeJS.Timeout | undefined;
+  let skillOutboxBusy = false;
+  let lastSkillOutboxError = "";
+  const drainSkills = () => {
+    if (skillOutboxBusy) return;
+    skillOutboxBusy = true;
+    void drainSkillInventoryOutbox().then(result => {
+      if (result.status === "failed" && result.reason !== lastSkillOutboxError) {
+        lastSkillOutboxError = result.reason ?? "unknown error";
+        console.error(`Beam skill inventory upload is queued for retry: ${lastSkillOutboxError}`);
+      } else if (result.status === "sent") lastSkillOutboxError = "";
+    }).finally(() => { skillOutboxBusy = false; });
+  };
+  const skillOutboxTimer = setInterval(drainSkills, 5_000);
+  skillOutboxTimer.unref?.();
+  drainSkills();
   if (options.skillIndex ?? options.osMonitor !== false) {
     const run = () => { void checkSkillsIfDue().then(result => {
       if (!result) return;
@@ -197,6 +213,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
     url: `http://${hostname}:${boundPort}`, token, directory, customRules, agentInstalls,
     policySync: Boolean(identity),
     close: () => { if (policyTimer) clearInterval(policyTimer); clearInterval(tamperTimer);
-      clearInterval(spoolTimer); if (skillTimer) clearInterval(skillTimer); osMonitor.stop(); void app.forwardQueue.close(); server.close(); },
+      clearInterval(spoolTimer); if (skillTimer) clearInterval(skillTimer); clearInterval(skillOutboxTimer); osMonitor.stop(); void app.forwardQueue.close(); server.close(); },
   };
 }

@@ -6,9 +6,12 @@ import { join } from "node:path";
 import { writeIdentity } from "../src/enroll.js";
 import { indexSkills } from "../src/skill-inventory.js";
 import { redactPath, sendMatchedLines, syncSkillInventory } from "../src/skill-sync.js";
+import { drainSkillInventoryOutbox, queueSkillInventory } from "../src/skill-sync.js";
+import { forwardSkillInventory, SKILL_INVENTORY_BATCH_SIZE } from "../src/forward.js";
+import type { SkillReport, SkillReportItem } from "../src/skill-sync.js";
 
 const BODY_MARKER = "UNIQUE-BENIGN-BODY-MARKER"; // ordinary skill text that triggers no rule
-let home: string, data: string, server: Server, received: Array<{ auth?: string; url?: string; body: any }>;
+let home: string, data: string, server: Server, received: Array<{ auth?: string; url?: string; body: any }>, rejectBatch: number | null;
 const saved = { data: process.env.BEAM_DATA_DIR, api: process.env.BEAM_API_URL };
 
 async function skill(dir: string, body: string) { await mkdir(dir, { recursive: true }); await writeFile(join(dir, "SKILL.md"), `---\nname: x\n---\n${body}\n`); }
@@ -17,9 +20,9 @@ async function enroll() {
 }
 
 beforeEach(async () => {
-  home = await mkdtemp(join(tmpdir(), "sync-home-")); data = await mkdtemp(join(tmpdir(), "sync-data-")); received = [];
+  home = await mkdtemp(join(tmpdir(), "sync-home-")); data = await mkdtemp(join(tmpdir(), "sync-data-")); received = []; rejectBatch = null;
   process.env.BEAM_DATA_DIR = data;
-  server = createServer((req, res) => { let raw = ""; req.on("data", c => raw += c); req.on("end", () => { received.push({ auth: req.headers.authorization, url: req.url, body: JSON.parse(raw) }); res.statusCode = 202; res.end("{}"); }); });
+  server = createServer((req, res) => { let raw = ""; req.on("data", c => raw += c); req.on("end", () => { const body = JSON.parse(raw); received.push({ auth: req.headers.authorization, url: req.url, body }); res.statusCode = body.batchIndex === rejectBatch ? 503 : 202; res.end("{}"); }); });
   await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
   process.env.BEAM_API_URL = `http://127.0.0.1:${(server.address() as any).port}`;
   await skill(join(home, ".claude/skills/good"), `Summarize the diff.\n${BODY_MARKER}`);
@@ -33,6 +36,43 @@ afterEach(async () => {
 });
 
 describe("daily skill sync to the collector", () => {
+  it("queues setup reports locally without waiting for HTTP, then drains them in bounded batches", async () => {
+    await enroll();
+    const result = await queueSkillInventory({ home });
+    expect(result).toMatchObject({ status: "queued", skills: 2 });
+    expect(received).toHaveLength(0);
+    expect((await drainSkillInventoryOutbox()).status).toBe("sent");
+    expect(received).toHaveLength(1);
+    expect(received[0].body.skills).toHaveLength(2);
+    expect(received[0].body.batchCount).toBe(1);
+  });
+
+  it("sends large inventories sequentially in batches of 20 with one complete snapshot id", async () => {
+    await enroll();
+    const skills = Array.from({ length: 47 }, (_, i) => ({
+      id: "skill-" + i, name: "skill-" + i, agent: "claude-code", scope: "global", path: "~/.claude/skills/" + i, repo: null,
+      hash: "hash-" + i, score: 0, level: "LOW", findings: 0, injection: false, trusted: false,
+      topFindings: [], allFindings: [], files: 1, firstSeen: "2026-11-03T00:00:00Z", lastSeen: "2026-11-03T00:00:00Z", modifiedAt: null,
+    } as SkillReportItem));
+    const report: SkillReport = { generatedAt: "2026-11-03T00:00:00Z", day: "2026-11-03", skills };
+    expect((await forwardSkillInventory(report)).ok).toBe(true);
+    expect(received.map(request => request.body.skills.length)).toEqual([20, 20, 7]);
+    expect(received.map(request => request.body.batchIndex)).toEqual([0, 1, 2]);
+    expect(received.every(request => request.body.batchCount === 3 && request.body.totalSkills === 47)).toBe(true);
+    expect(new Set(received.map(request => request.body.syncId)).size).toBe(1);
+    expect(received.flatMap(request => request.body.skills.map((skill: SkillReportItem) => skill.id))).toEqual(skills.map(skill => skill.id));
+    expect(SKILL_INVENTORY_BATCH_SIZE).toBe(20);
+  });
+
+  it("stops at the first failed batch so the collector cannot finalize a partial snapshot", async () => {
+    await enroll();
+    rejectBatch = 1;
+    const skills = Array.from({ length: 45 }, (_, i) => ({ id: "s" + i } as SkillReportItem));
+    const result = await forwardSkillInventory({ generatedAt: "2026-11-03T00:00:00Z", day: "2026-11-03", skills });
+    expect(result.ok).toBe(false);
+    expect(received.map(request => request.body.batchIndex)).toEqual([0, 1]);
+  });
+
   it("does nothing on a device that isn't enrolled", async () => {
     expect((await syncSkillInventory({ home })).status).toBe("not-enrolled"); expect(received).toHaveLength(0);
   });

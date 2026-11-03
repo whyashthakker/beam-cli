@@ -72,17 +72,22 @@ export async function forwardMcpInventory(servers: McpInventory[]): Promise<Forw
 }
 
 // Same host and auth as MCP inventory: the dedicated collector, keyed by the device secret.
-export async function forwardSkillInventory(report: SkillReport): Promise<ForwardMcpInventoryResult> {
+export async function forwardSkillInventory(report: SkillReport, existingSyncId?: string): Promise<ForwardMcpInventoryResult> {
   const identity = await readIdentity();
   if (!identity) return { ok: false, reason: "This device isn't connected to a Beam workspace." };
   const collectorBase = getApiUrl();
   try {
-    const response = await fetch(`${collectorBase}/v1/skills/inventory`, {
-      method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${identity.deviceSecret}` },
-      body: JSON.stringify(report), signal: AbortSignal.timeout(15_000),
-    });
-    if (response.ok) return { ok: true };
-    return { ok: false, reason: response.status === 404 ? "This workspace's collector doesn't support skill inventory yet." : `Collector responded with HTTP ${response.status}.` };
+    const batchCount = Math.max(1, Math.ceil(report.skills.length / SKILL_INVENTORY_BATCH_SIZE));
+    const syncId = existingSyncId ?? randomUUID();
+    for (let batchIndex = 0; batchIndex < batchCount; batchIndex++) {
+      const skills = report.skills.slice(batchIndex * SKILL_INVENTORY_BATCH_SIZE, (batchIndex + 1) * SKILL_INVENTORY_BATCH_SIZE);
+      const response = await fetch(`${collectorBase}/v1/skills/inventory`, {
+        method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${identity.deviceSecret}` },
+        body: JSON.stringify({ ...report, skills, syncId, batchIndex, batchCount, totalSkills: report.skills.length }), signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) return { ok: false, reason: response.status === 404 ? "This workspace's collector doesn't support skill inventory yet." : `Collector rejected skill batch ${batchIndex + 1}/${batchCount} with HTTP ${response.status}.` };
+    }
+    return { ok: true };
   } catch (error) {
     return { ok: false, reason: `Could not reach ${collectorBase}: ${error instanceof Error ? error.message : String(error)}` };
   }
@@ -90,6 +95,7 @@ export async function forwardSkillInventory(report: SkillReport): Promise<Forwar
 
 export const FORWARD_BATCH_SIZE = 6;
 export const FORWARD_FLUSH_MS = 10_000;
+export const SKILL_INVENTORY_BATCH_SIZE = 20;
 
 // Persist before acknowledging local ingest. Delivery failures and process restarts leave
 // events in this outbox; the remote (orgId, dedupeKey) constraint makes retries idempotent.
