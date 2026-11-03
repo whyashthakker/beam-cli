@@ -47,6 +47,13 @@ The table lists events Beam registers, including prompts, tools, results, failur
 
 ## Captured activity
 
+Hook payloads first reach the local `/ingest` server, which adds the normalized
+`id`, `timestamp`, `agent` and `type` fields required by the workspace collector.
+Workspace deliveries are saved in `data/event-outbox` before local ingest is
+acknowledged. Failed sends stay on disk, retry every ten seconds while Beam runs,
+and resume after restart. Events are bound to the enrolled workspace/device.
+Remote retries use the same IDs so the collector can deduplicate them.
+
 Normalized events include an `activity` object. Studio's action drawer displays it, and workspace forwarding includes it alongside existing event fields.
 
 - `hookEvent`, `toolCallId`, and parent/session identity preserve the originating callback and correlate tool requests with results.

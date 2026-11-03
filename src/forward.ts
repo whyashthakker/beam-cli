@@ -1,8 +1,9 @@
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { getApiUrl, getDataDirectory } from "./config.js";
 import { lastGoodPolicyPath } from "./policy.js";
-import { readIdentity } from "./enroll.js";
+import { readIdentity, type Identity } from "./enroll.js";
 import type { Event, Scan } from "./core.js";
 import type { McpInventory } from "./mcp-config.js";
 import type { SkillReport } from "./skill-sync.js";
@@ -12,17 +13,17 @@ function policyPath(): string {
   return join(getDataDirectory(), "policy.json");
 }
 
-// Fire-and-forget: forwarding to the workspace must never block or fail the agent. Like every
-// other identity-authenticated call in this file, this must hit the *enrolled* device's own
+// Like other identity-authenticated calls, this must hit the enrolled device's own
 // identity.apiBase -- not a separately configured URL -- otherwise a device enrolled against a
 // non-default workspace API (self-hosted, staging, a local dev dashboard) silently forwards
 // events to the wrong place while `beam whoami`/`beam account` and policy sync (which do use
 // identity.apiBase) keep reporting the device as enrolled and healthy.
-export async function forwardEvents(events: Event | Event[]): Promise<void> {
+export async function forwardEvents(events: Event | Event[], expected?: Pick<Identity, "deviceId" | "orgId" | "apiBase">): Promise<boolean> {
   const identity = await readIdentity();
-  if (!identity) return;
+  if (!identity) return false;
+  if (expected && (identity.deviceId !== expected.deviceId || identity.orgId !== expected.orgId || identity.apiBase !== expected.apiBase)) return false;
   try {
-    await fetch(`${identity.apiBase}/v1/ingest`, {
+    const response = await fetch(`${identity.apiBase}/v1/ingest`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -31,8 +32,11 @@ export async function forwardEvents(events: Event | Event[]): Promise<void> {
       body: JSON.stringify(events),
       signal: AbortSignal.timeout(5000),
     });
-  } catch {
-    /* offline / unreachable — the local collector still has the record */
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return true;
+  } catch (error) {
+    console.error(`Beam workspace event delivery failed: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
   }
 }
 
@@ -87,44 +91,94 @@ export async function forwardSkillInventory(report: SkillReport): Promise<Forwar
 export const FORWARD_BATCH_SIZE = 6;
 export const FORWARD_FLUSH_MS = 10_000;
 
-// Batches events in memory (per collector process) and forwards them to the workspace in
-// groups of FORWARD_BATCH_SIZE, instead of one HTTP request per captured action. Lives on the
-// long-running collector (see serve.ts) since that's the only process with state that persists
-// across the many short-lived `beam hook` invocations. A leftover partial batch (below
-// FORWARD_BATCH_SIZE) is flushed after FORWARD_FLUSH_MS of inactivity so a quiet machine still
-// reaches the dashboard instead of waiting indefinitely for a 15th event.
+// Persist before acknowledging local ingest. Delivery failures and process restarts leave
+// events in this outbox; the remote (orgId, dedupeKey) constraint makes retries idempotent.
+// Each envelope is bound to the enrolled device so re-enrollment cannot send old activity
+// into a different workspace. Only already-normalized, redacted events enter this queue.
 export class ForwardQueue {
-  private pending: Event[] = [];
   private flushTimer: NodeJS.Timeout | undefined;
+  private writing: Promise<void> = Promise.resolve();
+  private flushing: Promise<void> | undefined;
+  private stopped = false;
+  private readonly directory: string;
 
-  push(events: Event[]): void {
-    if (!events.length) return;
-    this.pending.push(...events);
-    while (this.pending.length >= FORWARD_BATCH_SIZE) {
-      const batch = this.pending.splice(0, FORWARD_BATCH_SIZE);
-      void forwardEvents(batch);
-    }
+  constructor(directory = getDataDirectory()) {
+    this.directory = join(directory, "event-outbox");
     this.scheduleFlush();
   }
 
+  push(events: Event[]): Promise<void> {
+    const write = this.writing.then(async () => {
+      if (!events.length) return;
+      const identity = await readIdentity();
+      if (!identity) return;
+      await mkdir(this.directory, { recursive: true, mode: 0o700 });
+      for (let i = 0; i < events.length; i += FORWARD_BATCH_SIZE) {
+        const name = `${Date.now()}-${randomUUID()}`;
+        const temp = join(this.directory, `${name}.tmp`);
+        const envelope = { deviceId: identity.deviceId, orgId: identity.orgId, apiBase: identity.apiBase, events: events.slice(i, i + FORWARD_BATCH_SIZE) };
+        try {
+          await writeFile(temp, JSON.stringify(envelope), { mode: 0o600, flag: "wx" });
+          await rename(temp, join(this.directory, `${name}.json`));
+        } finally { await rm(temp, { force: true }); }
+      }
+    });
+    this.writing = write.catch(() => {});
+    return write.then(() => {
+      if (events.length >= FORWARD_BATCH_SIZE) void this.flush();
+    });
+  }
+
   private scheduleFlush(): void {
-    if (this.flushTimer) clearTimeout(this.flushTimer);
-    if (!this.pending.length) return;
+    if (this.stopped || this.flushTimer) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
-      if (!this.pending.length) return;
-      const batch = this.pending.splice(0, this.pending.length);
-      void forwardEvents(batch);
+      void this.flush();
     }, FORWARD_FLUSH_MS);
     this.flushTimer.unref?.();
   }
 
-  /** Force out whatever is pending right now (e.g. on collector shutdown). */
-  flush(): void {
+  flush(): Promise<void> {
+    if (this.flushing) return this.flushing;
     if (this.flushTimer) { clearTimeout(this.flushTimer); this.flushTimer = undefined; }
-    if (!this.pending.length) return;
-    const batch = this.pending.splice(0, this.pending.length);
-    void forwardEvents(batch);
+    this.flushing = this.deliver().catch(error => {
+      console.error(`Beam event outbox: ${error instanceof Error ? error.message : String(error)}`);
+    }).finally(() => { this.flushing = undefined; this.scheduleFlush(); });
+    return this.flushing;
+  }
+
+  close(): Promise<void> {
+    this.stopped = true;
+    return this.flush();
+  }
+
+  private async deliver(): Promise<void> {
+    await this.writing;
+    const identity = await readIdentity();
+    if (!identity) return;
+    let files: string[];
+    try { files = await readdir(this.directory); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+    let attempted = 0;
+    let pending: Event[] = [];
+    let paths: string[] = [];
+    const send = async (): Promise<boolean> => {
+      if (!pending.length) return true;
+      if (!await forwardEvents(pending, identity)) return false;
+      for (const path of paths) await rm(path, { force: true });
+      pending = []; paths = [];
+      return true;
+    };
+    for (const name of files.filter(n => /^\d+-[\da-f-]+\.json$/.test(n)).sort()) {
+      const path = join(this.directory, name);
+      const envelope = JSON.parse(await readFile(path, "utf8"));
+      if (envelope.deviceId !== identity.deviceId || envelope.orgId !== identity.orgId || envelope.apiBase !== identity.apiBase) continue;
+      if (attempted++ >= 100) break;
+      if (pending.length + envelope.events.length > FORWARD_BATCH_SIZE && !await send()) return;
+      pending.push(...envelope.events); paths.push(path);
+      if (pending.length >= FORWARD_BATCH_SIZE && !await send()) return;
+    }
+    await send();
   }
 }
 

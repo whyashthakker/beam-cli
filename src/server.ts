@@ -8,7 +8,7 @@ import { ForwardQueue, forwardReview, forwardScan } from "./forward.js";
 
 export async function createCollector(options: { directory: string; token: string; origins?: string[]; rulesHome?: string }) {
   const store = new Store(options.directory); await store.init();
-  const forwardQueue = new ForwardQueue();
+  const forwardQueue = new ForwardQueue(options.directory);
   const origins = new Set(options.origins ?? ["http://localhost:3200", "http://127.0.0.1:3200"]);
   const secret = Buffer.from(`Bearer ${options.token}`);
   return { store, forwardQueue, async fetch(req: Request): Promise<Response> {
@@ -54,11 +54,12 @@ export async function createCollector(options: { directory: string; token: strin
         const supported = records.filter(r => !r.record_type || ["event", "finding"].includes(String(r.record_type)));
         const normalized = supported.map(normalize);
         const result = await store.addEvents(normalized);
-        // Forward what the store actually kept, not the raw input batch -- addEvents() already
-        // drops cross-agent duplicates (see store.ts's findCrossAgentDuplicate) and, when needed,
-        // relabels an already-forwarded duplicate's agent; forwarding the unfiltered batch here
-        // would undo that and send every duplicate straight to the workspace dashboard anyway.
-        forwardQueue.push([...result.events, ...result.relabeled]);
+        // Forward retained IDs and corrected agent labels. Cross-agent echoes
+        // dropped by addEvents() must not reappear in the workspace timeline.
+        // Retry enqueueing exact-ID duplicates too: a previous outbox disk write may
+        // have failed after local persistence. Cross-agent echoes still stay excluded.
+        const retained = new Set(store.events.map(event => event.id));
+        await forwardQueue.push([...normalized.filter(event => retained.has(event.id)), ...result.relabeled]);
         return json(url.pathname === "/v1/logs" ? {} : { accepted: result.accepted, duplicates: result.duplicates, skipped: records.length - supported.length });
       }
       const data = JSON.parse(body);

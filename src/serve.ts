@@ -97,8 +97,10 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
     spoolBusy = true;
     try {
       await drainHookSpool(directory, async records => {
-        const result = await app.store.addEvents(records.map(normalizeHookEvent));
-        app.forwardQueue.push([...result.events, ...result.relabeled]);
+        const normalized = records.map(normalizeHookEvent);
+        const result = await app.store.addEvents(normalized);
+        const retained = new Set(app.store.events.map(event => event.id));
+        await app.forwardQueue.push([...normalized.filter(event => retained.has(event.id)), ...result.relabeled]);
       });
     } finally { spoolBusy = false; }
   };
@@ -157,7 +159,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
     void checkForTampering(agentHome).then(async events => {
       if (!events.length) return;
       await app.store.addEvents(events);
-      app.forwardQueue.push(events);
+      await app.forwardQueue.push(events);
       for (const event of events) console.error(`\n⚠ ${event.summary}`);
     }).catch(() => {});
   };
@@ -171,7 +173,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
     await app.store.addEvents(events);
     // Same batched forward as hook-captured events (see server.ts's /ingest handler) --
     // otherwise OS-monitor rows would only ever show up in the local studio view.
-    app.forwardQueue.push(events);
+    await app.forwardQueue.push(events);
   });
 
   // Once a day (and at startup, if a day has passed since the last skill scan), looks for skills that
@@ -195,6 +197,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
     url: `http://${hostname}:${boundPort}`, token, directory, customRules, agentInstalls,
     policySync: Boolean(identity),
     close: () => { if (policyTimer) clearInterval(policyTimer); clearInterval(tamperTimer);
-      clearInterval(spoolTimer); if (skillTimer) clearInterval(skillTimer); osMonitor.stop(); app.forwardQueue.flush(); server.close(); },
+      clearInterval(spoolTimer); if (skillTimer) clearInterval(skillTimer); osMonitor.stop(); void app.forwardQueue.close(); server.close(); },
   };
 }

@@ -198,10 +198,10 @@ export function normalize(raw: Obj): Event {
       : toolUseId ? `tool_use:${str(raw.source_agent)}:${str(raw.session_id ?? raw.sessionId)}:${str(obj(raw.endpoint).hostname)}:${phase}:${phase === "observed" ? str(raw.hook_event_name) + ":" : ""}${toolUseId}`
       : JSON.stringify(raw)
     ).digest("hex"),
-    timestamp: new Date(timestamp).toISOString(), receivedAt: new Date().toISOString(), agent: clean(str(raw.source_agent ?? raw.agent, "custom")),
-    session: clean(str(raw.session_id ?? raw.sessionId ?? raw.session, "unassigned")),
+    timestamp: new Date(timestamp).toISOString(), receivedAt: new Date().toISOString(), agent: clean(str(raw.source_agent ?? raw.agent, "custom")).slice(0, 100),
+    session: clean(str(raw.session_id ?? raw.sessionId ?? raw.session, "unassigned")).slice(0, 200),
     ...(str(raw.session_title) ? { sessionTitle: clean(str(raw.session_title)).slice(0, 100), sessionTitleSource: raw.session_title_source === "agent" ? "agent" as const : "prompt" as const } : {}),
-    ...(number(raw.turn) ? { turn: { n: Math.floor(number(raw.turn) as number), topic: clean(str(raw.turn_topic)).slice(0, 100), shift: raw.turn_shift === true } } : {}), type: clean(type), tool: clean(tool), summary: redact(detail).slice(0, 4000),
+    ...(number(raw.turn) ? { turn: { n: Math.floor(number(raw.turn) as number), topic: clean(str(raw.turn_topic)).slice(0, 100), shift: raw.turn_shift === true } } : {}), type: clean(type).slice(0, 100), tool: clean(tool).slice(0, 100), summary: redact(detail).slice(0, 4000),
     project: clean(str(raw.project_path ?? raw.cwd)), source: clean(str(raw.source_type, raw.hook_event_name ? "hook" : "import")),
     endpoint: clean(str(obj(raw.endpoint).hostname ?? raw.hostname, "local")), model: clean(str(raw.model)),
     phase,
