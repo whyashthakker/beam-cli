@@ -2,6 +2,7 @@ import { activityFor, activityType, type Activity } from "./activity.js";
 import { hookKind } from "./hook-catalog.js";
 import { assessAccessFinding } from "./access-risk.js";
 import { classifyActionContext, type ActionContext } from "./action-context.js";
+import { commandBehaviorRegex } from "./mitigation-pattern.js";
 import { createHash, randomUUID } from "node:crypto";
 import { beamVersion } from "./version.js";
 import { changedLines, type LineChanges } from "./edit-stats.js";
@@ -23,6 +24,7 @@ export type Event = {
   activity?: Activity;
   actionContext?: ActionContext;
   actionLog?: { text: string; truncated: boolean };
+  mitigationCandidate?: { kind: "command"; pattern: string; version: 1 };
   policy_decision?: { action: string; rule?: string; reason?: string; risk_score?: number; risk_level?: string; risk_factors?: string[] };
   inputTokens?: number; outputTokens?: number; costUsd?: number;
 };
@@ -161,6 +163,7 @@ export function normalize(raw: Obj): Event {
   const activity = activityFor(raw, redact);
   const detail = command || path || url || (typeof raw.prompt === "string" ? raw.prompt : "") || activity?.searchTerms?.join("; ") || activity?.urls?.join("; ") || activity?.paths?.join("; ") || str(raw.content_preview ?? raw.observed_content_preview ?? raw.summary) || tool || type;
   const findings = /(?:result|message|telemetry)/.test(type) ? [] : detect(detail,{tool,input,cwd:str(raw.cwd??raw.project_path),command});
+  const commandPattern = type === "command.exec" ? commandBehaviorRegex(redact(command)) : null;
   if (raw.record_type === "finding") {
     findings.push({ id: str(raw.rule_id, "imported.finding"), title: redact(str(raw.title, "Imported finding")), severity: ["critical", "high", "medium", "info"].includes(str(raw.severity)) ? raw.severity as Severity : "medium", explanation: "Imported rule match. It indicates a pattern, not proof of compromise or action completion.", evidence: redact(detail).slice(0, 600) });
   }
@@ -213,6 +216,7 @@ export function normalize(raw: Obj): Event {
     ...(mcpServer || explicitMcpTool || explicitMcpResource ? { mcp: { server: clean(mcpServer || "unknown"), ...(mcpTool ? { tool: clean(mcpTool) } : {}), ...(explicitMcpResource ? { resource: clean(explicitMcpResource) } : {}), requestType: mcpRequestType } } : {}),
     ...(findings.length ? { actionContext: classifyActionContext(tool, input, str(raw.cwd ?? raw.project_path), command, clean) } : {}),
     ...(findings.length ? { actionLog: { text: redact(detail).slice(0, 16000), truncated: redact(detail).length > 16000 } } : {}),
+    ...(commandPattern ? { mitigationCandidate: { kind: "command" as const, pattern: commandPattern, version: 1 as const } } : {}),
     ...(type === "file.write" && changedLines(raw.tool_input ?? raw.input) ? { lines: changedLines(raw.tool_input ?? raw.input) } : {}),
     ...(policyDecision ? { policy_decision: policyDecision } : {}),
     findings, inputTokens, outputTokens, costUsd,

@@ -11,7 +11,7 @@ import { canonicalPolicyPath, canonicalPolicyPattern, policyPathTargets, type Po
 
 export type PolicyMode = "observe" | "advisory" | "enforce";
 export type PolicyAction = "ALLOW" | "ASK" | "BLOCK" | "REDACT" | "AUDIT";
-export interface PolicyRule { id: string; title?: string; action: PolicyAction; enforce?: true; risk?: number; eventType?: string; tool?: string; command?: string; commandLine?: string; args?: string[]; path?: string; url?: string; role?: string; user?: string; agent?: string; cwd?: string; repository?: string; branch?: string; environment?: string; time?: { after?: string; before?: string }; reason?: string; approval?: ApprovalPolicy }
+export interface PolicyRule { id: string; title?: string; action: PolicyAction; enforce?: true; risk?: number; eventType?: string; tool?: string; command?: string; commandLine?: string; commandRegex?: string; args?: string[]; path?: string; url?: string; role?: string; user?: string; agent?: string; cwd?: string; repository?: string; branch?: string; environment?: string; time?: { after?: string; before?: string }; reason?: string; approval?: ApprovalPolicy }
 export interface PolicyRules { mode: PolicyMode; blockedTools: string[]; blockedCommandPatterns: string[]; disabledAgents: string[]; rules?: PolicyRule[]; risk?: { askAt?: number; blockAt?: number }; customDetectors?: CustomDetector[] }
 export interface PolicyBundle { version: number; rules: PolicyRules; notAfter: string | null; errors?: string[] }
 const EMPTY: PolicyRules = { mode: "observe", blockedTools: [], blockedCommandPatterns: [], disabledAgents: [], rules: [], customDetectors: [] };
@@ -26,6 +26,11 @@ function validRule(v: unknown, index: number, errors: string[]): PolicyRule | un
   if (!validAction(r.action)) { errors.push(`rules[${index}] (${r.id}) has an invalid action`); return undefined; }
   if (r.enforce !== undefined && (r.enforce !== true || String(r.action).toUpperCase() !== "BLOCK")) { errors.push(`rules[${index}] (${r.id}).enforce is only supported for explicit BLOCK rules`); return undefined; }
   if (r.eventType !== undefined && (typeof r.eventType !== "string" || !r.eventType.trim())) { errors.push(`rules[${index}] (${r.id}).eventType must be a non-empty string`); return undefined; }
+  if (r.commandRegex !== undefined) {
+    if (typeof r.commandRegex !== "string" || r.commandRegex.length < 3 || r.commandRegex.length > 300) { errors.push(`rules[${index}] (${r.id}).commandRegex must be 3-300 characters`); return undefined; }
+    try { if (new RegExp(r.commandRegex, "i").test("")) { errors.push(`rules[${index}] (${r.id}).commandRegex matches every command`); return undefined; } }
+    catch { errors.push(`rules[${index}] (${r.id}).commandRegex is invalid`); return undefined; }
+  }
   if (r.args !== undefined && (!Array.isArray(r.args) || r.args.some(a => typeof a !== "string"))) { errors.push(`rules[${index}] (${r.id}).args must be strings`); return undefined; }
   if (r.risk !== undefined && (typeof r.risk !== "number" || r.risk < 0 || r.risk > 100)) { errors.push(`rules[${index}] (${r.id}).risk must be 0-100`); return undefined; }
   return { ...r, action: String(r.action).toUpperCase() as PolicyAction } as PolicyRule;
@@ -68,6 +73,7 @@ function matches(r: PolicyRule, c: ActionContext & { riskScore: number; pathTarg
   if (r.cwd && !glob(r.cwd, c.cwd ?? "")) return false;
   if (r.command && !glob(r.command, c.command.split(/\s+/)[0] ?? "")) return false;
   if (r.commandLine && !glob(r.commandLine, c.command)) return false;
+  if (r.commandRegex) { try { if (!new RegExp(r.commandRegex, "i").test(c.command)) return false; } catch { return false; } }
   if (r.path) {
     const rulePath = r.path;
     const pattern = canonicalPolicyPattern(rulePath, c.cwd) ?? rulePath;
@@ -85,7 +91,7 @@ function matches(r: PolicyRule, c: ActionContext & { riskScore: number; pathTarg
   if (r.time && c.time) { const t = c.time.slice(11, 16); if (r.time.after && t < r.time.after || r.time.before && t > r.time.before) return false; }
   return true;
 }
-function specificity(r: PolicyRule): number { return [r.eventType, r.tool, r.command, r.commandLine, r.args?.length, r.path, r.url, r.role, r.user, r.agent, r.cwd, r.repository, r.branch, r.environment, r.time].filter(Boolean).length; }
+function specificity(r: PolicyRule): number { return [r.eventType, r.tool, r.command, r.commandLine, r.commandRegex, r.args?.length, r.path, r.url, r.role, r.user, r.agent, r.cwd, r.repository, r.branch, r.environment, r.time].filter(Boolean).length; }
 
 export function evaluate(bundle: PolicyBundle | null, ctx: ActionContext): Decision {
   // Use the same classifier as Activity, including argument-dependent web tools.

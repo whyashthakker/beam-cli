@@ -19,9 +19,12 @@ describe("evaluate", () => {
   });
 
   it("enforces only the selected mitigation while preserving observe mode for unrelated calls", () => {
-    const policy = bundle({ mode: "observe", rules: [{ id: "mitigation-command", agent: "claude-code", commandLine: "ping google.com", enforce: true, action: "BLOCK" }] });
-    expect(evaluate(policy, { ...ctx, command: "ping google.com" }).action).toBe("deny");
-    expect(evaluate(policy, { ...ctx, command: "ping example.com" }).action).toBe("allow");
+    const commandRegex = String.raw`(?:^|[;&|]\s*)(?:(?:sudo|command)\s+)?(?:\/?[A-Za-z0-9_.-]+\/)*ping(?:\s+(?:--|-[A-Za-z][A-Za-z0-9-]*(?:=\d{1,6})?|\d{1,6}))*\s+['"]?google\.com\.?['"]?(?=$|[\s;&|])`;
+    const policy = bundle({ mode: "observe", rules: [{ id: "mitigation-command", agent: "claude-code", commandRegex, enforce: true, action: "BLOCK" }] });
+    for (const command of ["ping google.com", "ping google.com.", "ping -c 1 google.com", "ping -c1 google.com", "ping -n 1 google.com", "sudo ping -- google.com", "/sbin/ping google.com"])
+      expect(evaluate(policy, { ...ctx, command }).action).toBe("deny");
+    for (const command of ["ping example.com", "ping google.com.evil.test", "grep google.com README.md", "echo 'ping google.com'"])
+      expect(evaluate(policy, { ...ctx, command }).action).toBe("allow");
     expect(evaluate(policy, { ...ctx, agent: "codex", command: "ping google.com" }).action).toBe("allow");
   });
 
