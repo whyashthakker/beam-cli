@@ -1,3 +1,4 @@
+import { activityType } from "./activity.js";
 import { classifyActionContext } from "./action-context.js";
 import { environmentRisk } from "./access-risk.js";
 import { builtinRulesById } from "./rule-catalog.js";
@@ -9,7 +10,7 @@ import type { ApprovalPolicy } from "./approvals.js";
 
 export type PolicyMode = "observe" | "advisory" | "enforce";
 export type PolicyAction = "ALLOW" | "ASK" | "BLOCK" | "REDACT" | "AUDIT";
-export interface PolicyRule { id: string; title?: string; action: PolicyAction; risk?: number; tool?: string; command?: string; commandLine?: string; args?: string[]; path?: string; url?: string; role?: string; user?: string; agent?: string; cwd?: string; repository?: string; branch?: string; environment?: string; time?: { after?: string; before?: string }; reason?: string; approval?: ApprovalPolicy }
+export interface PolicyRule { id: string; title?: string; action: PolicyAction; risk?: number; eventType?: string; tool?: string; command?: string; commandLine?: string; args?: string[]; path?: string; url?: string; role?: string; user?: string; agent?: string; cwd?: string; repository?: string; branch?: string; environment?: string; time?: { after?: string; before?: string }; reason?: string; approval?: ApprovalPolicy }
 export interface PolicyRules { mode: PolicyMode; blockedTools: string[]; blockedCommandPatterns: string[]; disabledAgents: string[]; rules?: PolicyRule[]; risk?: { askAt?: number; blockAt?: number }; customDetectors?: CustomDetector[] }
 export interface PolicyBundle { version: number; rules: PolicyRules; notAfter: string | null; errors?: string[] }
 const EMPTY: PolicyRules = { mode: "observe", blockedTools: [], blockedCommandPatterns: [], disabledAgents: [], rules: [], customDetectors: [] };
@@ -22,6 +23,7 @@ function validRule(v: unknown, index: number, errors: string[]): PolicyRule | un
   const r = v as Record<string, unknown>;
   if (typeof r.id !== "string" || !r.id.trim()) { errors.push(`rules[${index}].id is required`); return undefined; }
   if (!validAction(r.action)) { errors.push(`rules[${index}] (${r.id}) has an invalid action`); return undefined; }
+  if (r.eventType !== undefined && (typeof r.eventType !== "string" || !r.eventType.trim())) { errors.push(`rules[${index}] (${r.id}).eventType must be a non-empty string`); return undefined; }
   if (r.args !== undefined && (!Array.isArray(r.args) || r.args.some(a => typeof a !== "string"))) { errors.push(`rules[${index}] (${r.id}).args must be strings`); return undefined; }
   if (r.risk !== undefined && (typeof r.risk !== "number" || r.risk < 0 || r.risk > 100)) { errors.push(`rules[${index}] (${r.id}).risk must be 0-100`); return undefined; }
   return { ...r, action: String(r.action).toUpperCase() as PolicyAction } as PolicyRule;
@@ -49,7 +51,7 @@ export async function readPolicy(): Promise<PolicyBundle | null> {
 }
 
 export type DecisionAction = "allow" | "ask" | "block" | "redact" | "audit" | "warn" | "deny";
-export interface ActionContext { agent: string; tool: string; command: string; args?: string[]; path?: string; url?: string; role?: string; user?: string; cwd?: string; repository?: string; branch?: string; environment?: string; time?: string }
+export interface ActionContext { eventType?: string; input?: Record<string, unknown>; agent: string; tool: string; command: string; args?: string[]; path?: string; url?: string; role?: string; user?: string; cwd?: string; repository?: string; branch?: string; environment?: string; time?: string }
 export interface Decision { action: DecisionAction; reason?: string; mode: PolicyMode; policyVersion: number; policy?: string; rule?: string; approval?: ApprovalPolicy; actor?: string; role?: string; agent?: string; tool?: string; command?: string; args?: string[]; resource?: string; riskScore: number; riskLevel: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"; riskFactors: string[]; customDetectors?: CustomDetector[]; errors?: string[] }
 const safety: Record<PolicyAction, number> = { ALLOW: 0, AUDIT: 1, REDACT: 2, ASK: 3, BLOCK: 4 };
 function glob(pattern: string, value: string): boolean { const e = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "§§").replace(/\*/g, "[^/]*").replace(/§§/g, ".*").replace(/\?/g, "."); return new RegExp(`^${e}$`, "i").test(value); }
@@ -58,6 +60,7 @@ function riskInfo(c: ActionContext): { score: number; level: "LOW" | "MEDIUM" | 
 function matches(r: PolicyRule, c: ActionContext & { riskScore: number }): boolean {
   // r.tool supports glob wildcards (e.g. "mcp__posthog__*") so a dashboard rule can target one
   // MCP server's tools without matching every MCP call; other identity fields stay exact-match.
+  if (r.eventType && !glob(r.eventType, c.eventType ?? "")) return false;
   if (r.tool && !glob(r.tool, c.tool)) return false;
   if (!same(r.role, c.role) || !same(r.user, c.user) || !same(r.agent, c.agent) || !same(r.repository, c.repository) || !same(r.branch, c.branch) || !same(r.environment, c.environment)) return false;
   if (r.cwd && !glob(r.cwd, c.cwd ?? "")) return false;
@@ -70,9 +73,11 @@ function matches(r: PolicyRule, c: ActionContext & { riskScore: number }): boole
   if (r.time && c.time) { const t = c.time.slice(11, 16); if (r.time.after && t < r.time.after || r.time.before && t > r.time.before) return false; }
   return true;
 }
-function specificity(r: PolicyRule): number { return [r.tool, r.command, r.commandLine, r.args?.length, r.path, r.url, r.role, r.user, r.agent, r.cwd, r.repository, r.branch, r.environment, r.time].filter(Boolean).length; }
+function specificity(r: PolicyRule): number { return [r.eventType, r.tool, r.command, r.commandLine, r.args?.length, r.path, r.url, r.role, r.user, r.agent, r.cwd, r.repository, r.branch, r.environment, r.time].filter(Boolean).length; }
 
 export function evaluate(bundle: PolicyBundle | null, ctx: ActionContext): Decision {
+  // Use the same classifier as Activity, including argument-dependent web tools.
+  ctx = { ...ctx, eventType: ctx.eventType ?? activityType({ tool_name: ctx.tool, tool_input: ctx.input }, "tool.call") };
   const info = riskInfo(ctx); const score = info.score; const base = { mode: bundle?.rules.mode ?? "observe", policyVersion: bundle?.version ?? 0, riskScore: score, riskLevel: info.level, riskFactors: info.factors, customDetectors: bundle?.rules.customDetectors ?? [], actor: ctx.user, role: ctx.role, agent: ctx.agent, tool: ctx.tool, command: ctx.command, args: ctx.args, resource: ctx.path ?? ctx.url, errors: bundle?.errors };
   if (!bundle) return { action: "allow", ...base };
   if (bundle.errors?.length) return { action: "deny", ...base, reason: `Security policy rejected: ${bundle.errors.join("; ")}`, rule: "policy.invalid" };

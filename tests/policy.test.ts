@@ -176,3 +176,27 @@ describe("evaluate", () => {
   });
 
 });
+
+
+describe("agent action type rules", () => {
+  const policy = bundle({ rules: [{ id: "claude-search", agent: "claude-code", eventType: "file.search", action: "BLOCK" }] });
+  it.each(["Grep", "Glob", "search_files"])("blocks Claude search through %s", (tool) => {
+    expect(evaluate(policy, { agent: "claude-code", tool, command: "" }).action).toBe("deny");
+  });
+  it("allows another Claude action", () => {
+    expect(evaluate(policy, { agent: "claude-code", tool: "Read", command: "" }).action).toBe("allow");
+  });
+  it("allows search by another agent", () => {
+    expect(evaluate(policy, { agent: "codex", tool: "Grep", command: "" }).action).toBe("allow");
+  });
+  it("matches argument-dependent web search", () => {
+    const web = bundle({ rules: [{ id: "search", eventType: "web.search", action: "BLOCK" }] });
+    expect(evaluate(web, { agent: "codex", tool: "web.run", command: "", input: { search_query: [{ q: "example" }] } }).action).toBe("deny");
+    expect(evaluate(web, { agent: "codex", tool: "web.run", command: "", input: { open: [{ ref_id: "https://example.com" }] } }).action).toBe("allow");
+  });
+  it("preserves observe and advisory modes", () => {
+    const search = { agent: "claude-code", tool: "Grep", command: "" };
+    expect(evaluate({ ...policy, rules: { ...policy.rules, mode: "observe" } }, search).action).toBe("allow");
+    expect(evaluate({ ...policy, rules: { ...policy.rules, mode: "advisory" } }, search).action).toBe("ask");
+  });
+});

@@ -428,6 +428,8 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
     const command = String(data.command ?? toolInput.command ?? "");
     let decision = evaluate(await readPolicy().catch(() => null), {
       agent: sourceAgent,
+      eventType: promptGate ? "prompt.submit" : undefined,
+      input: toolInput,
       tool: String(data.tool_name ?? ""),
       command,
       args: Array.isArray(toolInput.args) ? toolInput.args.map(String) : command.split(/\s+/).slice(1),
