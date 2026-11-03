@@ -18,6 +18,19 @@ describe("evaluate", () => {
     expect(evaluate(bundle({ mode: "observe", blockedTools: ["Bash"] }), ctx).action).toBe("allow");
   });
 
+  it("enforces only the selected mitigation while preserving observe mode for unrelated calls", () => {
+    const policy = bundle({ mode: "observe", rules: [{ id: "mitigation-command", agent: "claude-code", commandLine: "ping google.com", enforce: true, action: "BLOCK" }] });
+    expect(evaluate(policy, { ...ctx, command: "ping google.com" }).action).toBe("deny");
+    expect(evaluate(policy, { ...ctx, command: "ping example.com" }).action).toBe("allow");
+    expect(evaluate(policy, { ...ctx, agent: "codex", command: "ping google.com" }).action).toBe("allow");
+  });
+
+  it("enforces an explicit agent suspension in observe mode without changing another agent", () => {
+    const policy = bundle({ mode: "observe", rules: [{ id: "mitigation-suspend-claude", agent: "claude-code", enforce: true, action: "BLOCK" }] });
+    expect(evaluate(policy, { ...ctx, tool: "Read", command: "" }).action).toBe("deny");
+    expect(evaluate(policy, { ...ctx, agent: "codex", command: "rm -rf /" }).action).toBe("allow");
+  });
+
   it("denies a blocked tool in enforce mode", () => {
     const d = evaluate(bundle({ blockedTools: ["Bash"] }), ctx);
     expect(d.action).toBe("deny");
@@ -68,6 +81,14 @@ describe("evaluate", () => {
 
   it("denies a disabled agent regardless of tool", () => {
     expect(evaluate(bundle({ disabledAgents: ["claude-code"] }), ctx).action).toBe("deny");
+  });
+
+  it("does not let a more specific ALLOW rule bypass an agent suspension", () => {
+    const policy = bundle({ disabledAgents: ["claude-code"], rules: [{ id: "previous-allow", agent: "claude-code", tool: "Bash", commandLine: "echo hello", action: "ALLOW" }] });
+    const decision = evaluate(policy, { ...ctx, command: "echo hello" });
+    expect(decision.action).toBe("deny");
+    expect(decision.rule).toBe("legacy.disabled-agent");
+    expect(evaluate(policy, { ...ctx, agent: "codex", command: "echo hello" }).action).toBe("allow");
   });
 
   it("fails open on an expired bundle", () => {

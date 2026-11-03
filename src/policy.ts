@@ -11,7 +11,7 @@ import { canonicalPolicyPath, canonicalPolicyPattern, policyPathTargets, type Po
 
 export type PolicyMode = "observe" | "advisory" | "enforce";
 export type PolicyAction = "ALLOW" | "ASK" | "BLOCK" | "REDACT" | "AUDIT";
-export interface PolicyRule { id: string; title?: string; action: PolicyAction; risk?: number; eventType?: string; tool?: string; command?: string; commandLine?: string; args?: string[]; path?: string; url?: string; role?: string; user?: string; agent?: string; cwd?: string; repository?: string; branch?: string; environment?: string; time?: { after?: string; before?: string }; reason?: string; approval?: ApprovalPolicy }
+export interface PolicyRule { id: string; title?: string; action: PolicyAction; enforce?: true; risk?: number; eventType?: string; tool?: string; command?: string; commandLine?: string; args?: string[]; path?: string; url?: string; role?: string; user?: string; agent?: string; cwd?: string; repository?: string; branch?: string; environment?: string; time?: { after?: string; before?: string }; reason?: string; approval?: ApprovalPolicy }
 export interface PolicyRules { mode: PolicyMode; blockedTools: string[]; blockedCommandPatterns: string[]; disabledAgents: string[]; rules?: PolicyRule[]; risk?: { askAt?: number; blockAt?: number }; customDetectors?: CustomDetector[] }
 export interface PolicyBundle { version: number; rules: PolicyRules; notAfter: string | null; errors?: string[] }
 const EMPTY: PolicyRules = { mode: "observe", blockedTools: [], blockedCommandPatterns: [], disabledAgents: [], rules: [], customDetectors: [] };
@@ -24,6 +24,7 @@ function validRule(v: unknown, index: number, errors: string[]): PolicyRule | un
   const r = v as Record<string, unknown>;
   if (typeof r.id !== "string" || !r.id.trim()) { errors.push(`rules[${index}].id is required`); return undefined; }
   if (!validAction(r.action)) { errors.push(`rules[${index}] (${r.id}) has an invalid action`); return undefined; }
+  if (r.enforce !== undefined && (r.enforce !== true || String(r.action).toUpperCase() !== "BLOCK")) { errors.push(`rules[${index}] (${r.id}).enforce is only supported for explicit BLOCK rules`); return undefined; }
   if (r.eventType !== undefined && (typeof r.eventType !== "string" || !r.eventType.trim())) { errors.push(`rules[${index}] (${r.id}).eventType must be a non-empty string`); return undefined; }
   if (r.args !== undefined && (!Array.isArray(r.args) || r.args.some(a => typeof a !== "string"))) { errors.push(`rules[${index}] (${r.id}).args must be strings`); return undefined; }
   if (r.risk !== undefined && (typeof r.risk !== "number" || r.risk < 0 || r.risk > 100)) { errors.push(`rules[${index}] (${r.id}).risk must be 0-100`); return undefined; }
@@ -92,12 +93,21 @@ export function evaluate(bundle: PolicyBundle | null, ctx: ActionContext): Decis
   const info = riskInfo(ctx); const score = info.score; const base = { mode: bundle?.rules.mode ?? "observe", policyVersion: bundle?.version ?? 0, riskScore: score, riskLevel: info.level, riskFactors: info.factors, customDetectors: bundle?.rules.customDetectors ?? [], actor: ctx.user, role: ctx.role, agent: ctx.agent, tool: ctx.tool, command: ctx.command, args: ctx.args, resource: ctx.path ?? ctx.url, errors: bundle?.errors };
   if (!bundle) return { action: "allow", ...base };
   if (bundle.errors?.length) return { action: "deny", ...base, reason: `Security policy rejected: ${bundle.errors.join("; ")}`, rule: "policy.invalid" };
-  if (bundle.rules.mode === "observe" || (bundle.notAfter && Date.parse(bundle.notAfter) < Date.now())) return { action: "allow", ...base };
+  if (bundle.notAfter && Date.parse(bundle.notAfter) < Date.now()) return { action: "allow", ...base };
+  const pathTargets = bundle.rules.rules?.some((r) => r.path && (bundle.rules.mode !== "observe" || r.enforce)) ? policyPathTargets(ctx) : undefined;
+  // A manager can enforce a narrow mitigation without enabling unrelated policy
+  // rules or risk thresholds for this member's other tools and agents.
+  const mandatory = (bundle.rules.rules ?? []).filter((r) => r.enforce === true && r.action === "BLOCK" && matches(r, { ...ctx, riskScore: score, pathTargets })).sort((a, b) => specificity(b) - specificity(a))[0];
+  if (mandatory) return { ...base, mode: "enforce", action: "deny", reason: mandatory.reason, policy: "local policy", rule: mandatory.id };
+  if (bundle.rules.mode === "observe") return { action: "allow", ...base };
+  // A disabled agent is a suspension, so a more specific command ALLOW must not
+  // re-enable it. User-scoped bundles limit this suspension to their recipient.
+  if (bundle.rules.disabledAgents.some(a => a.toLowerCase() === ctx.agent.toLowerCase())) {
+    return { ...base, action: bundle.rules.mode === "enforce" ? "deny" : "ask", reason: `${ctx.agent} is disabled by workspace policy.`, policy: "local policy", rule: "legacy.disabled-agent" };
+  }
   const candidates: Array<{ r: PolicyRule; rank: number }> = [];
-  const pathTargets = bundle.rules.rules?.some((r) => r.path) ? policyPathTargets(ctx) : undefined;
   for (const r of bundle.rules.rules ?? []) if (matches(r, { ...ctx, riskScore: score, pathTargets })) candidates.push({ r, rank: specificity(r) });
   for (const tool of bundle.rules.blockedTools) { const r: PolicyRule = { id: `legacy.tool.${tool}`, tool, action: "BLOCK", reason: `The ${tool} tool is blocked by workspace policy.` }; if (matches(r, { ...ctx, riskScore: score })) candidates.push({ r, rank: 1 }); }
-  if (bundle.rules.disabledAgents.some(a => a.toLowerCase() === ctx.agent.toLowerCase())) candidates.push({ r: { id: "legacy.disabled-agent", agent: ctx.agent, action: "BLOCK", reason: `${ctx.agent} is disabled by workspace policy.` }, rank: 1 });
   for (const pattern of bundle.rules.blockedCommandPatterns) { try { if (new RegExp(pattern, "i").test(ctx.command)) candidates.push({ r: { id: `legacy.command.${pattern}`, action: "BLOCK", reason: `Command matches blocked pattern: /${pattern}/` }, rank: 1 }); } catch { /* preserve legacy fail-open behavior; structured rules are validated and reported */ } }
   const selected = candidates.sort((a, b) => b.rank - a.rank || safety[b.r.action] - safety[a.r.action])[0]?.r;
   const thresholds = bundle.rules.risk ?? { askAt: 30, blockAt: 70 }; let action: PolicyAction = selected?.action ?? "ALLOW";

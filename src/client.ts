@@ -421,8 +421,8 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
     }
 
     // 1. Enforcement first — a local file read, so it works even if the collector is down.
-    //    Only acts when a manager has set the policy to advisory/enforce; observe mode
-    //    (the default) is a no-op and Beam stays observation-only.
+    //    General rules follow advisory/enforce mode. Explicit mandatory mitigation
+    //    blocks can deny matching calls while unrelated calls remain in observe mode.
     const toolInput = data.tool_input && typeof data.tool_input === "object"
       ? (data.tool_input as Record<string, unknown>) : {};
     const command = String(data.command ?? toolInput.command ?? toolInput.cmd ?? "");
