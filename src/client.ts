@@ -425,7 +425,7 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
     //    (the default) is a no-op and Beam stays observation-only.
     const toolInput = data.tool_input && typeof data.tool_input === "object"
       ? (data.tool_input as Record<string, unknown>) : {};
-    const command = String(data.command ?? toolInput.command ?? "");
+    const command = String(data.command ?? toolInput.command ?? toolInput.cmd ?? "");
     let decision = evaluate(await readPolicy().catch(() => null), {
       agent: sourceAgent,
       eventType: promptGate ? "prompt.submit" : undefined,
@@ -437,7 +437,7 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
       url: String(toolInput.url ?? data.url ?? ""),
       role: typeof data.role === "string" ? data.role : undefined,
       user: typeof data.user === "string" ? data.user : undefined,
-      cwd: typeof data.cwd === "string" ? data.cwd : undefined,
+      cwd: typeof toolInput.workdir === "string" ? toolInput.workdir : typeof data.cwd === "string" ? data.cwd : undefined,
       repository: typeof data.repository === "string" ? data.repository : undefined,
       branch: typeof data.branch === "string" ? data.branch : undefined,
       environment: typeof data.environment === "string" ? data.environment : undefined,

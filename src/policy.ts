@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { getDataDirectory } from "./config.js";
 import type { CustomDetector } from "./data-detectors.js";
 import type { ApprovalPolicy } from "./approvals.js";
+import { canonicalPolicyPath, canonicalPolicyPattern, policyPathTargets, type PolicyPathTarget } from "./policy-paths.js";
 
 export type PolicyMode = "observe" | "advisory" | "enforce";
 export type PolicyAction = "ALLOW" | "ASK" | "BLOCK" | "REDACT" | "AUDIT";
@@ -57,16 +58,26 @@ const safety: Record<PolicyAction, number> = { ALLOW: 0, AUDIT: 1, REDACT: 2, AS
 function glob(pattern: string, value: string): boolean { const e = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "§§").replace(/\*/g, "[^/]*").replace(/§§/g, ".*").replace(/\?/g, "."); return new RegExp(`^${e}$`, "i").test(value); }
 function same(a: string | undefined, b: string | undefined): boolean { return !a || (b ?? "").toLowerCase() === a.toLowerCase(); }
 function riskInfo(c: ActionContext): { score: number; level: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"; factors: string[] } { const s = `${c.command} ${c.path ?? ""} ${c.url ?? ""}`; const factors: string[] = []; const accessContext=classifyActionContext(c.tool,{file_path:c.path},c.cwd??"",c.command,v=>v,false); const access=environmentRisk(accessContext); const routineNamed=!!access && "severity" in access && access.severity==="info" && accessContext.actions.every(a=>a.operation==="environment-lookup"); let n = 0; if (builtinRulesById(["destructive.delete"])[0]?.severityFor?.(c.command) === "medium") { n += 35; factors.push("scoped temporary test cleanup"); } else if (/\brm\s+.*-rf\s+\//i.test(s)) { n += 98; factors.push("destructive operation"); } else if (/\brm\b/i.test(s)) { n += 45; factors.push("filesystem operation"); } if (/\bsudo\b/i.test(s)) { n += 35; factors.push("privileged operation"); } if (/\b(curl|wget)\b|https?:\/\//i.test(s)) { n += 25; factors.push("external destination"); } if (/\.env|\.ssh|\.aws|private.?key|api.?key|token|secret/i.test(s)) { n += routineNamed ? 5 : 35; factors.push(routineNamed ? "scoped named environment lookup" : "sensitive data or file"); } const score = Math.min(100, n); return { score, level: score >= 90 ? "CRITICAL" : score >= 70 ? "HIGH" : score >= 30 ? "MEDIUM" : "LOW", factors }; }
-function matches(r: PolicyRule, c: ActionContext & { riskScore: number }): boolean {
+function matches(r: PolicyRule, c: ActionContext & { riskScore: number; pathTargets?: PolicyPathTarget[] }): boolean {
   // r.tool supports glob wildcards (e.g. "mcp__posthog__*") so a dashboard rule can target one
   // MCP server's tools without matching every MCP call; other identity fields stay exact-match.
-  if (r.eventType && !glob(r.eventType, c.eventType ?? "")) return false;
+  if (!r.path && r.eventType && !glob(r.eventType, c.eventType ?? "")) return false;
   if (r.tool && !glob(r.tool, c.tool)) return false;
   if (!same(r.role, c.role) || !same(r.user, c.user) || !same(r.agent, c.agent) || !same(r.repository, c.repository) || !same(r.branch, c.branch) || !same(r.environment, c.environment)) return false;
   if (r.cwd && !glob(r.cwd, c.cwd ?? "")) return false;
   if (r.command && !glob(r.command, c.command.split(/\s+/)[0] ?? "")) return false;
   if (r.commandLine && !glob(r.commandLine, c.command)) return false;
-  if (r.path && !glob(r.path, c.path ?? "")) return false;
+  if (r.path) {
+    const rulePath = r.path;
+    const pattern = canonicalPolicyPattern(rulePath, c.cwd) ?? rulePath;
+    const targets = c.pathTargets ?? (c.path ? [{ path: c.path, eventType: c.eventType ?? "" }] : []);
+    if (!targets.some((target) => {
+      if (r.eventType && !glob(r.eventType, target.eventType) && !glob(r.eventType, c.eventType ?? "")) return false;
+      const path = canonicalPolicyPath(target.path, c.cwd) ?? target.path;
+      // A subtree restriction covers both the directory itself and its contents.
+      return glob(pattern, path) || (pattern.endsWith("/**") && glob(pattern.slice(0, -3), path)) || glob(rulePath, target.path);
+    })) return false;
+  }
   if (r.url && !glob(r.url, c.url ?? "")) return false;
   if (r.args && r.args.some((a, i) => !glob(a, c.args?.[i] ?? ""))) return false;
   if (r.risk !== undefined && c.riskScore < r.risk) return false;
@@ -83,7 +94,8 @@ export function evaluate(bundle: PolicyBundle | null, ctx: ActionContext): Decis
   if (bundle.errors?.length) return { action: "deny", ...base, reason: `Security policy rejected: ${bundle.errors.join("; ")}`, rule: "policy.invalid" };
   if (bundle.rules.mode === "observe" || (bundle.notAfter && Date.parse(bundle.notAfter) < Date.now())) return { action: "allow", ...base };
   const candidates: Array<{ r: PolicyRule; rank: number }> = [];
-  for (const r of bundle.rules.rules ?? []) if (matches(r, { ...ctx, riskScore: score })) candidates.push({ r, rank: specificity(r) });
+  const pathTargets = bundle.rules.rules?.some((r) => r.path) ? policyPathTargets(ctx) : undefined;
+  for (const r of bundle.rules.rules ?? []) if (matches(r, { ...ctx, riskScore: score, pathTargets })) candidates.push({ r, rank: specificity(r) });
   for (const tool of bundle.rules.blockedTools) { const r: PolicyRule = { id: `legacy.tool.${tool}`, tool, action: "BLOCK", reason: `The ${tool} tool is blocked by workspace policy.` }; if (matches(r, { ...ctx, riskScore: score })) candidates.push({ r, rank: 1 }); }
   if (bundle.rules.disabledAgents.some(a => a.toLowerCase() === ctx.agent.toLowerCase())) candidates.push({ r: { id: "legacy.disabled-agent", agent: ctx.agent, action: "BLOCK", reason: `${ctx.agent} is disabled by workspace policy.` }, rank: 1 });
   for (const pattern of bundle.rules.blockedCommandPatterns) { try { if (new RegExp(pattern, "i").test(ctx.command)) candidates.push({ r: { id: `legacy.command.${pattern}`, action: "BLOCK", reason: `Command matches blocked pattern: /${pattern}/` }, rank: 1 }); } catch { /* preserve legacy fail-open behavior; structured rules are validated and reported */ } }

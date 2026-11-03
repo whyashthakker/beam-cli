@@ -445,6 +445,32 @@ describe("captureHook", () => {
   });
 
   it.each([
+    ["claude-code", "Bash", { command: "cat ../protected/note.txt" }, '"permissionDecision":"deny"'],
+    ["codex", "exec_command", { cmd: "cat ../protected/note.txt" }, '"permissionDecision":"deny"'],
+    ["cursor", "read_file", { target_file: "../protected/note.txt" }, '"permission":"deny"'],
+    ["gemini", "read_file", { file_path: "../protected/note.txt" }, '"decision":"deny"'],
+  ])("enforces an agent-scoped folder policy through the %s hook", async (agent, tool, input, expected) => {
+    process.env.BEAM_TOKEN = "t";
+    const directory = await tempDir("beam-folder-hook-");
+    const protectedPath = path.join(directory, "protected");
+    await fs.mkdir(protectedPath);
+    const cwd = path.join(directory, "outside");
+    await fs.mkdir(cwd);
+    await fs.writeFile(path.join(process.env.BEAM_DATA_DIR!, "policy.json"), JSON.stringify({ version: 1, rules: {
+      mode: "enforce", blockedTools: [], disabledAgents: [], blockedCommandPatterns: [],
+      rules: [{ id: "protected-folder", agent, eventType: "file.read", path: `${protectedPath}/**`, action: "BLOCK", reason: "Protected folder" }],
+    } }));
+    withStdin(JSON.stringify({ tool_name: tool, tool_input: input, cwd, session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await captureHook(agent);
+      expect(output.mock.calls.map(([chunk]) => String(chunk)).join("")).toContain(expected);
+      expect(process.exitCode).toBe(2);
+    } finally { output.mockRestore(); }
+  });
+
+  it.each([
     ["claude-code", "UserPromptSubmit", '"hookEventName":"UserPromptSubmit"'],
     ["codex", "UserPromptSubmit", '"hookEventName":"UserPromptSubmit"'],
   ])("blocks a disabled %s agent at its prompt-submit hook, not just at tool-call time", async (agent, hookEventName, expected) => {
