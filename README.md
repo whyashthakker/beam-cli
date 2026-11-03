@@ -84,19 +84,13 @@ MCP responses can be filtered locally before sensitive content reaches an agent.
 
 AgentBeam is not Claude-specific. Setup discovers the agents actually installed on the machine and installs the appropriate native hook for each selected agent.
 
-| Agent | Hook support |
-|---|---|
-| Claude Code | Pre-tool protection and activity capture |
-| Codex | Pre-tool protection and activity capture |
-| Gemini CLI | Before-tool protection and activity capture |
-| GitHub Copilot CLI | Pre-tool protection and activity capture |
-| Cursor | Pre-tool protection and activity capture |
-| Hermes Agent | Pre-tool shell hook in `~/.hermes/config.yaml`; asks for approval on first use |
-| OpenClaw | `before_tool_call` plugin, registered with `openclaw plugins install --link` |
-| OpenCode | Shim-based protection where supported |
-| Jev (TypeSafe AI) | Discovery only — config/artifact presence; ecosystem is too fragmented across third-party CLIs (`jev-cli`, `jev-axi`, `jev-guard`) for a single hook contract yet |
+Beam now provides **27 native agent hook/plugin integrations**, covering prompts, pre-tool calls, results, failures, permissions and session/subagent events where the host exposes them. Supported agents include Claude Code, Codex, Cursor, Copilot CLI, VS Code Copilot Chat, Gemini, Windsurf/Devin Desktop, OpenCode, OpenClaw, Pi, Kimi, Qwen, Cline, Amp, Auggie, Kiro, Goose, Kilo, OpenHands, Crush, Junie, Antigravity, Factory Droid, Grok Build, Devin CLI, Hermes and Muse Code. Jev remains discovery-only.
 
-Agent configuration is updated non-destructively, without replacing existing hooks.
+Run `beam agent list --events` for exact event names or see the [full coverage and capture guide](docs/agent-hooks.md). Re-run `beam agent install-all` to upgrade detected agents, then restart the affected hosts and approve changed hooks where required. OpenHands needs an explicit repository config path; VS Code shares Copilot's hook file.
+
+Activity now includes **redacted user prompts**, tool arguments/results, file and directory paths, search terms, URLs and supplied edit details. Open an action in Studio to inspect these fields. Events queue locally when the collector is unavailable. Capture is bounded and depends on host callbacks; shell side effects and uninstrumented tools cannot be reconstructed completely from hooks.
+
+Agent configuration is merged with existing settings, with an original-file backup. New integrations have fixture and generated-callback coverage; live host/version validation is still required.
 
 ## Optional Jev action judging
 

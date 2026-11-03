@@ -1,5 +1,5 @@
 // How many lines an edit added and removed, worked out on the device from the tool's own input so
-// only the two counts -- never the file contents -- leave the machine.
+// line counts accompany the bounded, redacted edit details in activity telemetry.
 
 export type LineChanges = { added: number; removed: number };
 
@@ -53,17 +53,17 @@ export function changedLines(toolInput: unknown): LineChanges | undefined {
     const total = { added: 0, removed: 0 };
     for (const edit of input.edits) {
       const e = record(edit);
-      const counts = diffCounts(str(e.old_string) ?? "", str(e.new_string) ?? "");
+      const counts = diffCounts(str(e.old_string) ?? str(e.oldText) ?? str(e.old_text) ?? "", str(e.new_string) ?? str(e.newText) ?? str(e.new_text) ?? "");
       total.added += counts.added;
       total.removed += counts.removed;
     }
     return total;
   }
-  const before = str(input.old_string) ?? str(input.old_str);
-  const after = str(input.new_string) ?? str(input.new_str);
+  const before = str(input.old_string) ?? str(input.old_str) ?? str(input.oldText) ?? str(input.old_text) ?? str(input.oldString);
+  const after = str(input.new_string) ?? str(input.new_str) ?? str(input.newText) ?? str(input.new_text) ?? str(input.newString);
   if (before !== undefined || after !== undefined) return diffCounts(before ?? "", after ?? "");
 
-  const patch = str(input.patch) ?? str(input.diff) ?? str(input.command);
+  const patch = str(input.patch) ?? str(input.patchText) ?? str(input.patch_text) ?? str(input.diff) ?? str(input.command);
   if (patch && /^(\*\*\* Begin Patch|diff --git|--- |@@ )/m.test(patch)) return patchCounts(patch);
 
   const content = str(input.content) ?? str(input.contents) ?? str(input.file_text);

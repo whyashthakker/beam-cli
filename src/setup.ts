@@ -63,8 +63,8 @@ export async function runSetup(): Promise<void> {
   // --- Step 1: detect agents, then let the user choose which ones get the hook ---
   step(1, "Detecting AI agents on this machine");
   const detected = await detectAgents();
-  const installable = detected.filter(a => a.hookConfigPath && a.mergeHookConfig);
-  const unsupported = detected.filter(a => !a.hookConfigPath || !a.mergeHookConfig);
+  const installable = detected.filter(a => a.customInstall || (a.hookConfigPath && a.mergeHookConfig));
+  const unsupported = detected.filter(a => !a.customInstall && (!a.hookConfigPath || !a.mergeHookConfig));
 
   if (!detected.length) {
     skip("No supported agents detected on this machine.");

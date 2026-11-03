@@ -1,3 +1,4 @@
+import { CATALOG_INSTALLERS } from "./agent-hook-install.js";
 import { execFileSync } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -136,14 +137,24 @@ export default definePluginEntry({
         source_agent: "openclaw",
         source_type: "hook",
       };
-      const result = spawnSync(NODE, [CLI, "hook", "openclaw"], { input: JSON.stringify(payload), encoding: "utf8", timeout: 5000 });
+      const result = spawnSync(NODE, [CLI, "hook", "openclaw"], { input: JSON.stringify(payload), encoding: "utf8", timeout: 30000 });
       let response: any = {};
       try { response = JSON.parse(result.stdout || "{}"); } catch { /* fail closed below */ }
       // OpenClaw's hook runner fails open on a thrown error, so a failure here returns a block instead.
-      if (result.error || result.status !== 0 || response.decision === "deny") {
+      if (result.error || result.status !== 0 || response.decision === "deny" || response.decision === "block") {
         return { block: true, blockReason: response.reason || "Beam denied this tool call." };
       }
     });
+    api.on("after_tool_call", async (event: any, ctx: any) => {
+      const payload = { hook_event_name: "after_tool_call", tool_name: event?.toolName ?? event?.name, tool_input: event?.params ?? event?.args, tool_response: event?.result, error: event?.error, tool_use_id: event?.toolCallId, session_id: ctx?.sessionKey ?? ctx?.sessionId, cwd: ctx?.workspaceDir };
+      spawnSync(NODE, [CLI, "hook", "openclaw", "--event", "after_tool_call"], { input: JSON.stringify(payload), encoding: "utf8", timeout: 10000 });
+    });
+    for (const name of ["session_start", "session_end", "message_received", "message_sent", "subagent_spawned", "subagent_ended"]) {
+      api.on(name, async (event: any, ctx: any) => {
+        const payload = { hook_event_name: name, session_id: ctx?.sessionKey ?? ctx?.sessionId ?? event?.sessionId, parent_session_id: event?.parentSessionId, cwd: ctx?.workspaceDir, ...(name === "message_received" ? { prompt: event?.content } : {}), ...(name === "message_sent" ? { assistant_text: event?.content } : {}) };
+        spawnSync(NODE, [CLI, "hook", "openclaw", "--event", name], { input: JSON.stringify(payload), encoding: "utf8", timeout: 10000 });
+      });
+    }
   },
 });
 `;
@@ -173,6 +184,7 @@ const openclaw: CustomInstaller = {
     const dir = openclawDir();
     const index = openclawIndex(target);
     const existing = await readFile(join(dir, "index.ts"), "utf8").catch(() => "");
+    if (existing && !existing.startsWith(OPENCLAW_MARKER)) throw new Error(`Refusing to overwrite unowned plugin ${dir}`);
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "openclaw.plugin.json"), OPENCLAW_MANIFEST, { mode: 0o600 });
     await writeFile(join(dir, "package.json"), OPENCLAW_PACKAGE, { mode: 0o600 });
@@ -198,4 +210,4 @@ const openclaw: CustomInstaller = {
   },
 };
 
-export const CUSTOM_INSTALLERS: Record<string, CustomInstaller> = { hermes, openclaw };
+export const CUSTOM_INSTALLERS: Record<string, CustomInstaller> = { hermes, ...CATALOG_INSTALLERS, openclaw };

@@ -794,30 +794,34 @@ mcp.command("proxy")
   .action(async (command: string, args: string[]) => { process.exitCode = await runMcpProxy(command, args ?? []); });
 
 program.command("hook")
-  .description("Forward a hook payload from stdin for the given agent (observation only, never blocks the agent). Payload field names are adapted per agent; see 'beam agent list'.")
+  .description("Capture an agent lifecycle payload and apply workspace policy at supported pre-action gates")
   .argument("[source-agent]", "reporting agent id, e.g. claude-code, codex, cursor, copilot-cli", "claude-code")
-  .action(async (sourceAgent: string) => captureHook(sourceAgent));
+  .option("--event <name>", "Native event name supplied by the installed hook")
+  .action(async (sourceAgent: string, options: { event?: string }) => captureHook(sourceAgent, undefined, options.event));
 
 const agent = program.command("agent").description("Discover and configure supported AI agents");
 
 agent.command("list")
   .alias("ls")
   .description("List supported agents and their hook payload verification status")
-  .action(() => {
+  .option("--events", "Include all configured lifecycle event names")
+  .action((options: { events?: boolean }) => {
     const rows = AGENTS.map(a => [
       a.id,
       a.name,
-      a.hookConfigPath ? "installable" : "config wiring not built yet",
+      a.id === "openhands" ? "project-scoped" : a.customInstall || a.hookConfigPath ? "installable" : "discovery only",
       a.verifiedPayload ? "payload verified" : "payload best-effort",
+      ...(options.events ? [(a.hookEvents ?? []).join(", ")] : []),
     ]);
-    console.log(renderColumns(["id", "name", "status", "payload"], rows));
+    console.log(renderColumns(["id", "name", "status", "payload", ...(options.events ? ["events"] : [])], rows));
   });
 
 agent.command("install")
   .description("Wire beam's hook into an agent's own hook config file, without disturbing existing hooks")
   .argument("<agent>", "agent id, e.g. claude-code, codex, cursor, copilot-cli")
-  .action(async (agentId: string) => {
-    const result = await installHook(agentId);
+  .option("--settings <path>", "Explicit hook config path (required for OpenHands project hooks)")
+  .action(async (agentId: string, options: { settings?: string }) => {
+    const result = await installHook(agentId, undefined, options.settings);
     await recordExpectedHooks();
     console.log(result.alreadyInstalled ? `✔ Already installed for ${result.agent}\n  → ${result.path}` : `✔ Installed beam hook for ${result.agent}\n  → ${result.path}`);
     if (result.note) console.log(`  ${result.note}`);
@@ -827,7 +831,8 @@ agent.command("uninstall")
   .description("Detach beam's hook from a single agent's own hook config, leaving everything else installed")
   .argument("<agent>", "agent id, e.g. claude-code, codex, cursor, copilot-cli")
   .option("--yes", "skip the confirmation prompt")
-  .action(async (agentId: string, options: { yes?: boolean }) => {
+  .option("--settings <path>", "Explicit hook config path")
+  .action(async (agentId: string, options: { yes?: boolean; settings?: string }) => {
     const identity = await readIdentity();
     const proceed = await confirmControlAction(
       `This will detach beam's hook from ${agentId}. Its activity will no longer be observed or policy-enforced by beam.`,
@@ -835,7 +840,7 @@ agent.command("uninstall")
     );
     if (!proceed) { console.log("Cancelled."); return; }
     if (identity) await reportControlEvent(`agent-uninstall-${agentId}`, `Beam hook detached from ${agentId} on ${identity.hostname}`, `This device ran 'beam agent uninstall ${agentId}'. ${agentId} is no longer being observed or policy-enforced by beam.`);
-    const result = await uninstallHook(agentId);
+    const result = await uninstallHook(agentId, undefined, options.settings);
     await recordExpectedHooks();
     console.log(result.removed ? `✔ Detached beam's hook from ${result.agent}\n  → ${result.path}` : `— No beam hook found for ${result.agent}.`);
     if (result.note) console.log(`  ${result.note}`);

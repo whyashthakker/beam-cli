@@ -1,3 +1,5 @@
+import { HOOK_CATALOG, hookKind } from "./hook-catalog.js";
+import { mergeHookSpec, unmergeHookSpec } from "./hook-config.js";
 import { join } from "node:path";
 
 export type Obj = Record<string, unknown>;
@@ -14,6 +16,7 @@ export interface AgentDefinition {
   pluginPath?: string | null;
   /** Event name this agent's hook contract uses for a pre-action gate (documented casing). */
   hookEventName: string | null;
+  hookEvents?: string[];
   /**
    * Merge beam's hook entry into this agent's existing hook config (parsed JSON, or {} if the
    * file didn't exist yet). Must be idempotent — safe to call repeatedly without duplicating.
@@ -44,177 +47,21 @@ export interface AgentDefinition {
   customInstall?: boolean;
 }
 
-function obj(v: unknown): Obj { return v && typeof v === "object" && !Array.isArray(v) ? v as Obj : {}; }
-function arr(v: unknown): unknown[] { return Array.isArray(v) ? v : []; }
-
-// Claude Code, Codex, Cursor, and Gemini CLI all install into a `hooks.<Event>` array of
-// `{ matcher, hooks: [{ type: "command", command }] }` entries (Claude Code's own shape, which
-// Gemini CLI's settings.json also uses verbatim per geminicli.com/docs/hooks/reference).
-// A handful of events -- UserPromptSubmit (Claude/Codex) and BeforeAgent (Gemini) among them --
-// have no matcher concept at all (they always fire); the docs' own examples omit the field there
-// entirely rather than sending an empty string, so this does the same to avoid relying on an
-// "ignored" field being tolerated rather than rejected.
-const CLAUDE_STYLE_EVENTS_WITHOUT_MATCHER = new Set(["UserPromptSubmit", "BeforeAgent"]);
-function mergeClaudeStyleHooks(event: string) {
-  const supportsMatcher = !CLAUDE_STYLE_EVENTS_WITHOUT_MATCHER.has(event);
-  return (existing: Obj, command: string): Obj => {
-    const hooks = obj(existing.hooks);
-    const list = arr(hooks[event]).map(obj);
-    const alreadyInstalled = list.some(entry => arr(entry.hooks).map(obj).some(h => h.command === command));
-    if (!alreadyInstalled) list.push({ ...(supportsMatcher ? { matcher: "" } : {}), hooks: [{ type: "command", command }] });
-    return { ...existing, hooks: { ...hooks, [event]: list } };
-  };
-}
-
-// Cursor's own hooks.json instead nests `{ command, matcher }` directly under the event array.
-function mergeCursorHooks(event: string) {
-  return (existing: Obj, command: string): Obj => {
-    const hooks = obj(existing.hooks);
-    const list = arr(hooks[event]).map(obj);
-    if (!list.some(entry => entry.command === command)) list.push({ command, matcher: ".*" });
-    return { version: existing.version ?? 1, ...existing, hooks: { ...hooks, [event]: list } };
-  };
-}
-
-// Copilot CLI's dedicated hook file uses `{ type: "command", bash, timeoutSec }` entries.
-function mergeCopilotHooks(event: string) {
-  return (existing: Obj, command: string): Obj => {
-    const hooks = obj(existing.hooks);
-    const list = arr(hooks[event]).map(obj);
-    if (!list.some(entry => entry.bash === command)) list.push({ type: "command", bash: command, timeoutSec: 30 });
-    return { version: existing.version ?? 1, ...existing, hooks: { ...hooks, [event]: list } };
-  };
-}
-
-// Reverse of mergeClaudeStyleHooks: drops beam's command out of each entry's inner hooks array
-// (rather than the whole entry), so a user-added hook sharing the same matcher is left alone.
-function unmergeClaudeStyleHooks(event: string) {
-  return (existing: Obj, isOwnCommand: (command: string) => boolean): Obj => {
-    const hooks = obj(existing.hooks);
-    if (!(event in hooks)) return existing;
-    const list = arr(hooks[event]).map(obj)
-      .map(entry => ({ ...entry, hooks: arr(entry.hooks).map(obj).filter(h => !isOwnCommand(String(h.command ?? ""))) }))
-      .filter(entry => arr(entry.hooks).length > 0);
-    return { ...existing, hooks: { ...hooks, [event]: list } };
-  };
-}
-
-// Reverse of mergeCursorHooks.
-function unmergeCursorHooks(event: string) {
-  return (existing: Obj, isOwnCommand: (command: string) => boolean): Obj => {
-    const hooks = obj(existing.hooks);
-    if (!(event in hooks)) return existing;
-    const list = arr(hooks[event]).map(obj).filter(entry => !isOwnCommand(String(entry.command ?? "")));
-    return { ...existing, hooks: { ...hooks, [event]: list } };
-  };
-}
-
-// Reverse of mergeCopilotHooks.
-function unmergeCopilotHooks(event: string) {
-  return (existing: Obj, isOwnCommand: (command: string) => boolean): Obj => {
-    const hooks = obj(existing.hooks);
-    if (!(event in hooks)) return existing;
-    const list = arr(hooks[event]).map(obj).filter(entry => !isOwnCommand(String(entry.bash ?? "")));
-    return { ...existing, hooks: { ...hooks, [event]: list } };
-  };
-}
-
-// Installs beam into more than one hook event (e.g. the tool-call gate *and* the prompt-submit
-// gate) by folding each single-event merger over the config in turn. A disabled agent only ever
-// reliably stops at the pre-action gate if that agent never calls a tool in a turn (pure chat) --
-// registering the prompt-submit event too means a disabled agent's policy.disabledAgents block
-// (see policy.ts's evaluate()) fires before the prompt is even processed, not just before a tool
-// call that may never come.
-function mergeAll(mergers: Array<(existing: Obj, command: string) => Obj>) {
-  return (existing: Obj, command: string): Obj => mergers.reduce((acc, merge) => merge(acc, command), existing);
-}
-function unmergeAll(unmergers: Array<(existing: Obj, isOwnCommand: (command: string) => boolean) => Obj>) {
-  return (existing: Obj, isOwnCommand: (command: string) => boolean): Obj => unmergers.reduce((acc, unmerge) => unmerge(acc, isOwnCommand), existing);
-}
-
-export const AGENTS: AgentDefinition[] = [
-  {
-    id: "claude-code", name: "Claude Code",
-    configs: [".claude/settings.json"], artifacts: [".claude/projects"],
-    hookConfigPath: ".claude/settings.json", hookEventName: "PreToolUse",
-    mergeHookConfig: mergeAll([mergeClaudeStyleHooks("PreToolUse"), mergeClaudeStyleHooks("UserPromptSubmit"), mergeClaudeStyleHooks("PostToolUse")]),
-    unmergeHookConfig: unmergeAll([unmergeClaudeStyleHooks("PreToolUse"), unmergeClaudeStyleHooks("UserPromptSubmit"), unmergeClaudeStyleHooks("PostToolUse")]),
-    adapter: "passthrough", verifiedPayload: true,
-    notes: "Payload verified against code.claude.com/docs/en/hooks. Also installs UserPromptSubmit (same hookSpecificOutput.permissionDecision contract, just hookEventName: \"UserPromptSubmit\") so a disabled agent is stopped before the prompt is processed, not only at its first tool call. Also installs PostToolUse: a tool has already run by the time this fires, so it can only rewrite what Claude sees afterward (hookSpecificOutput.updatedToolOutput, field confirmed against the same docs), not block -- used to redact a secret a command's own output exposed (e.g. `cat .env`) that PreToolUse redaction of the *input* can't catch, since the secret was never in the command text to begin with. Codex is not given this entry: its PostToolUse payload/updatedToolOutput support is unverified."
-  },
-  {
-    id: "codex", name: "Codex",
-    configs: [".codex/config.toml"], artifacts: [".codex/sessions", ".codex/archived_sessions"],
-    hookConfigPath: ".codex/hooks.json", hookEventName: "PreToolUse",
-    mergeHookConfig: mergeAll([mergeClaudeStyleHooks("PreToolUse"), mergeClaudeStyleHooks("UserPromptSubmit")]),
-    unmergeHookConfig: unmergeAll([unmergeClaudeStyleHooks("PreToolUse"), unmergeClaudeStyleHooks("UserPromptSubmit")]),
-    adapter: "passthrough", verifiedPayload: true,
-    notes: "Same hooks.json shape and stdin payload fields as Claude Code (session_id, cwd, hook_event_name, tool_name, tool_input, tool_use_id). Also installs UserPromptSubmit for the same disabled-agent-at-prompt-time reason."
-  },
-  {
-    id: "cursor", name: "Cursor",
-    // ".cursor/hooks.json" is the file beam itself writes on install, so it can never be used to
-    // detect a pre-existing Cursor install (circular). The bare ".cursor" directory is what
-    // Cursor itself creates just from being used, so it's a real presence signal.
-    configs: [".cursor"], artifacts: [".cursor/projects"],
-    hookConfigPath: ".cursor/hooks.json", hookEventName: "preToolUse",
-    mergeHookConfig: mergeAll([mergeCursorHooks("preToolUse"), mergeCursorHooks("beforeSubmitPrompt")]),
-    unmergeHookConfig: unmergeAll([unmergeCursorHooks("preToolUse"), unmergeCursorHooks("beforeSubmitPrompt")]),
-    adapter: "passthrough", verifiedPayload: true,
-    notes: "Payload verified against cursor.com/docs/hooks; extra fields (model, conversation_id, ...) are ignored, not misread. Also installs beforeSubmitPrompt -- unlike preToolUse's permission field, that event's block contract is {continue: false, user_message} (see client.ts emitDeny)."
-  },
-  {
-    id: "copilot-cli", name: "GitHub Copilot CLI",
-    // Same circularity as Cursor above: ".copilot/hooks/beam.json" is our own output.
-    // ".copilot/config.json" is what the real Copilot CLI writes on its own first run.
-    configs: [".copilot/config.json"], artifacts: [".copilot/session-state"],
-    hookConfigPath: ".copilot/hooks/beam.json", hookEventName: "preToolUse",
-    mergeHookConfig: mergeAll([mergeCopilotHooks("preToolUse"), mergeCopilotHooks("userPromptSubmitted")]),
-    unmergeHookConfig: unmergeAll([unmergeCopilotHooks("preToolUse"), unmergeCopilotHooks("userPromptSubmitted")]),
-    adapter: "copilot-camel", verifiedPayload: true,
-    notes: "Payload verified against docs.github.com Copilot hooks reference (camelCase: sessionId, cwd, toolName, toolArgs). userPromptSubmitted is also installed for observation/audit only -- GitHub's docs state its stdout is ignored (no blocking contract), so a disabled agent is only actually stopped at its first preToolUse call."
-  },
-  {
-    id: "gemini", name: "Gemini CLI",
-    // ".gemini/settings.json" is our own write target (circular, like Cursor/Copilot above); the
-    // bare ".gemini" directory (created by any use of the Gemini CLI, e.g. mcp_config.json,
-    // projects/) is the reliable presence signal instead.
-    configs: [".gemini"], artifacts: [".gemini/tmp"],
-    hookConfigPath: ".gemini/settings.json", hookEventName: "BeforeTool",
-    // BeforeTool/BeforeAgent use the exact same {matcher, hooks: [{type, command}]} array shape
-    // as Claude Code's PreToolUse/UserPromptSubmit (geminicli.com/docs/hooks/reference) --
-    // beam previously targeted ".agents/hooks.json" with a "pre_tool_execution" event and a
-    // "beam-security" wrapper, which is actually the unrelated Gemini API "Managed Agents"
-    // sandbox hook contract (ai.google.dev/gemini-api/docs/agent-hooks), not Gemini CLI's own.
-    mergeHookConfig: mergeAll([mergeClaudeStyleHooks("BeforeTool"), mergeClaudeStyleHooks("BeforeAgent")]),
-    unmergeHookConfig: unmergeAll([unmergeClaudeStyleHooks("BeforeTool"), unmergeClaudeStyleHooks("BeforeAgent")]),
-    adapter: "gemini", verifiedPayload: true,
-    notes: "Payload verified against geminicli.com/docs/hooks/reference: stdin is flat (session_id, cwd, hook_event_name, tool_name, tool_input, prompt), not the nested tool_call shape the \"gemini\" adapter also tolerates as a defensive fallback. Also installs BeforeAgent so a disabled agent is stopped before the prompt reaches the model, not only at its first tool call; both events accept {decision: \"deny\", reason} and both also honor exit code 2 (see client.ts's EXIT_2_FAILS_CLOSED)."
-  },
-  {
-    id: "opencode", name: "OpenCode",
-    configs: [".config/opencode/opencode.json", ".config/opencode/opencode.jsonc"], artifacts: [".local/share/opencode"],
-    hookConfigPath: null, pluginPath: ".opencode/plugins/beam.ts", hookEventName: "tool.execute.before",
-    mergeHookConfig: null, unmergeHookConfig: null, adapter: "passthrough", verifiedPayload: true,
-    notes: "Uses OpenCode's native tool.execute.before plugin hook."
-  },
-  {
-    id: "hermes", name: "Hermes Agent",
-    configs: [".hermes"], artifacts: [],
-    hookConfigPath: ".hermes/config.yaml", hookEventName: "pre_tool_call",
-    mergeHookConfig: null, unmergeHookConfig: null, customInstall: true,
-    adapter: "pre-tool-alias", verifiedPayload: true,
-    notes: "Installs a shell hook under hooks.pre_tool_call in ~/.hermes/config.yaml (default profile), between beam:begin/beam:end comments. Stdin fields (hook_event_name, tool_name, tool_input, session_id, cwd) and the block contract ({decision: \"block\", reason} or exit 2) verified against hermes-agent.nousresearch.com/docs/user-guide/features/hooks; tool_input shapes per Hermes tool are not. Hermes asks you to approve the hook on first use, and a hook that errors or times out fails open unless fail_closed is set."
-  },
-  {
-    id: "openclaw", name: "OpenClaw",
-    configs: [".openclaw"], artifacts: [],
-    hookConfigPath: null, hookEventName: "before_tool_call",
-    mergeHookConfig: null, unmergeHookConfig: null, customInstall: true,
-    adapter: "pre-tool-alias", verifiedPayload: false,
-    notes: "OpenClaw has no hook config file: beam writes a small plugin that registers api.on(\"before_tool_call\") and links it with 'openclaw plugins install --link' and 'openclaw plugins enable'. Registration and the { block, blockReason } return follow docs.openclaw.ai/plugins/hooks and published plugins, but the event field names are not printed in a reference, so the plugin reads them defensively; treat enforcement as unverified until you see a real event."
-  },
-  {
+export const AGENTS: AgentDefinition[] = HOOK_CATALOG.map(spec => ({
+  id: spec.id, name: spec.name, configs: spec.id === "copilot-cli" ? [".copilot/config.json"] : [spec.detect], artifacts: ({ "claude-code": [".claude/projects"], codex: [".codex/sessions", ".codex/archived_sessions"], cursor: [".cursor/projects"], "copilot-cli": [".copilot/session-state"], gemini: [".gemini/tmp"], opencode: [".local/share/opencode"] } as Record<string, string[]>)[spec.id] ?? [],
+  hookConfigPath: spec.format === "plugin" ? null : spec.path,
+  pluginPath: spec.format === "plugin" ? spec.path : null,
+  hookEventName: spec.events.find(e => hookKind(e) === "pre") ?? null,
+  hookEvents: spec.events,
+  customInstall: true,
+  mergeHookConfig: (existing, command) => mergeHookSpec(spec, existing, command),
+  unmergeHookConfig: (existing, own) => unmergeHookSpec(spec, existing, own),
+  adapter: ["claude-code", "codex", "cursor"].includes(spec.id) ? "passthrough" : spec.id === "hermes" ? "pre-tool-alias" : spec.id === "copilot-cli" || spec.id === "vscode" ? "copilot-camel" : spec.id === "gemini" ? "gemini" : "generic",
+  verifiedPayload: ["claude-code", "codex", "cursor", "copilot-cli", "gemini", "hermes"].includes(spec.id),
+  notes: "Configuration and payload mapping based on Numbat's host contracts; validate with a live session on your agent version. See docs/agent-hooks.md.",
+}));
+AGENTS.push(
+{
     id: "jev", name: "Jev (TypeSafe AI)",
     // TypeSafe's own Jev tooling and at least half a dozen independent third-party CLIs
     // (jev-cli, jev-axi, jev-guard, ...) each pick their own config layout, so unlike the
@@ -228,8 +75,7 @@ export const AGENTS: AgentDefinition[] = [
       "increasingly wired into other agents' tool-call gating (e.g. jev-guard) rather than run as " +
       "a coding agent itself. No single vendor hook contract exists yet across the many third-party " +
       "CLIs wrapping it, so this entry is discovery-only (config/artifact presence), not installable."
-  },
-];
+  });
 
 export function findAgent(id: string): AgentDefinition | undefined {
   return AGENTS.find(a => a.id === id);

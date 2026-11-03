@@ -6,18 +6,14 @@ import { approvalAuditEvent, validateApprovalRequest } from "./approvals.js";
 import type { ApprovalRequest, ApprovalDecision } from "./approvals.js";
 export type ApprovalAudit = { event: string; request_id: string; policy_id?: string; user?: string; agent: string; decision?: string; timestamp: string; reason?: string };
 
-// core.normalize()'s id already collapses two hook firings for the *same* tool call when both
-// carry an identical tool_use_id -- but a wrapping agent (e.g. Cursor's own preToolUse hook
-// firing for a tool call that also went through the Claude Agent SDK's own hook loading, which
-// reads the same ~/.claude/settings.json Claude Code uses regardless of which product embeds the
-// SDK) mints its own tool_use_id rather than forwarding the inner agent's, so that id-based dedup
-// never engages and the same physical command shows up twice under two different "agent" labels.
-// This is a second, looser pass: two events from *different* agents, same phase/type/summary/
-// project, within a few seconds of each other are almost certainly one physical action observed
-// by two hooks, not two independent runs.
+// Older imported events have no native hook identity. Keep their historical
+// proximity deduplication; native activity records are retained per agent/session.
 const CROSS_AGENT_DEDUP_WINDOW_MS = 3000;
 const CROSS_AGENT_DEDUP_SCAN_WINDOW = 200;
 function findCrossAgentDuplicate(candidate: Event, pool: Event[]): Event | undefined {
+  // Native hook activity is scoped to its agent/session; proximity alone cannot prove
+  // two independently issued actions are duplicates.
+  if (candidate.activity) return undefined;
   const t = Date.parse(candidate.timestamp);
   if (!Number.isFinite(t)) return undefined;
   return pool.find(e => e.agent !== candidate.agent

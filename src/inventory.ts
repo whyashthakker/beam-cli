@@ -12,7 +12,7 @@ export async function inventory(events: Event[], home = homedir()) {
     return {
       agent: d.id, name: d.name, configPresent: await exists(d.configs), artifactsPresent: await exists(d.artifacts),
       captureStatus: last ? "records received" : "not verified", lastReceived: last,
-      hookInstallable: Boolean(d.hookConfigPath), payloadVerified: d.verifiedPayload, integration: d.notes,
+      hookInstallable: Boolean(d.customInstall || d.hookConfigPath), payloadVerified: d.verifiedPayload, integration: d.notes,
     };
   }));
 }

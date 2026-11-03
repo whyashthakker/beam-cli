@@ -1,3 +1,4 @@
+import { hookKind } from "./hook-catalog.js";
 // Optional second opinion on agent actions from any model you choose, alongside (or instead of)
 // TypeSafe Jev: a general LLM behind an OpenAI-compatible chat completions endpoint ("llm"), or
 // any decision service that speaks the small JSON contract below ("http"). Same guarantees as
@@ -152,7 +153,7 @@ export async function judgeAction(input: JevInput, config: JudgeConfig, custom: 
 /** Same gate as Jev: pre-tool events only, and only when local policy would let the action run. */
 export async function applyJudgeHook(decision: Decision, data: Record<string, unknown>): Promise<{ decision: Decision; judgment?: JudgeResult }> {
   const event = String(data.hook_event_name ?? "PreToolUse").toLowerCase();
-  if (!["pretooluse", "beforetool", "beforeshellexecution", "beforemcpexecution"].includes(event)
+  if (hookKind(event) !== "pre"
     || !["allow", "warn"].includes(decision.action)) return { decision };
   let config: JudgeConfig;
   try { config = await readJudgeConfig(); }

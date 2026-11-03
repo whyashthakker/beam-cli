@@ -264,7 +264,7 @@ tr.row:hover { background:#0e1013; cursor:pointer; }
         if (activeTab === "findings" && (!e.findings || !e.findings.length)) return false;
         if (agentFilter !== "all" && e.agent !== agentFilter) return false;
         if (sevFilter !== "all" && risk(e) !== sevFilter) return false;
-        var haystack = (e.summary + " " + e.agent + " " + e.session + " " + e.type).toLowerCase();
+        var haystack = (e.summary + " " + e.agent + " " + e.session + " " + e.type + " " + JSON.stringify(e.activity || {})).toLowerCase();
         return !q || haystack.indexOf(q) !== -1;
       });
       var rows = visible.slice(0, 500).map(function (e) {
@@ -306,7 +306,7 @@ tr.row:hover { background:#0e1013; cursor:pointer; }
       [["Agent", event.agent], ["MCP server", event.mcp && event.mcp.server], ["MCP tool", event.mcp && event.mcp.tool], ["MCP resource", event.mcp && event.mcp.resource], ["Session", event.session], ["Time", new Date(event.timestamp).toLocaleString()], ["Source", event.source], ["Status", event.phase], ["Project", event.project || "Not supplied"], ["Endpoint", event.endpoint], ["Model", event.model || "Not supplied"]]
         .filter(function (kv) { return kv[1]; })
         .map(function (kv) { return "<dt>" + kv[0] + "</dt><dd>" + escapeHtml(kv[1]) + "</dd>"; }).join("") +
-      "</dl>" + findings + "</section></div>";
+      "</dl>" + (event.activity ? '<h3>Captured activity</h3><pre style="white-space:pre-wrap;overflow-wrap:anywhere">' + escapeHtml(JSON.stringify(event.activity, null, 2)) + '</pre>' : '') + findings + "</section></div>";
     root.querySelector(".close").addEventListener("click", function () { root.innerHTML = ""; });
     root.querySelector(".drawer-backdrop").addEventListener("click", function (e) { if (e.target === e.currentTarget) root.innerHTML = ""; });
   }

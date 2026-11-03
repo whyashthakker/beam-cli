@@ -7,7 +7,7 @@ describe("hook payload adapters", () => {
   it("passes Claude Code's payload through unchanged and normalizes it as proposed", () => {
     const raw = { hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, session_id: "s1", cwd: "/repo" };
     const adapted = adaptHookPayload("claude-code", raw);
-    expect(adapted).toEqual(raw);
+    expect(adapted).toMatchObject(raw);
     const event = normalize({ ...adapted, source_agent: "claude-code" });
     expect(event.phase).toBe("proposed"); expect(event.type).toBe("command.exec"); expect(event.project).toBe("/repo");
   });

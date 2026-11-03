@@ -157,7 +157,7 @@ describe("captureHook", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("maps UserPromptSubmit onto event_type/tool_name without forwarding the prompt text", async () => {
+  it("captures redacted prompt text on UserPromptSubmit", async () => {
     process.env.BEAM_TOKEN = "t";
     // Forced deny (via a matching policy) purely so /ingest actually fires here -- an allowed
     // prompt.submit event skips ingest entirely, which would make the assertions below vacuous.
@@ -168,9 +168,7 @@ describe("captureHook", () => {
       const body = JSON.parse(String(init.body));
       expect(body.event_type).toBe("prompt.submit");
       expect(body.tool_name).toBe("UserPromptSubmit");
-      expect(body.command).toBeUndefined();
-      expect(body.prompt).toBeUndefined();
-      expect(JSON.stringify(body)).not.toContain("help me deploy");
+      expect(body.prompt).toBe("help me deploy");
       return new Response("{}", { status: 200 });
     });
     global.fetch = fetchMock as unknown as typeof fetch;
@@ -178,7 +176,7 @@ describe("captureHook", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("never forwards the session id for a prompt.submit event", async () => {
+  it("retains prompt session identity for the activity timeline", async () => {
     process.env.BEAM_TOKEN = "t";
     // Forced deny (via a matching policy) purely so /ingest actually fires here -- an allowed
     // prompt.submit event skips ingest entirely, which would make the assertions below vacuous.
@@ -187,7 +185,7 @@ describe("captureHook", () => {
     withStdin(JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: "help me deploy", session_id: "s1" }));
     const fetchMock = jest.fn(async (_url: string, init: RequestInit) => {
       const body = JSON.parse(String(init.body));
-      expect(body.session_id).toBeUndefined();
+      expect(body.session_id).toBe("s1");
       expect(body.sessionId).toBeUndefined();
       expect(body.session).toBeUndefined();
       return new Response("{}", { status: 200 });
@@ -422,11 +420,11 @@ describe("captureHook", () => {
     expect(captured?.model).toBe("claude-opus");
   });
 
-  it("logs and resolves instead of throwing when the collector is unreachable", async () => {
+  it("queues an event instead of throwing when the collector is unreachable", async () => {
     withStdin(JSON.stringify({ hook_event_name: "PreToolUse" }));
     const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
     await expect(captureHook()).resolves.toBeUndefined();
-    expect(errorSpy).toHaveBeenCalled();
+    expect((await fs.readdir(path.join(process.env.BEAM_DATA_DIR!, "hook-spool"))).some(f => f.endsWith(".json"))).toBe(true);
     errorSpy.mockRestore();
   });
 
@@ -547,7 +545,7 @@ describe("captureHook", () => {
       output.mockRestore();
     });
 
-    it("never runs policy enforcement (no /ingest call, no block) for a completed PostToolUse action", async () => {
+    it("captures a completed PostToolUse action without applying pre-action policy", async () => {
       process.env.BEAM_TOKEN = "t";
       const policyDir = process.env.BEAM_DATA_DIR!;
       // A policy that would BLOCK this exact command at PreToolUse must have no effect here --
@@ -562,7 +560,8 @@ describe("captureHook", () => {
       const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
       await captureHook("claude-code");
       expect(output).not.toHaveBeenCalled(); // nothing to redact, and no block JSON either
-      expect(fetchMock).not.toHaveBeenCalled(); // no telemetry capture for this minimal path
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(process.exitCode).not.toBe(2);
       output.mockRestore();
     });
   });

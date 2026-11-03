@@ -150,7 +150,7 @@ describe("hook precedence and enforcement", () => {
   it.each(["claude-code", "codex", "gemini", "cursor", "copilot-cli"])("emits the actual %s hook denial when Jev fails", async agent => {
     await writeJevConfig({ ...config, mode: "enforce" });
     process.env.BEAM_TOKEN = "test-token";
-    Object.defineProperty(process, "stdin", { value: Readable.from([JSON.stringify({ ...hook, model: "test" })]), configurable: true });
+    Object.defineProperty(process, "stdin", { value: Readable.from([JSON.stringify(agent === "copilot-cli" ? { hook_event_name: "preToolUse", toolName: hook.tool_name, toolArgs: JSON.stringify(hook.tool_input), model: "test" } : { ...hook, model: "test" })]), configurable: true });
     const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
     jest.spyOn(process.stderr, "write").mockImplementation(() => true);
     global.fetch = jest.fn(async url => new Response("{}", { status: url === JEV_ENDPOINT ? 503 : 200 })) as typeof fetch;

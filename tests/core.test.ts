@@ -75,10 +75,10 @@ describe("normalization", () => {
     const event = normalize({ record_type: "finding", finding_id: "f1", source_agent: "claude", rule_id: "recon.network_sweep", title: "Sweep", severity: "high", cited_event_ids: ["e1"], tags: ["attack.t1046"], evidence_refs: [{ artifact_type: "hook" }] });
     expect(event.provenance?.citedEventIds).toEqual(["e1"]); expect(event.provenance?.tags).toContain("attack.t1046"); expect(event.findings[0].severity).toBe("high");
   });
-  it("collapses one tool call reported by two hook installs (Claude Code run inside Cursor) into a single event id", () => {
+  it("keeps native hook IDs scoped to their reporting agent and session", () => {
     const claudeCode = normalize({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "npm test" }, tool_use_id: "toolu_01", session_id: "claude-session", source_agent: "claude-code" });
     const cursor = normalize({ hook_event_name: "preToolUse", tool_name: "Bash", tool_input: { command: "npm test" }, tool_use_id: "toolu_01", session_id: "cursor-session", source_agent: "cursor" });
-    expect(claudeCode.id).toBe(cursor.id);
+    expect(claudeCode.id).not.toBe(cursor.id);
   });
   it("still distinguishes unrelated tool calls that happen to share nothing but source", () => {
     const first = normalize({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "npm test" }, tool_use_id: "toolu_01", source_agent: "claude-code" });

@@ -1,3 +1,6 @@
+import { spoolHookEvent } from "./hook-spool.js";
+import { hookKind } from "./hook-catalog.js";
+import { activityFor } from "./activity.js";
 import { classifyActionContext } from "./action-context.js";
 import { environmentRisk } from "./access-risk.js";
 import { mkdir, open, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
@@ -354,32 +357,38 @@ async function readStdin(limitBytes: number): Promise<string> {
 }
 
 // Never throws: best-effort capture must not suppress configured policy enforcement.
-export async function captureHook(sourceAgent = "claude-code", home = homedir()): Promise<void> {
+export async function captureHook(sourceAgent = "claude-code", home = homedir(), suppliedEvent?: string): Promise<void> {
+  let canBlock = suppliedEvent === undefined || hookKind(suppliedEvent) === "pre";
   try {
-    const input = await readStdin(100_000);
+    const input = await readStdin(2_000_000);
     const raw = JSON.parse(input) as Record<string, unknown>;
-    let data = adaptHookPayload(sourceAgent, raw);
+    let data = adaptHookPayload(sourceAgent, raw, suppliedEvent);
+    sourceAgent = String(data.source_agent ?? sourceAgent);
     data.source_agent = sourceAgent;
     data.source_type = "hook";
 
-    // PostToolUse: the tool already ran, so there is nothing to block -- only redact a secret
-    // that showed up in its *output* (not its input, which PreToolUse redaction below already
-    // covers) before Claude reads it. A separate, minimal path: no policy enforcement, no
-    // telemetry capture, no workspace/skill checks apply to an action that's already completed.
-    if (data.hook_event_name === "PostToolUse") {
-      try {
+    const eventKind = hookKind(String(data.hook_event_name ?? ""));
+    const promptGate = eventKind === "prompt" && ["claude-code", "codex", "cursor", "gemini"].includes(sourceAgent);
+    canBlock = eventKind === "pre" || promptGate;
+    if (eventKind === "prompt" && typeof data.prompt === "string") {
+      data.event_type = "prompt.submit";
+      data.tool_name = data.tool_name ?? data.hook_event_name;
+      data.command = data.prompt;
+      if (sessionTitlesEnabled()) await notePrompt(String(data.session_id ?? ""), data.prompt, String(data.cwd ?? "")).catch(() => {});
+    }
+    // Completed actions, permission notifications, and lifecycle callbacks are observation only.
+    // They must never run pre-action policy, skill approval, or action-judge gates.
+    if (!canBlock) {
+      if (eventKind === "post" && sourceAgent === "claude-code") {
         const bundle = await readPolicy().catch(() => null);
-        const sessionId = String(data.session_id ?? data.sessionId ?? "");
-        await emitRedactedOutput(sourceAgent, data.tool_response, sessionId, bundle?.rules.customDetectors);
-      } catch { /* best-effort: must never throw and block the agent on a completed action */ }
+        await emitRedactedOutput(sourceAgent, data.tool_response, String(data.session_id ?? ""), bundle?.rules.customDetectors).catch(() => {});
+      }
+      await captureActivity(data);
+      if (sourceAgent === "cline") process.stdout.write(JSON.stringify({ cancel: false }));
+      if (sourceAgent === "antigravity" && eventKind === "assistant") process.stdout.write(JSON.stringify({ decision: "stop" }));
       return;
     }
 
-    if (data.hook_event_name === "UserPromptSubmit" && typeof data.prompt === "string") {
-      data.event_type = data.event_type ?? "prompt.submit";
-      data.tool_name = data.tool_name ?? "UserPromptSubmit";
-      data.command = data.command ?? data.prompt;
-    }
     // Model and token-usage backfill are independent: a newer agent build (Codex 0.155.1+ sends
     // `model` as a common field on every hook event -- see learn.chatgpt.com/docs/hooks) can
     // already provide data.model while still never sending input_tokens/output_tokens. Gating
@@ -519,38 +528,10 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     // step only ever runs for Beam's own soft, non-mandatory fallback.
     if (decision.action === "warn") decision = await resolveWarnInteractively(decision, targetPath, command);
 
-    // Detection and policy enforcement above already ran against the real prompt text and
-    // session id -- neither is forwarded to the local collector or the workspace dashboard from
-    // this point on. event_type/tool_name still identify a prompt-submit event; the content and
-    // the session identifier do not leave this machine. Scoped to prompt.submit only -- deleting
-    // session_id on every event type broke session grouping (and the tool_use_id dedup in
-    // core.ts, which is keyed per-hostname/phase but not per-session) for all other hook events.
-    // The only things derived from a prompt that are allowed out: a session title (first prompt) and
-    // a short per-turn topic, both redacted and capped at 80 characters -- see session-title.ts.
-    // Raw prompt text still never leaves the machine.
-    if (sessionTitlesEnabled()) {
-      try {
-        const sessionId = String(data.session_id ?? data.sessionId ?? "");
-        // Cursor (beforeSubmitPrompt) and Gemini (BeforeAgent) name their prompt hook differently
-        // from Claude Code / Codex, and are not rewritten to prompt.submit above (each agent's
-        // block contract is keyed on its own event name), so recognise them here.
-        const otherPromptHook = ["beforeSubmitPrompt", "BeforeAgent"].includes(String(data.hook_event_name)) && typeof data.prompt === "string";
-        if (data.event_type === "prompt.submit" || otherPromptHook) {
-          await notePrompt(sessionId, String(data.prompt ?? ""), String(data.cwd ?? ""));
-          if (otherPromptHook) delete data.prompt; // the raw prompt must not travel further than this check
-        } else {
-          const context = await sessionContextFor(sourceAgent, sessionId, { home, transcriptPath: typeof data.transcript_path === "string" ? data.transcript_path : undefined });
-          if (context) { data.session_title = context.title; data.session_title_source = context.titleSource; data.turn = context.turn; data.turn_topic = context.topic; data.turn_shift = context.shift; }
-        }
-      } catch { /* best-effort: a title must never affect enforcement */ }
-    }
-
-    if (data.event_type === "prompt.submit") {
-      delete data.prompt;
-      delete data.command;
-      delete data.session_id;
-      delete data.sessionId;
-      delete data.session;
+    // Retain redacted prompts and session identities now that prompt activity is part of capture.
+    if (sessionTitlesEnabled() && data.session_id && eventKind !== "prompt") {
+      const context = await sessionContextFor(sourceAgent, String(data.session_id), { home }).catch(() => null);
+      if (context) { data.session_title = context.title; data.session_title_source = context.titleSource; data.turn = context.turn; data.turn_topic = context.topic; data.turn_shift = context.shift; }
     }
 
     data.policy_decision = { action: decision.action, rule: decision.rule, reason: decision.reason, risk_score: decision.riskScore, risk_level: decision.riskLevel, risk_factors: decision.riskFactors };
@@ -576,17 +557,10 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
       process.stderr.write(`\n⚠ Beam policy (advisory): ${decision.reason}\n`);
     }
 
-    // 2. Local capture (best-effort — a failure here must not skip enforcement or throw). The
-    //    running collector (serve.ts) also batches this event into its own workspace forward --
-    //    see ForwardQueue in forward.ts -- so most events reach the dashboard in groups rather
-    //    than one request per action. Allowed prompt.submit events are skipped here: policy
-    //    enforcement above already ran against them, but every keystroke-triggered prompt
-    //    otherwise floods the Activity/Overview views with noise nobody reviews. A blocked
-    //    prompt is still surfaced -- see step 3 below.
-    if (data.event_type !== "prompt.submit" || decision.action === "deny") {
-      try { await send("/ingest", JSON.stringify(data)); }
-      catch (e) { console.error(e instanceof Error ? e.message : String(e)); }
-    }
+    if (["cline", "antigravity"].includes(sourceAgent) && ["allow", "audit", "warn"].includes(decision.action)) emitAllow(sourceAgent, decision.reason, hookEvent);
+
+    // Capture every lifecycle event, including allowed prompts and tool completions.
+    await captureActivity(data);
 
     // 3. A policy-blocked action carries a finding the collector's own normalize() can't
     //    reconstruct (it only knows about *this* process's policy decision) -- forward it to the
@@ -601,12 +575,35 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir())
     // confirms exit 2 blocks both BeforeTool and BeforeAgent, same as decision: "deny") and is
     // also treated as failure by OpenCode's native plugin wrapper.
     const policy = await readPolicy().catch(() => null);
-    if (policy && (policy.rules.mode === "enforce" || policy.errors?.length)) {
+    if (canBlock && policy && (policy.rules.mode === "enforce" || policy.errors?.length)) {
       // emitDeny already sets exit code 2 for the agents where that's the documented fail-closed
       // signal (see EXIT_2_FAILS_CLOSED above).
       emitDeny(sourceAgent, "Beam security policy could not complete safely; execution is denied.");
     }
   }
+}
+
+async function captureActivity(data: Record<string, unknown>): Promise<void> {
+  try {
+    const policy = await readPolicy().catch(() => null);
+    const redacted = await redactPayload(data, { customDetectors: policy?.rules.customDetectors }, String(data.session_id ?? ""));
+    const a = activityFor(redacted.data, value => redactSensitive(value, policy?.rules.customDetectors).text);
+    if (!a) return;
+    const projected: Record<string, unknown> = {};
+    for (const field of ["source_agent", "source_type", "hook_event_name", "session_id", "parent_session_id", "tool_name", "tool_use_id", "event_type", "command", "file_path", "url", "cwd", "model", "timestamp", "session_title", "session_title_source", "turn", "turn_topic", "turn_shift", "input_tokens", "output_tokens", "policy_decision", "status", "error", "is_error", "reason", "decision", "permission_decision", "permissionDecision", "approval", "approved", "agent_id", "agent_type", "subagent_id", "child_session_id", "exit_code", "exitCode", "duration_ms"]) {
+      const value = redacted.data[field];
+      if (value !== undefined) projected[field] = typeof value === "string" ? value.slice(0, 4000) : value;
+    }
+    const details = a.details as Record<string, unknown> | undefined;
+    if (details) for (const [key,value] of Object.entries(details)) projected[key] = value;
+    projected.tool_input = a.input;
+    projected.tool_response = a.output;
+    projected.prompt = a.prompt;
+    projected.assistant_text = a.assistant;
+    projected.capture_truncated = a.truncated;
+    try { await send("/ingest", JSON.stringify(projected)); }
+    catch { await spoolHookEvent(projected); }
+  } catch (e) { process.stderr.write(`Beam activity capture failed: ${e instanceof Error ? e.message : String(e)}\n`); }
 }
 
 function safeNormalize(data: Record<string, unknown>): Event | null {
@@ -718,7 +715,7 @@ function claudeStyleHookEventName(event: string): string {
 // updatedToolOutput support are unverified, and sending a rewrite a client doesn't honor would
 // silently do nothing while looking like protection.
 async function emitRedactedOutput(agent: string, toolResponse: unknown, sessionId: string, customDetectors?: Array<{ name: string; pattern: string; replacement: string }>): Promise<void> {
-  if (agent !== "claude-code" || toolResponse === null || typeof toolResponse !== "object") return;
+  if (agent !== "claude-code" || toolResponse === null || toolResponse === undefined) return;
   const redactValue = async (value: unknown): Promise<unknown> => {
     if (typeof value === "string") return (await redactWithSessionEntities(value, sessionId, customDetectors)).text;
     if (Array.isArray(value)) return Promise.all(value.map(redactValue));
@@ -753,6 +750,9 @@ function emitRedacted(agent: string, data: Record<string, unknown>, reason?: str
 }
 
 function emitAllow(agent: string, reason?: string, event = "PreToolUse"): void {
+  if (agent === "cline") { process.stdout.write(JSON.stringify({ cancel: false })); return; }
+  if (agent === "antigravity") { process.stdout.write(JSON.stringify({ decision: "ask" })); return; }
+
   if (agent === "claude-code" || agent === "codex") process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: claudeStyleHookEventName(event), permissionDecision: "allow", permissionDecisionReason: reason } }));
   else if (agent === "cursor" && event === "beforeSubmitPrompt") process.stdout.write(JSON.stringify({ continue: true }));
   else if (agent === "cursor") process.stdout.write(JSON.stringify({ permission: "allow" }));
@@ -766,13 +766,13 @@ function emitAllow(agent: string, reason?: string, event = "PreToolUse"): void {
 // content", separately from the exit-0 hookSpecificOutput.permissionDecision path). Setting this
 // alongside the JSON is belt-and-suspenders, not a replacement -- the JSON still carries the
 // clean reason text; exit 2 just guarantees the block itself isn't silently skipped.
-const EXIT_2_FAILS_CLOSED = new Set(["claude-code", "codex", "cursor", "copilot-cli", "gemini", "opencode", "openclaw", "hermes"]);
+const EXIT_2_FAILS_CLOSED = new Set(["claude-code", "codex", "cursor", "copilot-cli", "gemini", "opencode", "openclaw", "hermes", "windsurf", "kimi", "qwen", "auggie", "kiro", "goose", "openhands", "crush", "junie"]);
 
 // Claude Code / Codex hook contract: a JSON decision on stdout denies the tool call or prompt.
 // Other agents get a stderr note only (their block contracts differ and aren't verified), except
 // where noted below.
 function emitDeny(agent: string, reason: string, event = "PreToolUse"): void {
-  if (agent === "claude-code" || agent === "codex") {
+  if (["claude-code", "codex", "muse", "vscode", "factory"].includes(agent)) {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: claudeStyleHookEventName(event),
@@ -796,8 +796,19 @@ function emitDeny(agent: string, reason: string, event = "PreToolUse"): void {
   } else if (agent === "opencode" || agent === "openclaw") {
     process.stdout.write(JSON.stringify({ decision: "deny", reason: `Beam: ${reason}` }));
   } else if (agent === "hermes") {
-    // Hermes shell hooks block with {"decision": "block", "reason"} (or exit 2, set below).
+    process.stdout.write(JSON.stringify({ action: "block", message: `Beam: ${reason}`, decision: "block", reason: `Beam: ${reason}` }));
+  } else if (["pi", "kilo"].includes(agent)) {
+    process.stdout.write(JSON.stringify({ block: true, reason: `Beam: ${reason}` }));
+  } else if (agent === "cline") {
+    process.stdout.write(JSON.stringify({ cancel: true, errorMessage: `Beam: ${reason}` }));
+  } else if (agent === "amp") {
+    process.stdout.write(JSON.stringify({ action: "reject-and-continue", message: `Beam: ${reason}` }));
+  } else if (["antigravity", "grok"].includes(agent)) {
+    process.stdout.write(JSON.stringify({ decision: "deny", reason: `Beam: ${reason}` }));
+  } else if (agent === "devin") {
     process.stdout.write(JSON.stringify({ decision: "block", reason: `Beam: ${reason}` }));
+  } else if (["windsurf", "kimi", "qwen", "auggie", "kiro", "goose", "openhands", "crush", "junie"].includes(agent)) {
+    // These hosts use exit code 2, set below.
   } else {
     // OpenCode has no installed hook/plugin path in this repository. A message cannot block it.
     process.stderr.write(`\n✖ Beam cannot block this agent (${agent}): no verified enforcement adapter is installed.\n`);

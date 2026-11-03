@@ -18,8 +18,8 @@ function otherInstallCommand(agentId: string): string {
 // src/install.ts) instead of a bare "beam hook <agent>", so it works even when the shell
 // invoking an agent's hooks doesn't have beam's global bin on PATH.
 const cliPath = fileURLToPath(new URL("../src/cli.js", import.meta.url));
-function expectedCommand(agentId: string): string {
-  return `"${process.execPath}" "${cliPath}" hook ${agentId}`;
+function expectedCommand(agentId: string, event = agentId === "cursor" || agentId === "copilot-cli" ? "preToolUse" : agentId === "gemini" ? "BeforeTool" : "PreToolUse"): string {
+  return `"${process.execPath}" "${cliPath}" hook ${agentId} --event "${event}"`;
 }
 
 const temporaryDirectories: string[] = [];
@@ -70,14 +70,14 @@ describe("installHook", () => {
     const home = await tempHome();
     const result = await installHook("cursor", home);
     const config = JSON.parse(await fs.readFile(result.path, "utf8"));
-    expect(config.hooks.preToolUse[0]).toEqual({ command: expectedCommand("cursor"), matcher: ".*" });
+    expect(config.hooks.preToolUse[0]).toEqual({ command: expectedCommand("cursor"), matcher: "^(?!(?:Read|ReadFile)$).*" });
   });
 
   it("uses Copilot CLI's {type, bash, timeoutSec} shape", async () => {
     const home = await tempHome();
     const result = await installHook("copilot-cli", home);
     const config = JSON.parse(await fs.readFile(result.path, "utf8"));
-    expect(config.hooks.preToolUse[0]).toEqual({ type: "command", bash: expectedCommand("copilot-cli"), timeoutSec: 30 });
+    expect(config.hooks.preToolUse[0]).toEqual({ type: "command", bash: expectedCommand("copilot-cli"), powershell: `& ${expectedCommand("copilot-cli")}`, timeoutSec: 30 });
   });
 
   it("installs Gemini CLI's hook into .gemini/settings.json using Claude Code's own {matcher, hooks} shape, on both BeforeTool and BeforeAgent", async () => {
@@ -85,8 +85,8 @@ describe("installHook", () => {
     const result = await installHook("gemini", home);
     expect(result.path).toBe(path.join(home, ".gemini", "settings.json"));
     const config = JSON.parse(await fs.readFile(result.path, "utf8"));
-    expect(config.hooks.BeforeTool[0]).toEqual({ matcher: "", hooks: [{ type: "command", command: expectedCommand("gemini") }] });
-    expect(config.hooks.BeforeAgent[0]).toEqual({ hooks: [{ type: "command", command: expectedCommand("gemini") }] });
+    expect(config.hooks.BeforeTool[0]).toEqual({ matcher: "", hooks: [{ type: "command", command: expectedCommand("gemini"), timeout: 30000 }] });
+    expect(config.hooks.BeforeAgent[0]).toEqual({ hooks: [{ type: "command", command: expectedCommand("gemini", "BeforeAgent"), timeout: 30000 }] });
     expect(config.hooks.BeforeAgent[0]).not.toHaveProperty("matcher");
   });
 
@@ -100,7 +100,7 @@ describe("installHook", () => {
     const home = await tempHome();
     await installHook(agentId, home);
     const config = JSON.parse(await fs.readFile(path.join(home, relativeConfigPath), "utf8"));
-    expect(config.hooks.UserPromptSubmit[0].hooks[0].command).toBe(expectedCommand(agentId));
+    expect(config.hooks.UserPromptSubmit[0].hooks[0].command).toBe(expectedCommand(agentId, "UserPromptSubmit"));
     expect(config.hooks.PreToolUse[0].hooks[0].command).toBe(expectedCommand(agentId));
   });
 
@@ -115,23 +115,23 @@ describe("installHook", () => {
     await installHook(agentId, home);
     const config = JSON.parse(await fs.readFile(path.join(home, relativeConfigPath), "utf8"));
     expect(config.hooks.UserPromptSubmit[0]).not.toHaveProperty("matcher");
-    expect(config.hooks.PreToolUse[0].matcher).toBe("");
+    expect(config.hooks.PreToolUse[0].matcher).toBe(agentId === "codex" ? ".*" : "");
   });
 
   it("also installs Cursor's beforeSubmitPrompt hook alongside preToolUse", async () => {
     const home = await tempHome();
     const result = await installHook("cursor", home);
     const config = JSON.parse(await fs.readFile(result.path, "utf8"));
-    expect(config.hooks.beforeSubmitPrompt[0]).toEqual({ command: expectedCommand("cursor"), matcher: ".*" });
-    expect(config.hooks.preToolUse[0]).toEqual({ command: expectedCommand("cursor"), matcher: ".*" });
+    expect(config.hooks.beforeSubmitPrompt[0]).toEqual({ command: expectedCommand("cursor", "beforeSubmitPrompt") });
+    expect(config.hooks.preToolUse[0]).toEqual({ command: expectedCommand("cursor"), matcher: "^(?!(?:Read|ReadFile)$).*" });
   });
 
   it("also installs Copilot CLI's userPromptSubmitted hook alongside preToolUse", async () => {
     const home = await tempHome();
     const result = await installHook("copilot-cli", home);
     const config = JSON.parse(await fs.readFile(result.path, "utf8"));
-    expect(config.hooks.userPromptSubmitted[0]).toEqual({ type: "command", bash: expectedCommand("copilot-cli"), timeoutSec: 30 });
-    expect(config.hooks.preToolUse[0]).toEqual({ type: "command", bash: expectedCommand("copilot-cli"), timeoutSec: 30 });
+    expect(config.hooks.userPromptSubmitted[0]).toEqual({ type: "command", bash: expectedCommand("copilot-cli", "userPromptSubmitted"), powershell: `& ${expectedCommand("copilot-cli", "userPromptSubmitted")}`, timeoutSec: 30 });
+    expect(config.hooks.preToolUse[0]).toEqual({ type: "command", bash: expectedCommand("copilot-cli"), powershell: `& ${expectedCommand("copilot-cli")}`, timeoutSec: 30 });
   });
 
   it("installing twice does not duplicate the prompt-submit entry either", async () => {
@@ -150,7 +150,7 @@ describe("installHook", () => {
   it("installs the native OpenCode plugin", async () => {
     const home = await tempHome();
     const result = await installHook("opencode", home);
-    expect(result.path).toContain(".opencode/plugins/beam.ts");
+    expect(result.path).toContain(".config/opencode/plugins/beam.ts");
     expect(await fs.readFile(result.path, "utf8")).toContain("tool.execute.before");
   });
 
@@ -339,12 +339,14 @@ describe("uninstallHook", () => {
     expect(config.hooks.PreToolUse).toHaveLength(0);
   });
 
-  it("isHookInstalled recognizes a hook written by a different beam install", async () => {
+  it("reports a legacy partial installation as incomplete until reinstalled", async () => {
     const home = await tempHome();
     await fs.mkdir(path.join(home, ".claude"), { recursive: true });
     await fs.writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({
       hooks: { PreToolUse: [{ matcher: "", hooks: [{ type: "command", command: otherInstallCommand("claude-code") }] }] },
     }));
+    expect(await isHookInstalled("claude-code", home)).toBe(false);
+    await installHook("claude-code", home);
     expect(await isHookInstalled("claude-code", home)).toBe(true);
   });
 

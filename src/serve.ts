@@ -1,3 +1,5 @@
+import { drainHookSpool } from "./hook-spool.js";
+import { normalize as normalizeHookEvent } from "./core.js";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -89,6 +91,20 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
   if (token.length < 32) throw new Error("BEAM_TOKEN must contain at least 32 characters.");
 
   const app = await createCollector({ directory, token, origins: options.origins ?? process.env.BEAM_ALLOWED_ORIGINS?.split(",").map(s => s.trim()), rulesHome: options.rulesHome });
+  let spoolBusy = false;
+  const drainSpool = async () => {
+    if (spoolBusy) return;
+    spoolBusy = true;
+    try {
+      await drainHookSpool(directory, async records => {
+        const result = await app.store.addEvents(records.map(normalizeHookEvent));
+        app.forwardQueue.push([...result.events, ...result.relabeled]);
+      });
+    } finally { spoolBusy = false; }
+  };
+  await drainSpool().catch(() => {});
+  const spoolTimer = setInterval(() => { void drainSpool().catch(() => {}); }, 5000);
+  spoolTimer.unref?.();
   const port = options.port ?? Number(process.env.BEAM_PORT || 4319);
   const hostname = options.hostname ?? "127.0.0.1";
 
@@ -178,6 +194,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
   return {
     url: `http://${hostname}:${boundPort}`, token, directory, customRules, agentInstalls,
     policySync: Boolean(identity),
-    close: () => { if (policyTimer) clearInterval(policyTimer); clearInterval(tamperTimer); if (skillTimer) clearInterval(skillTimer); osMonitor.stop(); app.forwardQueue.flush(); server.close(); },
+    close: () => { if (policyTimer) clearInterval(policyTimer); clearInterval(tamperTimer);
+      clearInterval(spoolTimer); if (skillTimer) clearInterval(skillTimer); osMonitor.stop(); app.forwardQueue.flush(); server.close(); },
   };
 }

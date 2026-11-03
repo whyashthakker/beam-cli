@@ -1,3 +1,4 @@
+import { hookKind } from "./hook-catalog.js";
 import { constants } from "node:fs";
 import { mkdir, open, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -187,7 +188,7 @@ export async function judgeWithJev(input: JevInput, config: JevConfig, custom: C
 
 export async function applyJevHook(decision: Decision, data: Record<string, unknown>): Promise<{ decision: Decision; judgment?: JevResult }> {
   const event = String(data.hook_event_name ?? "PreToolUse").toLowerCase();
-  if (!["pretooluse", "beforetool", "beforeshellexecution", "beforemcpexecution"].includes(event)
+  if (hookKind(event) !== "pre"
     || !["allow", "warn"].includes(decision.action)) return { decision };
   let config: JevConfig;
   try { config = await readJevConfig(); }

@@ -88,6 +88,6 @@ describe("event and adapter wiring", () => {
   it("copilot userPromptSubmitted is recognised as a prompt event", () => {
     const data = adaptHookPayload("copilot-cli", { sessionId: "c1", prompt: "hello" });
     expect(data.hook_event_name).toBe("UserPromptSubmit");
-    expect(adaptHookPayload("copilot-cli", { sessionId: "c1", toolName: "bash", toolArgs: "{}" }).hook_event_name).toBe("PreToolUse");
+    expect(adaptHookPayload("copilot-cli", { sessionId: "c1", toolName: "bash", toolArgs: "{}" }).hook_event_name).toBe("preToolUse");
   });
 });

@@ -10,7 +10,7 @@ import { startServer } from "../src/serve.js";
 // hooks doesn't have beam's global bin on PATH.
 const cliPath = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 function expectedCommand(agentId: string): string {
-  return `"${process.execPath}" "${cliPath}" hook ${agentId}`;
+  return `"${process.execPath}" "${cliPath}" hook ${agentId} --event "PreToolUse"`;
 }
 
 const dirs: string[] = [];

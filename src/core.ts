@@ -1,3 +1,5 @@
+import { activityFor, activityType, type Activity } from "./activity.js";
+import { hookKind } from "./hook-catalog.js";
 import { assessAccessFinding } from "./access-risk.js";
 import { classifyActionContext, type ActionContext } from "./action-context.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -18,6 +20,7 @@ export type Event = {
   endpoint: string; model: string; phase: string; findings: Finding[];
   mcp?: { server: string; tool?: string; resource?: string; requestType?: "tool" | "resource" | "prompt" | "unknown" };
   provenance?: { recordId: string; schemaVersion: string; citedEventIds: string[]; tags: string[]; evidence: string };
+  activity?: Activity;
   actionContext?: ActionContext;
   actionLog?: { text: string; truncated: boolean };
   policy_decision?: { action: string; rule?: string; reason?: string; risk_score?: number; risk_level?: string; risk_factors?: string[] };
@@ -150,10 +153,13 @@ export function normalize(raw: Obj): Event {
     else if (["Write", "Edit", "write_file", "apply_patch"].includes(tool)) type = "file.write";
     else if (["browser.navigate", "browser_navigate"].includes(tool)) type = "browser.navigate";
     else if (tool) type = "tool.call";
+    else if (raw.source_type === "hook" || raw.hook_event_name) type = "hook.activity";
     else if (raw.record_type === "finding") type = "finding";
     else throw new Error("Record needs event_type or tool_name. Raw transcripts are not supported; normalize them first.");
   }
-  const detail = command || path || url || str(raw.content_preview ?? raw.observed_content_preview ?? raw.summary) || tool || type;
+  if (!raw.event_type && !raw.observed_event_type) type = activityType(raw, type);
+  const activity = activityFor(raw, redact);
+  const detail = command || path || url || (typeof raw.prompt === "string" ? raw.prompt : "") || activity?.searchTerms?.join("; ") || activity?.urls?.join("; ") || activity?.paths?.join("; ") || str(raw.content_preview ?? raw.observed_content_preview ?? raw.summary) || tool || type;
   const findings = /(?:result|message|telemetry)/.test(type) ? [] : detect(detail,{tool,input,cwd:str(raw.cwd??raw.project_path),command});
   if (raw.record_type === "finding") {
     findings.push({ id: str(raw.rule_id, "imported.finding"), title: redact(str(raw.title, "Imported finding")), severity: ["critical", "high", "medium", "info"].includes(str(raw.severity)) ? raw.severity as Severity : "medium", explanation: "Imported rule match. It indicates a pattern, not proof of compromise or action completion.", evidence: redact(detail).slice(0, 600) });
@@ -162,16 +168,9 @@ export function normalize(raw: Obj): Event {
   if (!Number.isFinite(Date.parse(timestamp))) throw new Error("Invalid event timestamp.");
   const clean = (s: string) => redact(s).slice(0, 500);
   const stableId = str(raw.event_id ?? raw.finding_id ?? raw.id);
-  // A hook's own tool_use_id (Claude Code's "toolu_...", Codex's call_id, Cursor's tool_use_id --
-  // all verified to carry this field, see agents.ts notes) identifies one physical tool call
-  // regardless of which hook config observed it. That matters when the *same* Claude Code CLI
-  // invocation is wrapped by more than one installed hook -- e.g. run from inside Cursor's own
-  // agent/IDE, which spawns Claude Code as a subprocess but also fires its own preToolUse hook for
-  // the same tool call beam already installed into .claude/settings.json. Deliberately left out of
-  // the source_agent-namespaced stableId branch below (unlike event_id/finding_id, which come from
-  // independent import sources that legitimately could reuse the same id) so both hook firings
-  // collapse into a single event instead of duplicating on the dashboard.
-  const toolUseId = str(raw.tool_use_id ?? raw.toolUseId);
+  // Native tool IDs may be reused by independent agents or sessions. Scope stable
+  // IDs to both, and keep pre, completion, failure and permission records distinct.
+  const toolUseId = str(raw.tool_use_id ?? raw.toolUseId ?? raw.tool_call_id ?? raw.call_id);
   const usage = obj(raw.usage ?? raw.token_usage ?? raw.tokenUsage);
   const inputTokens = number(raw.input_tokens ?? raw.inputTokens ?? usage.input_tokens ?? usage.inputTokens ?? usage.prompt_tokens ?? usage.promptTokens);
   const outputTokens = number(raw.output_tokens ?? raw.outputTokens ?? usage.output_tokens ?? usage.outputTokens ?? usage.completion_tokens ?? usage.completionTokens);
@@ -180,11 +179,12 @@ export function normalize(raw: Obj): Event {
   const explicitMcpServer = str(raw.mcp_server ?? raw.mcpServer ?? mcpRaw.server ?? mcpRaw.server_name ?? mcpRaw.serverName);
   const explicitMcpTool = str(raw.mcp_tool ?? raw.mcpTool ?? mcpRaw.tool ?? mcpRaw.tool_name ?? mcpRaw.toolName);
   const explicitMcpResource = str(raw.mcp_resource ?? raw.mcpResource ?? mcpRaw.resource ?? mcpRaw.resource_uri ?? mcpRaw.resourceUri);
-  const toolParts = tool.match(/^mcp[.:/]([^.:/]+)[.:/]([^.:/]+)$/i);
+  const toolParts = tool.match(/^mcp__([^]+?)__(.+)$/i) ?? tool.match(/^mcp[.:/]([^.:/]+)[.:/]([^.:/]+)$/i);
   const mcpServer = explicitMcpServer || (toolParts ? toolParts[1] : "");
   const mcpTool = explicitMcpTool || (toolParts ? toolParts[2] : "");
   const mcpRequestType = explicitMcpResource ? "resource" : mcpTool ? "tool" : "unknown";
-  const phase = (() => { const event = str(raw.hook_event_name).toLowerCase(); return event === "pretooluse" ? "proposed" : event === "posttooluse" ? "completed hook" : "observed"; })();
+  const kind = hookKind(str(raw.hook_event_name));
+  const phase = kind === "pre" ? "proposed" : kind === "post" ? (raw.is_error || raw.error ? "failed hook" : "completed hook") : kind === "failure" ? "failed hook" : "observed";
   const decision = obj(raw.policy_decision);
   const policyDecision = ["allow", "ask", "deny", "redact", "audit", "warn"].includes(str(decision.action)) ? {
     action: str(decision.action), rule: clean(str(decision.rule)) || undefined, reason: clean(str(decision.reason)) || undefined,
@@ -195,7 +195,7 @@ export function normalize(raw: Obj): Event {
   return {
     id: createHash("sha256").update(
       stableId ? `${str(raw.source_agent)}:${str(obj(raw.endpoint).hostname)}:${stableId}`
-      : toolUseId ? `tool_use:${str(obj(raw.endpoint).hostname)}:${phase}:${toolUseId}`
+      : toolUseId ? `tool_use:${str(raw.source_agent)}:${str(raw.session_id ?? raw.sessionId)}:${str(obj(raw.endpoint).hostname)}:${phase}:${phase === "observed" ? str(raw.hook_event_name) + ":" : ""}${toolUseId}`
       : JSON.stringify(raw)
     ).digest("hex"),
     timestamp: new Date(timestamp).toISOString(), receivedAt: new Date().toISOString(), agent: clean(str(raw.source_agent ?? raw.agent, "custom")),
@@ -205,6 +205,7 @@ export function normalize(raw: Obj): Event {
     project: clean(str(raw.project_path ?? raw.cwd)), source: clean(str(raw.source_type, raw.hook_event_name ? "hook" : "import")),
     endpoint: clean(str(obj(raw.endpoint).hostname ?? raw.hostname, "local")), model: clean(str(raw.model)),
     phase,
+    ...(activity ? { activity } : {}),
     provenance: { recordId: clean(stableId || toolUseId), schemaVersion: clean(str(raw.schema_version)),
       citedEventIds: Array.isArray(raw.cited_event_ids) ? raw.cited_event_ids.filter((v): v is string => typeof v === "string").slice(0, 100).map(clean) : [],
       tags: Array.isArray(raw.tags) ? raw.tags.filter((v): v is string => typeof v === "string").slice(0, 100).map(clean) : [],
