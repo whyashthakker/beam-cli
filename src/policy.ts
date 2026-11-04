@@ -12,9 +12,13 @@ import { canonicalPolicyPath, canonicalPolicyPattern, policyPathTargets, type Po
 export type PolicyMode = "observe" | "advisory" | "enforce";
 export type PolicyAction = "ALLOW" | "ASK" | "BLOCK" | "REDACT" | "AUDIT";
 export interface PolicyRule { id: string; title?: string; action: PolicyAction; enforce?: true; risk?: number; eventType?: string; tool?: string; command?: string; commandLine?: string; commandRegex?: string; args?: string[]; path?: string; url?: string; role?: string; user?: string; agent?: string; cwd?: string; repository?: string; branch?: string; environment?: string; time?: { after?: string; before?: string }; reason?: string; approval?: ApprovalPolicy }
-export interface PolicyRules { mode: PolicyMode; blockedTools: string[]; blockedCommandPatterns: string[]; disabledAgents: string[]; rules?: PolicyRule[]; risk?: { askAt?: number; blockAt?: number }; customDetectors?: CustomDetector[] }
+// A bare string ("integrity.tls_bypass") pauses that rule for every agent. An object with
+// `agent` scopes the pause to just that agent (case-insensitive, e.g. "codex") -- other
+// agents keep detecting it normally.
+export interface IgnoredRule { ruleId: string; agent?: string }
+export interface PolicyRules { mode: PolicyMode; blockedTools: string[]; blockedCommandPatterns: string[]; disabledAgents: string[]; rules?: PolicyRule[]; risk?: { askAt?: number; blockAt?: number }; customDetectors?: CustomDetector[]; ignoredRules?: (string | IgnoredRule)[] }
 export interface PolicyBundle { version: number; rules: PolicyRules; notAfter: string | null; errors?: string[] }
-const EMPTY: PolicyRules = { mode: "observe", blockedTools: [], blockedCommandPatterns: [], disabledAgents: [], rules: [], customDetectors: [] };
+const EMPTY: PolicyRules = { mode: "observe", blockedTools: [], blockedCommandPatterns: [], disabledAgents: [], rules: [], customDetectors: [], ignoredRules: [] };
 export function policyPath(): string { return join(getDataDirectory(), "policy.json"); }
 export function lastGoodPolicyPath(): string { return join(getDataDirectory(), "policy.last-good.json"); }
 
@@ -41,6 +45,12 @@ export async function readPolicy(): Promise<PolicyBundle | null> {
     if (!parsed.rules || typeof parsed.rules !== "object") throw new Error("missing rules");
     const errors: string[] = []; const source = parsed.rules as Partial<PolicyRules>;
     if (source.customDetectors !== undefined && (!Array.isArray(source.customDetectors) || source.customDetectors.some(d => !d || typeof d.name !== "string" || typeof d.pattern !== "string" || typeof d.replacement !== "string"))) errors.push("customDetectors must contain name, pattern, and replacement strings");
+    if (source.ignoredRules !== undefined && (!Array.isArray(source.ignoredRules) || source.ignoredRules.some(e => {
+      if (typeof e === "string") return !e.trim();
+      if (!e || typeof e !== "object" || Array.isArray(e)) return true;
+      const entry = e as unknown as Record<string, unknown>;
+      return typeof entry.ruleId !== "string" || !entry.ruleId.trim() || (entry.agent !== undefined && (typeof entry.agent !== "string" || !entry.agent.trim()));
+    }))) errors.push("ignoredRules must contain rule id strings, or {ruleId, agent?} objects");
     for (const detector of Array.isArray(source.customDetectors) ? source.customDetectors : []) { try { new RegExp(detector.pattern); } catch { errors.push(`Invalid custom detector pattern: ${detector.name}`); } }
     const rules = Array.isArray(source.rules) ? source.rules.map((r, i) => validRule(r, i, errors)).filter((r): r is PolicyRule => Boolean(r)) : [];
     if (source.rules !== undefined && !Array.isArray(source.rules)) errors.push("rules must be an array");

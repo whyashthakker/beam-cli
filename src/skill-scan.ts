@@ -24,7 +24,7 @@ const injectionRules: InjectionRule[] = [
 
 // 0-100. Prompt injection is weighted up because a skill is text the agent will obey, and one
 // critical finding alone is already enough to land in HIGH.
-const WEIGHT: Record<Severity, number> = { critical: 40, high: 20, medium: 8, info: 2 };
+const WEIGHT: Record<Severity, number> = { critical: 40, high: 20, medium: 8, low: 4, info: 2 };
 export function skillRiskScore(findings: Finding[]): { score: number; level: SkillScan["level"] } {
   // Each rule counts once per skill (a big skill repeating "production" across 30 files is one
   // signal, not thirty). Ordinary rules that merely *mention* env vars, sudo or curl are common in

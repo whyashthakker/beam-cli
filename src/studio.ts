@@ -91,7 +91,7 @@ tr.row:hover { background:#0e1013; cursor:pointer; }
       <div class="filters">
         <input id="search" placeholder="Search actions, sessions, or tools…">
         <select id="agentFilter"><option value="all">All agents</option></select>
-        <select id="severityFilter"><option value="all">All risk levels</option><option>critical</option><option>high</option><option>medium</option><option>info</option></select>
+        <select id="severityFilter"><option value="all">All risk levels</option><option>critical</option><option>high</option><option>medium</option><option>low</option><option>info</option></select>
       </div>
       <div class="panel"><table><thead><tr><th>Time</th><th>Action / context</th><th>Agent</th><th>Risk</th><th>Review</th></tr></thead><tbody id="eventRows"></tbody></table><div class="empty" id="eventsEmpty" style="display:none">Your timeline starts with the first event. Run <code>beam agent install &lt;agent&gt;</code> or <code>beam hook &lt;agent&gt;</code> to send one.</div></div>
     </div>
@@ -211,7 +211,7 @@ tr.row:hover { background:#0e1013; cursor:pointer; }
   }
 
   function risk(event) {
-    var order = { critical: 3, high: 2, medium: 1, info: 0 };
+    var order = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
     var top = "info";
     (event.findings || []).forEach(function (f) { if (order[f.severity] > order[top]) top = f.severity; });
     return top;

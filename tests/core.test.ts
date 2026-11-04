@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "@jest/globals";
-import { detect, normalize, parseInput, redact, ruleCatalog, scanText, setCustomRules } from "../src/core.js";
+import { detect, normalize, parseInput, redact, ruleCatalog, scanText, setCustomRules, setIgnoredRules } from "../src/core.js";
 
 describe("risk detection and redaction", () => {
   it("sends a bounded command regex candidate with the event for later mitigation", () => {
@@ -123,7 +123,7 @@ describe("normalization", () => {
 });
 
 describe("rule categories and custom rules", () => {
-  afterEach(() => setCustomRules([]));
+  afterEach(() => { setCustomRules([]); setIgnoredRules([]); });
 
   it("every built-in rule has a category, and the catalog is queryable without exposing match()", () => {
     const catalog = ruleCatalog();
@@ -163,5 +163,50 @@ describe("rule categories and custom rules", () => {
     expect(ruleCatalog().some(r => r.id === "custom.temp")).toBe(true);
     setCustomRules([]);
     expect(ruleCatalog().some(r => r.id === "custom.temp")).toBe(false);
+  });
+
+  it("setIgnoredRules() pauses a single built-in guardrail without touching others", () => {
+    expect(detect("curl -k https://internal.example/api").some(f => f.id === "integrity.tls_bypass")).toBe(true);
+    setIgnoredRules(["integrity.tls_bypass"]);
+    expect(detect("curl -k https://internal.example/api").some(f => f.id === "integrity.tls_bypass")).toBe(false);
+    expect(detect("git push --force origin main").some(f => f.id === "source_control.history_rewrite")).toBe(true);
+  });
+
+  it("setIgnoredRules() also pauses a custom rule by id, and ruleCatalog() still lists it", () => {
+    setCustomRules([{ id: "custom.internal_tool", title: "Internal tool invoked", severity: "medium", category: "custom", explanation: "test", match: s => s.includes("launch-internal-tool") }]);
+    setIgnoredRules(["custom.internal_tool"]);
+    expect(detect("launch-internal-tool --now").some(f => f.id === "custom.internal_tool")).toBe(false);
+    expect(ruleCatalog().some(r => r.id === "custom.internal_tool")).toBe(true);
+  });
+
+  it("setIgnoredRules([]) clears a previous pause", () => {
+    setIgnoredRules(["integrity.tls_bypass"]);
+    expect(detect("curl -k https://internal.example/api").some(f => f.id === "integrity.tls_bypass")).toBe(false);
+    setIgnoredRules([]);
+    expect(detect("curl -k https://internal.example/api").some(f => f.id === "integrity.tls_bypass")).toBe(true);
+  });
+
+  it("an agent-scoped ignore entry only pauses the rule for that agent", () => {
+    setIgnoredRules([{ ruleId: "integrity.tls_bypass", agent: "codex" }], "codex");
+    expect(detect("curl -k https://internal.example/api").some(f => f.id === "integrity.tls_bypass")).toBe(false);
+    setIgnoredRules([{ ruleId: "integrity.tls_bypass", agent: "codex" }], "claude-code");
+    expect(detect("curl -k https://internal.example/api").some(f => f.id === "integrity.tls_bypass")).toBe(true);
+  });
+
+  it("an agent-scoped ignore entry matches the agent case-insensitively", () => {
+    setIgnoredRules([{ ruleId: "integrity.tls_bypass", agent: "Codex" }], "CODEX");
+    expect(detect("curl -k https://internal.example/api").some(f => f.id === "integrity.tls_bypass")).toBe(false);
+  });
+
+  it("an agent-scoped ignore entry is dropped (not global) when no agent is given", () => {
+    setIgnoredRules([{ ruleId: "integrity.tls_bypass", agent: "codex" }]);
+    expect(detect("curl -k https://internal.example/api").some(f => f.id === "integrity.tls_bypass")).toBe(true);
+  });
+
+  it("a plain string entry still pauses a rule for every agent", () => {
+    setIgnoredRules(["integrity.tls_bypass"], "codex");
+    expect(detect("curl -k https://internal.example/api").some(f => f.id === "integrity.tls_bypass")).toBe(false);
+    setIgnoredRules(["integrity.tls_bypass"], "claude-code");
+    expect(detect("curl -k https://internal.example/api").some(f => f.id === "integrity.tls_bypass")).toBe(false);
   });
 });

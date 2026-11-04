@@ -6,7 +6,7 @@ import { isScopedTemporaryCleanup } from "./destructive-risk.js";
 import { patternMatch, anyMatch, allMatch, functionalMatch, type Matcher, type MatchSpan } from "./rule-matches.js";
 import { credentialExposureSpans, possibleCredentialExposure } from "./credential-egress.js";
 
-export type Severity = "critical" | "high" | "medium" | "info";
+export type Severity = "critical" | "high" | "medium" | "low" | "info";
 
 export type RuleCategory = "exec" | "exfil" | "impact" | "integrity" | "persistence" | "privilege" | "recon" | "secrets" | "source_control" | "custom";
 export type Rule = { id: string; title: string; severity: Severity; category: RuleCategory; explanation: string; match: Matcher; severityFor?: (s: string) => Severity };

@@ -33,7 +33,7 @@ const NEW_PACKAGE_DAYS = 30;
 // malware-shaped pkg.* highs count in full; everything else (borrowed shell rules, CVEs below
 // critical, mediums) is capped below the HIGH band, so a package full of ordinary noise can't
 // look as bad as one with an actual malware shape.
-const WEIGHT: Record<Severity, number> = { critical: 40, high: 20, medium: 8, info: 2 };
+const WEIGHT: Record<Severity, number> = { critical: 40, high: 20, medium: 8, low: 4, info: 2 };
 export function packageRiskScore(findings: Finding[]): { score: number; level: PackageScan["level"] } {
   const unique = [...new Map(findings.map(f => [f.id, f])).values()];
   const full = unique.filter(f => f.severity === "critical" || (f.severity === "high" && f.id.startsWith("pkg."))).reduce((s, f) => s + WEIGHT[f.severity], 0);

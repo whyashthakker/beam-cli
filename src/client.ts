@@ -7,7 +7,7 @@ import { mkdir, open, readdir, readFile, rename, stat, writeFile } from "node:fs
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getBeamHome, getCollectorUrl, getDataDirectory } from "./config.js";
-import { normalize, scanText, type Event, type Scan } from "./core.js";
+import { normalize, scanText, setIgnoredRules, type Event, type Scan } from "./core.js";
 import { adaptHookPayload } from "./hook-adapters.js";
 import { forwardEvents } from "./forward.js";
 import { evaluate, readPolicy, type Decision } from "./policy.js";
@@ -84,6 +84,7 @@ export interface ExtractSaveResult { found: number; accepted: number; duplicates
 // custom rules instead of erroring, so keep them distinct rather than reusing one parameter.
 export async function extractPreview(agentId: string, limit = 200, home = homedir(), beamHome = getBeamHome()): Promise<ExtractPreviewResult> {
   await loadCustomRules(beamHome);
+  setIgnoredRules((await readPolicy().catch(() => null))?.rules.ignoredRules ?? [], agentId);
   const records = await extractAgent(agentId, home);
   const events: Event[] = [];
   for (const record of records) { try { events.push(normalize(record)); } catch { /* skip a record normalize() can't accept */ } }
@@ -426,7 +427,9 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
     const toolInput = data.tool_input && typeof data.tool_input === "object"
       ? (data.tool_input as Record<string, unknown>) : {};
     const command = commandOf(data);
-    let decision = evaluate(await readPolicy().catch(() => null), {
+    const policyBundle = await readPolicy().catch(() => null);
+    setIgnoredRules(policyBundle?.rules.ignoredRules ?? [], sourceAgent);
+    let decision = evaluate(policyBundle, {
       agent: sourceAgent,
       eventType: promptGate ? "prompt.submit" : undefined,
       input: toolInput,

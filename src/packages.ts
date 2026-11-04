@@ -146,7 +146,7 @@ export async function attachVulnerabilities(scans: PackageScan[], notes: string[
   const response = await checkPackages(identity, packages);
   if (!response.ok) { notes.push(`Known-vulnerability check skipped: ${response.message}`); return []; }
   const vulns = response.result.vulnerabilities;
-  const severity = (s: string): Finding["severity"] => (s === "critical" ? "critical" : s === "high" ? "high" : s === "low" ? "info" : "medium");
+  const severity = (s: string): Finding["severity"] => (s === "critical" ? "critical" : s === "high" ? "high" : s === "low" ? "low" : "medium");
   for (const scan of scans) {
     const own = vulns.filter(v => v.ecosystem === scan.ecosystem && v.name === scan.name && v.version === scan.version);
     if (!own.length) continue;

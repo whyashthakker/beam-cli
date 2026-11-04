@@ -6,7 +6,7 @@ import { setCustomRules, type Rule, type RuleCategory, type Severity } from "./c
 
 export interface CustomRuleLoadResult { path: string; loaded: number; errors: string[] }
 
-const VALID_SEVERITIES: Severity[] = ["critical", "high", "medium", "info"];
+const VALID_SEVERITIES: Severity[] = ["critical", "high", "medium", "low", "info"];
 
 export function customRulesPath(home = getBeamHome()): string { return join(home, "rules.json"); }
 

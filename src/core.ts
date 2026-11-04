@@ -29,7 +29,7 @@ export type Event = {
   inputTokens?: number; outputTokens?: number; costUsd?: number;
 };
 export type Scan = { id: string; name: string; kind: "skill" | "mcp"; timestamp: string; hash: string; findings: Finding[]; lines: number };
-export const severityRank: Record<Severity, number> = { critical: 3, high: 2, medium: 1, info: 0 };
+export const severityRank: Record<Severity, number> = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
 export function risk(findings: Finding[]): Severity {
   return findings.reduce<Severity>((s, f) => severityRank[f.severity] > severityRank[s] ? f.severity : s, "info");
 }
@@ -48,11 +48,30 @@ let customRules: Rule[] = [];
 export function setCustomRules(rules: Rule[]): void { customRules = rules; }
 function activeRules(): Rule[] { return [...builtinRules, ...customRules]; }
 
+// Rule IDs a workspace policy has paused (PolicyRules.ignoredRules): a mitigation that silences
+// one specific guardrail -- e.g. a known-noisy rule for one agent -- without touching every other
+// detector or the policy's allow/ask/block mode. Set from the loaded policy bundle for the agent
+// handling the current hook event (see client.ts); empty until then, so a rule is never silently
+// dropped before a policy says to.
+export type IgnoredRuleEntry = string | { ruleId: string; agent?: string };
+let ignoredRuleIds = new Set<string>();
+// A bare string entry pauses that rule for every agent. An entry with `agent` only pauses it for
+// the agent handling this call (case-insensitive exact match, same as PolicyRule.agent); an
+// agent-scoped entry is dropped entirely when no agent is given, rather than applying everywhere.
+export function setIgnoredRules(entries: IgnoredRuleEntry[], agent?: string): void {
+  ignoredRuleIds = new Set(
+    entries
+      .map(e => typeof e === "string" ? { ruleId: e, agent: undefined } : e)
+      .filter(e => !e.agent || (agent !== undefined && e.agent.toLowerCase() === agent.toLowerCase()))
+      .map(e => e.ruleId),
+  );
+}
+
 export function ruleCatalog(): Omit<Rule, "match" | "severityFor">[] {
   return activeRules().map(({ match: _, severityFor: _severityFor, ...rule }) => rule);
 }
 export function detect(text: string, request?: {tool:string;input:Record<string,unknown>;cwd:string;command:string}): Finding[] {
-  const rules=activeRules().filter(r=>r.match(text));
+  const rules=activeRules().filter(r=>r.match(text)&&!ignoredRuleIds.has(r.id));
   const access=rules.some(r=>["credentials.environment","source.private_files","credentials.access"].includes(r.id)) ? classifyActionContext(request?.tool??"Bash",request?.input??{},request?.cwd??"",request?.command??text,s=>s,false) : undefined;
   return rules.flatMap(r => {
     const assessment=access?assessAccessFinding(r.id,access):undefined;
@@ -165,7 +184,7 @@ export function normalize(raw: Obj): Event {
   const findings = /(?:result|message|telemetry)/.test(type) ? [] : detect(detail,{tool,input,cwd:str(raw.cwd??raw.project_path),command});
   const commandPattern = type === "command.exec" ? commandBehaviorRegex(redact(command)) : null;
   if (raw.record_type === "finding") {
-    findings.push({ id: str(raw.rule_id, "imported.finding"), title: redact(str(raw.title, "Imported finding")), severity: ["critical", "high", "medium", "info"].includes(str(raw.severity)) ? raw.severity as Severity : "medium", explanation: "Imported rule match. It indicates a pattern, not proof of compromise or action completion.", evidence: redact(detail).slice(0, 600) });
+    findings.push({ id: str(raw.rule_id, "imported.finding"), title: redact(str(raw.title, "Imported finding")), severity: ["critical", "high", "medium", "low", "info"].includes(str(raw.severity)) ? raw.severity as Severity : "medium", explanation: "Imported rule match. It indicates a pattern, not proof of compromise or action completion.", evidence: redact(detail).slice(0, 600) });
   }
   const timestamp = str(raw.timestamp, new Date().toISOString());
   if (!Number.isFinite(Date.parse(timestamp))) throw new Error("Invalid event timestamp.");
