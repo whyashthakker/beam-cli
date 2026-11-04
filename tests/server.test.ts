@@ -159,4 +159,22 @@ describe("Beam collector", () => {
     expect((await app.request("/approvals/resolve", { request_id: "missing", decision: "DENY", approver: "admin" })).status).toBe(400);
     expect((await app.request("/approvals/resolve", { request_id: toApprove.request_id, decision: "NOT_A_DECISION", approver: "admin" })).status).toBe(400);
   });
+
+  it("/approvals/resolve carries the approver's chosen grant duration, clamped to 10-60 minutes, and defaults to 15 when omitted", async () => {
+    const app = await setup();
+    const withGrant = createApprovalRequest({ approver: ["admin"], level: "ADMIN", mode: "SINGLE", agent: "codex", tool: "Bash", command: "aws --version", policy_version: 1, risk_score: 10, risk_level: "LOW", risk_factors: [], reason: "need aws cli" });
+    await app.request("/approvals", withGrant);
+    const res = await app.request("/approvals/resolve", { request_id: withGrant.request_id, decision: "APPROVE_ONCE", approver: "admin", grant_minutes: 45 });
+    expect((await res.json() as { grant_minutes?: number }).grant_minutes).toBe(45);
+
+    const outOfRange = createApprovalRequest({ approver: ["admin"], level: "ADMIN", mode: "SINGLE", agent: "codex", tool: "Bash", command: "aws s3", policy_version: 1, risk_score: 10, risk_level: "LOW", risk_factors: [], reason: "need aws cli" });
+    await app.request("/approvals", outOfRange);
+    const clamped = await app.request("/approvals/resolve", { request_id: outOfRange.request_id, decision: "APPROVE_ONCE", approver: "admin", grant_minutes: 500 });
+    expect((await clamped.json() as { grant_minutes?: number }).grant_minutes).toBe(60);
+
+    const noGrant = createApprovalRequest({ approver: ["admin"], level: "ADMIN", mode: "SINGLE", agent: "codex", tool: "Bash", command: "aws ec2", policy_version: 1, risk_score: 10, risk_level: "LOW", risk_factors: [], reason: "need aws cli" });
+    await app.request("/approvals", noGrant);
+    const defaulted = await app.request("/approvals/resolve", { request_id: noGrant.request_id, decision: "APPROVE_ONCE", approver: "admin" });
+    expect((await defaulted.json() as { grant_minutes?: number }).grant_minutes).toBe(15);
+  });
 });

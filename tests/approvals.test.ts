@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@jest/globals";
-import { applyApproval, approvalStillValid, createApprovalRequest, LocalApproverResolver } from "../src/approvals.js";
+import { applyApproval, approvalStillValid, clampGrantMinutes, createApprovalRequest, DEFAULT_GRANT_MINUTES, LocalApproverResolver, MAX_GRANT_MINUTES, MIN_GRANT_MINUTES } from "../src/approvals.js";
 
 const input = { user: "Rahul", role: "Developer", approver: ["Engineering Lead"], level: "MANAGER" as const, mode: "SINGLE" as const, agent: "claude-code", tool: "Bash", command: "git push", args: ["origin", "main"], policy_version: 2, risk_score: 62, risk_level: "MEDIUM" as const, risk_factors: ["protected branch"] };
 describe("approvals", () => {
@@ -21,5 +21,26 @@ describe("approvals", () => {
     const byOther = applyApproval(r, "APPROVE_ONCE", "Random Person", Date.now(), "not actually the approver");
     expect(byOther.status).toBe("DENIED");
     expect(byOther.decision_reason).toBeUndefined();
+  });
+
+  it("clampGrantMinutes keeps a value in range, and defaults when unset or not a number", () => {
+    expect(clampGrantMinutes(30)).toBe(30);
+    expect(clampGrantMinutes(5)).toBe(MIN_GRANT_MINUTES);
+    expect(clampGrantMinutes(500)).toBe(MAX_GRANT_MINUTES);
+    expect(clampGrantMinutes(undefined)).toBe(DEFAULT_GRANT_MINUTES);
+    expect(clampGrantMinutes(NaN)).toBe(DEFAULT_GRANT_MINUTES);
+  });
+
+  it("an approval carries the approver's chosen, clamped grant duration; denial and expiry never do", () => {
+    const approved = applyApproval(createApprovalRequest(input), "APPROVE_ONCE", "Engineering Lead", Date.now(), undefined, 45);
+    expect(approved.grant_minutes).toBe(45);
+    const outOfRange = applyApproval(createApprovalRequest(input), "APPROVE_ONCE", "Engineering Lead", Date.now(), undefined, 500);
+    expect(outOfRange.grant_minutes).toBe(MAX_GRANT_MINUTES);
+    const defaulted = applyApproval(createApprovalRequest(input), "APPROVE_ONCE", "Engineering Lead");
+    expect(defaulted.grant_minutes).toBe(DEFAULT_GRANT_MINUTES);
+    const denied = applyApproval(createApprovalRequest(input), "DENY", "Engineering Lead", Date.now(), undefined, 45);
+    expect(denied.grant_minutes).toBeUndefined();
+    const expired = applyApproval(createApprovalRequest(input, 1), "APPROVE_ONCE", "Engineering Lead", Date.now() + 2, undefined, 45);
+    expect(expired.grant_minutes).toBeUndefined();
   });
 });

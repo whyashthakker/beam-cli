@@ -82,8 +82,14 @@ describe("agent-scoped folder restrictions across tools", () => {
     expect(evaluate(p, request({ tool: "editFiles", input: { edits: [{ filePath: join(protectedDir, "secret.txt") }] }, eventType: "file.write" })).action).toBe("deny");
     expect(evaluate(p, request({ tool: "apply_patch", input: { patch: `*** Update File: ${protectedDir}/secret.txt\n@@\n-old\n+new` }, eventType: "file.write" })).action).toBe("deny");
   });
-  it("preserves observe mode", () => {
+  it("an explicit BLOCK rule still applies in observe mode", () => {
     const p = policy(); p.rules.mode = "observe";
-    expect(evaluate(p, request({ path: join(protectedDir, "secret.txt") })).action).toBe("allow");
+    const decision = evaluate(p, request({ path: join(protectedDir, "secret.txt") }));
+    expect(decision.action).toBe("deny");
+    expect(decision.rule).toBe("protected-folder");
+  });
+  it("observe mode still allows an unmatched action", () => {
+    const p = policy(); p.rules.mode = "observe";
+    expect(evaluate(p, request({ path: join(outside, "ok.txt") })).action).toBe("allow");
   });
 });

@@ -15,6 +15,10 @@ export interface ApprovalRequest {
   reason?: string;
   /** The approver's own explanation, set when the decision is applied (see applyApproval()). */
   decision_reason?: string;
+  /** How long an APPROVED decision grants: the approver's choice, 10-60 minutes. Only meaningful
+   * alongside status "APPROVED"; unset on every other status. Drives the local TTL on the
+   * requesting device's approved-actions.json (see beam-cli's approved-actions.ts). */
+  grant_minutes?: number;
 }
 export interface ApprovalPolicy { level: ApprovalLevel; approver?: string; timeoutMs?: number; securityApprover?: string; adminApprover?: string }
 export interface ApproverResolver { getManager(user: string): string | undefined; getApprovers(request: ApprovalRequest, policy: ApprovalPolicy): string[] }
@@ -59,17 +63,24 @@ export function formatApprovalRequest(request: ApprovalRequest): string {
   const resource = request.path || request.url || request.command || request.tool;
   return `[${request.level}] ${request.agent} ${request.tool}: ${resource} (risk ${request.risk_score}/100 ${request.risk_level})`;
 }
-export function applyApproval(request: ApprovalRequest, decision: ApprovalDecision, approver: string, now = Date.now(), decisionReason?: string): ApprovalRequest {
+export const MIN_GRANT_MINUTES = 10;
+export const MAX_GRANT_MINUTES = 60;
+export const DEFAULT_GRANT_MINUTES = 15;
+export function clampGrantMinutes(minutes: number | undefined): number {
+  if (!Number.isFinite(minutes)) return DEFAULT_GRANT_MINUTES;
+  return Math.min(MAX_GRANT_MINUTES, Math.max(MIN_GRANT_MINUTES, Math.round(minutes!)));
+}
+export function applyApproval(request: ApprovalRequest, decision: ApprovalDecision, approver: string, now = Date.now(), decisionReason?: string, grantMinutes?: number): ApprovalRequest {
   if (!validateApprovalRequest(request)) return { ...request, status: "DENIED", decision: "DENY" };
   if (Date.parse(request.expires_at) <= now || decision === "EXPIRE") return { ...request, status: "EXPIRED", decision: "EXPIRE" };
   if (request.level !== "USER" && approver === request.user) return { ...request, status: "DENIED", decision: "DENY" };
   if (!request.approver.includes(approver)) return { ...request, status: "DENIED", decision: "DENY" };
-  // decisionReason only ever reflects a genuine decision made below by an authorized approver on
-  // a still-pending request -- never attached to the fail-closed guard rejections above, which
-  // aren't a real person's explanation and shouldn't be presented as one to the requester.
+  // decisionReason/grantMinutes only ever reflect a genuine decision made below by an authorized
+  // approver on a still-pending request -- never attached to the fail-closed guard rejections
+  // above, which aren't a real person's explanation and shouldn't be presented as one.
   if (decision === "DENY") return { ...request, status: "DENIED", decision, decision_reason: decisionReason };
   if (request.status !== "PENDING") return request;
-  return { ...request, status: "APPROVED", decision, decision_reason: decisionReason };
+  return { ...request, status: "APPROVED", decision, decision_reason: decisionReason, grant_minutes: clampGrantMinutes(grantMinutes) };
 }
 export function approvalStillValid(request: ApprovalRequest, current: Omit<ApprovalRequest, "request_id" | "created_at" | "expires_at" | "status" | "fingerprint">, now = Date.now()): boolean {
   return request.status === "APPROVED" && Date.parse(request.expires_at) > now && request.fingerprint === approvalFingerprint(current);

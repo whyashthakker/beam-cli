@@ -14,8 +14,28 @@ describe("evaluate", () => {
     expect(evaluate(null, ctx).action).toBe("allow");
   });
 
-  it("allows everything in observe mode", () => {
-    expect(evaluate(bundle({ mode: "observe", blockedTools: ["Bash"] }), ctx).action).toBe("allow");
+  it("a legacy blocked tool still blocks in observe mode, but an unmatched tool stays allowed", () => {
+    const d = evaluate(bundle({ mode: "observe", blockedTools: ["Bash"] }), ctx);
+    expect(d.action).toBe("deny");
+    expect(d.rule).toBe("legacy.tool.Bash");
+    expect(evaluate(bundle({ mode: "observe", blockedTools: ["Write"] }), ctx).action).toBe("allow");
+  });
+
+  it("a legacy blocked command pattern still blocks in observe mode", () => {
+    const d = evaluate(bundle({ mode: "observe", blockedCommandPatterns: ["rm\\s+-rf"] }), ctx);
+    expect(d.action).toBe("deny");
+    expect(d.rule).toBe("legacy.command.rm\\s+-rf");
+  });
+
+  it("an ordinary structured BLOCK rule still blocks in observe mode, but an ASK rule does not", () => {
+    const blockRule = bundle({ mode: "observe", rules: [{ id: "block-rule", tool: "Bash", action: "BLOCK" }] });
+    expect(evaluate(blockRule, ctx).action).toBe("deny");
+    const askRule = bundle({ mode: "observe", rules: [{ id: "ask-rule", tool: "Bash", action: "ASK" }] });
+    expect(evaluate(askRule, ctx).action).toBe("allow");
+  });
+
+  it("the implicit risk-score heuristic stays silent in observe mode even for a high-risk action", () => {
+    expect(evaluate(bundle({ mode: "observe" }), { ...ctx, command: "rm -rf /" }).action).toBe("allow");
   });
 
   it("enforces only the selected mitigation while preserving observe mode for unrelated calls", () => {
@@ -84,6 +104,12 @@ describe("evaluate", () => {
 
   it("denies a disabled agent regardless of tool", () => {
     expect(evaluate(bundle({ disabledAgents: ["claude-code"] }), ctx).action).toBe("deny");
+  });
+
+  it("a disabled agent is still denied in observe mode, but softened to ask in advisory", () => {
+    expect(evaluate(bundle({ mode: "observe", disabledAgents: ["claude-code"] }), ctx).action).toBe("deny");
+    expect(evaluate(bundle({ mode: "advisory", disabledAgents: ["claude-code"] }), ctx).action).toBe("ask");
+    expect(evaluate(bundle({ mode: "observe", disabledAgents: ["claude-code"] }), { ...ctx, agent: "codex" }).action).toBe("allow");
   });
 
   it("does not let a more specific ALLOW rule bypass an agent suspension", () => {
@@ -218,9 +244,11 @@ describe("agent action type rules", () => {
     expect(evaluate(web, { agent: "codex", tool: "web.run", command: "", input: { search_query: [{ q: "example" }] } }).action).toBe("deny");
     expect(evaluate(web, { agent: "codex", tool: "web.run", command: "", input: { open: [{ ref_id: "https://example.com" }] } }).action).toBe("allow");
   });
-  it("preserves observe and advisory modes", () => {
+  it("an explicit BLOCK rule still applies in observe mode; advisory softens it to ask", () => {
     const search = { agent: "claude-code", tool: "Grep", command: "" };
-    expect(evaluate({ ...policy, rules: { ...policy.rules, mode: "observe" } }, search).action).toBe("allow");
+    expect(evaluate({ ...policy, rules: { ...policy.rules, mode: "observe" } }, search).action).toBe("deny");
     expect(evaluate({ ...policy, rules: { ...policy.rules, mode: "advisory" } }, search).action).toBe("ask");
+    // Observe mode still allows an action the rule doesn't match.
+    expect(evaluate({ ...policy, rules: { ...policy.rules, mode: "observe" } }, { agent: "claude-code", tool: "Read", command: "" }).action).toBe("allow");
   });
 });

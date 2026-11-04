@@ -88,7 +88,8 @@ export async function createCollector(options: { directory: string; token: strin
         if (!APPROVAL_DECISIONS.includes(data.decision)) throw new Error(`Expected decision to be one of ${APPROVAL_DECISIONS.join(", ")}.`);
         if (typeof data.approver !== "string" || !data.approver) throw new Error("Expected approver.");
         const decisionReason = typeof data.decision_reason === "string" ? data.decision_reason : undefined;
-        return json(await store.resolveApproval(data.request_id, data.decision, data.approver, (request, decision, approver) => applyApproval(request, decision, approver, Date.now(), decisionReason)));
+        const grantMinutes = typeof data.grant_minutes === "number" ? data.grant_minutes : undefined;
+        return json(await store.resolveApproval(data.request_id, data.decision, data.approver, (request, decision, approver) => applyApproval(request, decision, approver, Date.now(), decisionReason, grantMinutes)));
       }
       if (typeof data.id !== "string" || typeof data.reviewed !== "boolean") throw new Error("Expected event id and reviewed boolean.");
       await store.review(data.id, data.reviewed);

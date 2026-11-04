@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals
 import { askApproval, captureHook, extractPreview, extractSave, importEvents, listPendingApprovals, readToken, resolveApproval, scanFile } from "../src/client.js";
 import type { ApprovalRequest } from "../src/approvals.js";
 import { writeIdentity } from "../src/enroll.js";
+import { approvedActionsFile, recordApprovedAction } from "../src/approved-actions.js";
 
 const temporaryDirectories: string[] = [];
 const originalEnv = { ...process.env };
@@ -183,6 +184,28 @@ describe("approval requests", () => {
     expect(result.status).toBe("APPROVED");
     expect(result.decision_reason).toBe("known scratch dir, fine");
     expect(fetchMock).not.toHaveBeenCalledWith("http://127.0.0.1:4319/approvals", expect.anything());
+  });
+
+  it("askApproval honors the approver's chosen grant duration for the local retry window", async () => {
+    const dataDir = await tempDir("beam-approvals-grant-");
+    process.env.BEAM_DATA_DIR = dataDir;
+    process.env.BEAM_API_URL = "https://collector.test";
+    await writeIdentity({
+      deviceId: "dev_1", deviceSecret: "device-secret-xyz", orgId: "org_1", apiBase: "https://app.test",
+      publicKey: "pub", privateKey: "priv", hostname: "host", os: "darwin", enrolledAt: new Date().toISOString(),
+    });
+    const remoteRow = (grantMinutes: number | null) => ({ id: "remote_2", agent: "codex", tool: "Bash", command: "aws --version", path: null, url: null, level: "ADMIN", approver: ["user_1"], riskScore: 10, riskLevel: "LOW", riskFactors: [], reason: "need aws cli", status: "APPROVED", decision: "APPROVE_ONCE", decisionReason: null, grantMinutes, expiresAt: new Date(Date.now() + 60_000).toISOString(), createdAt: new Date().toISOString() });
+    global.fetch = (async (url: string, init: RequestInit) => {
+      if (init.method === "POST") return new Response(JSON.stringify(remoteRow(40)), { status: 202 });
+      return new Response(JSON.stringify([remoteRow(40)]), { status: 200 });
+    }) as unknown as typeof fetch;
+    const before = Date.now();
+    await askApproval({ agent: "codex", tool: "Bash", command: "aws --version", reason: "need aws cli", pollMs: 1 });
+    const stored = JSON.parse(await fs.readFile(approvedActionsFile(), "utf8")) as { expiresAt: string }[];
+    expect(stored).toHaveLength(1);
+    const minutesGranted = (Date.parse(stored[0]!.expiresAt) - before) / 60_000;
+    expect(minutesGranted).toBeGreaterThan(39);
+    expect(minutesGranted).toBeLessThan(41);
   });
 });
 
@@ -540,6 +563,182 @@ describe("captureHook", () => {
     await captureHook(agent);
     expect(output).toHaveBeenCalled();
     output.mockRestore();
+  });
+
+  it("a workspace-wide Bash block still lets 'beam policy ask' through, but not an ordinary command", async () => {
+    process.env.BEAM_TOKEN = "[SECRET_002]";
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: ["Bash"], blockedCommandPatterns: [], disabledAgents: [] } }));
+    withStdin(JSON.stringify({ tool_name: "Bash", tool_input: { command: 'beam policy ask "rm -rf /tmp/x" "cleanup the task needs"' }, session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await captureHook("claude-code");
+      expect(output.mock.calls.map(([chunk]) => String(chunk)).join("")).not.toContain('"permissionDecision":"deny"');
+      expect(process.exitCode).not.toBe(2);
+    } finally { output.mockRestore(); }
+  });
+
+  it("does not exempt 'beam policy approve'/'reject' -- only an ordinary blocked command would otherwise let an agent self-approve its own request", async () => {
+    process.env.BEAM_TOKEN = "[SECRET_002]";
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: ["Bash"], blockedCommandPatterns: [], disabledAgents: [] } }));
+    withStdin(JSON.stringify({ tool_name: "Bash", tool_input: { command: "beam policy approve req_123" }, session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await captureHook("claude-code");
+      expect(output.mock.calls.map(([chunk]) => String(chunk)).join("")).toContain('"permissionDecision":"deny"');
+    } finally { output.mockRestore(); }
+  });
+
+  it("does not exempt a chained command riding along with 'beam policy ask'", async () => {
+    process.env.BEAM_TOKEN = "[SECRET_002]";
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: ["Bash"], blockedCommandPatterns: [], disabledAgents: [] } }));
+    withStdin(JSON.stringify({ tool_name: "Bash", tool_input: { command: 'beam policy ask "x" "y" && rm -rf /tmp' }, session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await captureHook("claude-code");
+      expect(output.mock.calls.map(([chunk]) => String(chunk)).join("")).toContain('"permissionDecision":"deny"');
+    } finally { output.mockRestore(); }
+  });
+
+  it("a deny for an ordinary blocked command tells the agent how to ask for an exception", async () => {
+    process.env.BEAM_TOKEN = "[SECRET_002]";
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: ["Bash"], blockedCommandPatterns: [], disabledAgents: [] } }));
+    withStdin(JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf /some/dir" }, session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await captureHook("claude-code");
+      const written = output.mock.calls.map(([chunk]) => String(chunk)).join("");
+      expect(written).toContain('"permissionDecision":"deny"');
+      expect(written).toContain("beam policy ask");
+      expect(written).toContain("rm -rf /some/dir");
+      // Regression: the hint must name the real blocked agent/tool, not generic placeholders --
+      // beam policy ask's own --agent/--tool default to "cli"/"Bash" when omitted, which silently
+      // mismatches the fingerprint an approval needs to actually grant this agent's retry (see
+      // approved-actions.ts). Verified live: the hint used to read without --agent/--tool at all,
+      // and an approval filed by following it never unblocked the retry.
+      expect(written).toContain('--agent \\"claude-code\\"');
+      expect(written).toContain('--tool \\"Bash\\"');
+    } finally { output.mockRestore(); }
+  });
+
+  it("the hint names the real agent/tool for a different agent and tool too, not just the Bash default", async () => {
+    process.env.BEAM_TOKEN = "[SECRET_002]";
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: [], blockedCommandPatterns: [], disabledAgents: [], rules: [{ id: "protected-folder", agent: "codex", eventType: "file.read", path: "/protected/**", action: "BLOCK" }] } }));
+    withStdin(JSON.stringify({ tool_name: "exec_command", tool_input: { cmd: "cat /protected/secret.txt" }, session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await captureHook("codex");
+      const written = output.mock.calls.map(([chunk]) => String(chunk)).join("");
+      expect(written).toContain('--agent \\"codex\\"');
+      expect(written).toContain('--tool \\"exec_command\\"');
+    } finally { output.mockRestore(); }
+  });
+
+  it("end to end: approving the exact command the hint suggests actually unblocks the retry", async () => {
+    process.env.BEAM_TOKEN = "[SECRET_002]";
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: [], blockedCommandPatterns: [], disabledAgents: [], rules: [{ id: "block-aws", tool: "Bash", command: "aws", action: "BLOCK" }] } }));
+
+    withStdin(JSON.stringify({ tool_name: "Bash", tool_input: { command: "aws --version" }, session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const denyOutput = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    let hint = "";
+    try {
+      await captureHook("claude-code");
+      hint = denyOutput.mock.calls.map(([chunk]) => String(chunk)).join("");
+      expect(hint).toContain('"permissionDecision":"deny"');
+    } finally { denyOutput.mockRestore(); }
+
+    // Parse the exact fields the hint told the agent to use, same as a real agent would read
+    // them off the deny message, and approve under those exact fields -- not by calling
+    // recordApprovedAction() with values a test already knows are correct.
+    const agent = /--agent \\"([^"\\]+)\\"/.exec(hint)?.[1];
+    const tool = /--tool \\"([^"\\]+)\\"/.exec(hint)?.[1];
+    expect(agent).toBe("claude-code");
+    expect(tool).toBe("Bash");
+    await recordApprovedAction({ agent: agent!, tool: tool!, command: "aws --version" });
+    process.exitCode = 0; // reset the deny phase's exit code before checking the retry's own
+
+    withStdin(JSON.stringify({ tool_name: "Bash", tool_input: { command: "aws --version" }, session_id: "s1" }));
+    const retryOutput = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await captureHook("claude-code");
+      expect(retryOutput.mock.calls.map(([chunk]) => String(chunk)).join("")).not.toContain('"permissionDecision":"deny"');
+      expect(process.exitCode).not.toBe(2);
+    } finally { retryOutput.mockRestore(); }
+  });
+
+  it("never adds the 'beam policy ask' hint to Beam's own self-protection deny", async () => {
+    withStdin(JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf ~/.beam" }, session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await captureHook("claude-code");
+      const written = output.mock.calls.map(([chunk]) => String(chunk)).join("");
+      expect(written).toContain('"permissionDecision":"deny"');
+      expect(written).not.toContain("beam policy ask");
+    } finally { output.mockRestore(); }
+  });
+
+  it("an action an admin already approved goes through on retry, and only once", async () => {
+    process.env.BEAM_TOKEN = "[SECRET_002]";
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: ["Bash"], blockedCommandPatterns: [], disabledAgents: [] } }));
+    await recordApprovedAction({ agent: "claude-code", tool: "Bash", command: "rm -rf /tmp/approved-scratch" });
+    withStdin(JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf /tmp/approved-scratch" }, session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const firstOutput = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await captureHook("claude-code");
+      // A plain "allow" for claude-code writes nothing to stdout at all (silence/exit 0 is the
+      // host's own implicit allow) -- so the only thing to assert is the absence of a deny.
+      const written = firstOutput.mock.calls.map(([chunk]) => String(chunk)).join("");
+      expect(written).not.toContain('"permissionDecision":"deny"');
+      expect(process.exitCode).not.toBe(2);
+    } finally { firstOutput.mockRestore(); }
+
+    // Single-use: the identical command, asked again, is denied like normal -- the earlier
+    // approval was already consumed.
+    withStdin(JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf /tmp/approved-scratch" }, session_id: "s1" }));
+    const secondOutput = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await captureHook("claude-code");
+      expect(secondOutput.mock.calls.map(([chunk]) => String(chunk)).join("")).toContain('"permissionDecision":"deny"');
+    } finally { secondOutput.mockRestore(); }
+  });
+
+  it("an approved action does not grant a different, unapproved command", async () => {
+    process.env.BEAM_TOKEN = "[SECRET_002]";
+    const policyDir = process.env.BEAM_DATA_DIR!;
+    await fs.writeFile(path.join(policyDir, "policy.json"), JSON.stringify({ version: 1, rules: { mode: "enforce", blockedTools: ["Bash"], blockedCommandPatterns: [], disabledAgents: [] } }));
+    await recordApprovedAction({ agent: "claude-code", tool: "Bash", command: "rm -rf /tmp/approved-scratch" });
+    withStdin(JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf /tmp/some-other-dir" }, session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await captureHook("claude-code");
+      expect(output.mock.calls.map(([chunk]) => String(chunk)).join("")).toContain('"permissionDecision":"deny"');
+    } finally { output.mockRestore(); }
+  });
+
+  it("never grants an approved action over Beam's own self-protection", async () => {
+    await recordApprovedAction({ agent: "claude-code", tool: "Bash", command: "rm -rf ~/.beam" });
+    withStdin(JSON.stringify({ tool_name: "Bash", tool_input: { command: "rm -rf ~/.beam" }, session_id: "s1" }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await captureHook("claude-code");
+      expect(output.mock.calls.map(([chunk]) => String(chunk)).join("")).toContain('"permissionDecision":"deny"');
+    } finally { output.mockRestore(); }
   });
 
   it.each([

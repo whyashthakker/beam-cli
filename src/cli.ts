@@ -934,7 +934,7 @@ policy.command("ask <target> <reason>")
       approver: opts.approver, timeoutMs,
     });
     if (request.status === "APPROVED") {
-      console.log(`✔ Approved (${request.request_id}).${request.decision_reason ? ` ${request.decision_reason}` : ""} Continue.`);
+      console.log(`✔ Approved for ${request.grant_minutes ?? 15} minute${(request.grant_minutes ?? 15) === 1 ? "" : "s"} (${request.request_id}).${request.decision_reason ? ` ${request.decision_reason}` : ""} Continue.`);
       return;
     }
     console.log(`✖ ${request.status} (${request.request_id}).${request.decision_reason ? ` ${request.decision_reason}` : " No reason was given."}`);
@@ -958,9 +958,12 @@ policy.command("approve <id>")
   .description("Approve a pending request filed on this machine's own local collector (not an enrolled device's workspace request -- those are approved from the dashboard)")
   .option("--note <text>", "Optional note the requester will see")
   .option("--approver <name>", "Your name or id, recorded on the decision", "admin")
-  .action(async (id: string, opts: { note?: string; approver: string }) => {
-    const result = await resolveApproval(id, "APPROVE_ONCE", opts.approver, opts.note);
-    console.log(`${result.request_id}: ${result.status}`);
+  .option("--grant <minutes>", "How long the agent's retry window stays open, 10-60 minutes", "15")
+  .action(async (id: string, opts: { note?: string; approver: string; grant: string }) => {
+    const grantMinutes = Number(opts.grant);
+    if (!Number.isFinite(grantMinutes) || grantMinutes < 10 || grantMinutes > 60) throw new Error("--grant must be a number of minutes between 10 and 60.");
+    const result = await resolveApproval(id, "APPROVE_ONCE", opts.approver, opts.note, grantMinutes);
+    console.log(`${result.request_id}: ${result.status} (grant: ${result.grant_minutes ?? grantMinutes} min)`);
   });
 
 policy.command("reject <id> <reason>")

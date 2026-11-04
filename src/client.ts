@@ -24,7 +24,8 @@ import { addBlockedTarget, isTargetBlocked, readBlockedTargets } from "./blocked
 import { promptTty } from "./tty-prompt.js";
 import { gateSkill } from "./skill-gate.js";
 import { notePrompt, sessionContextFor, sessionTitlesEnabled } from "./session-title.js";
-import { createApprovalRequest, type ApprovalDecision, type ApprovalLevel, type ApprovalRequest } from "./approvals.js";
+import { clampGrantMinutes, createApprovalRequest, type ApprovalDecision, type ApprovalLevel, type ApprovalRequest } from "./approvals.js";
+import { consumeApprovedAction, recordApprovedAction } from "./approved-actions.js";
 
 export async function readToken(): Promise<string> {
   if (process.env.BEAM_TOKEN) return process.env.BEAM_TOKEN;
@@ -95,6 +96,7 @@ interface RemoteApprovalRequest {
   riskScore: number; riskLevel: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"; riskFactors: string[];
   reason: string | null;
   status: ApprovalRequest["status"]; decision: ApprovalDecision | null; decisionReason: string | null;
+  grantMinutes?: number | null;
   expiresAt: string; createdAt: string;
 }
 function fromRemoteApproval(remote: RemoteApprovalRequest): ApprovalRequest {
@@ -107,6 +109,7 @@ function fromRemoteApproval(remote: RemoteApprovalRequest): ApprovalRequest {
     status: remote.status, decision: remote.decision ?? undefined,
     fingerprint: "", // approvalStillValid()'s dedup concept never applies to a remote-filed request
     reason: remote.reason ?? undefined, decision_reason: remote.decisionReason ?? undefined,
+    grant_minutes: remote.grantMinutes ?? undefined,
   };
 }
 
@@ -145,10 +148,7 @@ async function askRemoteApproval(identity: Identity, options: AskApprovalOptions
   }
 }
 
-export async function askApproval(options: AskApprovalOptions): Promise<ApprovalRequest> {
-  const timeoutMs = options.timeoutMs ?? 10 * 60_000;
-  const identity = await readIdentity();
-  if (identity) return askRemoteApproval(identity, options, timeoutMs);
+async function askLocalApproval(options: AskApprovalOptions, timeoutMs: number): Promise<ApprovalRequest> {
   const request = createApprovalRequest({
     approver: [options.approver ?? "admin"],
     level: options.level ?? "ADMIN",
@@ -176,6 +176,21 @@ export async function askApproval(options: AskApprovalOptions): Promise<Approval
   }
 }
 
+export async function askApproval(options: AskApprovalOptions): Promise<ApprovalRequest> {
+  const timeoutMs = options.timeoutMs ?? 10 * 60_000;
+  const identity = await readIdentity();
+  const result = identity ? await askRemoteApproval(identity, options, timeoutMs) : await askLocalApproval(options, timeoutMs);
+  // Closes the loop: the agent's retry of this exact action goes straight through next time,
+  // without filing a second request -- see approved-actions.ts. The approver's own chosen
+  // duration (10-60 minutes, grant_minutes) drives how long the retry window stays open; an
+  // older collector/dashboard that never set it falls back to DEFAULT_GRANT_MINUTES.
+  if (result.status === "APPROVED") {
+    const ttlMs = clampGrantMinutes(result.grant_minutes) * 60_000;
+    await recordApprovedAction({ agent: options.agent, tool: options.tool, command: options.command, path: options.path, url: options.url }, ttlMs).catch(() => {});
+  }
+  return result;
+}
+
 // Local-machine only, deliberately: see askRemoteApproval()'s comment above for why an enrolled
 // device has no remote equivalent of these two yet (that's an admin-authenticated dashboard
 // surface, not this device-authenticated collector).
@@ -184,8 +199,8 @@ export async function listPendingApprovals(): Promise<ApprovalRequest[]> {
   return all.filter(r => r.status === "PENDING");
 }
 
-export async function resolveApproval(requestId: string, decision: ApprovalDecision, approver: string, decisionReason?: string): Promise<ApprovalRequest> {
-  return send("/approvals/resolve", JSON.stringify({ request_id: requestId, decision, approver, decision_reason: decisionReason })) as Promise<ApprovalRequest>;
+export async function resolveApproval(requestId: string, decision: ApprovalDecision, approver: string, decisionReason?: string, grantMinutes?: number): Promise<ApprovalRequest> {
+  return send("/approvals/resolve", JSON.stringify({ request_id: requestId, decision, approver, decision_reason: decisionReason, grant_minutes: grantMinutes })) as Promise<ApprovalRequest>;
 }
 
 export interface ScanOptions { mcp?: boolean; save?: boolean }
@@ -556,6 +571,17 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
     const toolInput = data.tool_input && typeof data.tool_input === "object"
       ? (data.tool_input as Record<string, unknown>) : {};
     const command = commandOf(data);
+    // Beam's own escape hatch: an agent blocked by policy -- even a fully disabled agent or a
+    // workspace-wide "blockedTools: [Bash]" -- must still be able to ask a human for an
+    // exception, or the block is a dead end with no way out. This unconditionally skips every
+    // check below (policy evaluate(), self-protection, risk escalation, anomaly tracking) for
+    // exactly that one command, before any of them run.
+    if (isApprovalEscapeHatch(String(data.tool_name ?? ""), command)) {
+      data.policy_decision = { action: "allow", rule: "beam.approval-escape-hatch" };
+      await captureActivity(data);
+      if (["cline", "antigravity"].includes(sourceAgent)) emitAllow(sourceAgent, undefined, String(data.hook_event_name ?? "PreToolUse"));
+      return;
+    }
     const policyBundle = await readPolicy().catch(() => null);
     setIgnoredRules(policyBundle?.rules.ignoredRules ?? [], sourceAgent);
     let decision = evaluate(policyBundle, {
@@ -668,6 +694,27 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
       if (context) { data.session_title = context.title; data.session_title_source = context.titleSource; data.turn = context.turn; data.turn_topic = context.topic; data.turn_shift = context.shift; }
     }
 
+    // An admin already approved this exact action (via `beam policy ask`, resolved in the
+    // dashboard or locally with `beam policy approve`) -- let the retry through instead of
+    // blocking it again. Single-use (see approved-actions.ts) and never for self-protection, same
+    // as the hint below: that guardrail isn't something this channel can grant an exception to.
+    if ((decision.action === "deny" || decision.action === "ask") && decision.rule !== "beam.self-protection") {
+      const granted = await consumeApprovedAction({ agent: sourceAgent, tool: String(data.tool_name ?? ""), command, path: targetPath, url: String(toolInput.url ?? data.url ?? "") }).catch(() => false);
+      if (granted) decision = { ...decision, action: "allow", rule: "beam.approval-granted", reason: "Approved by a workspace admin." };
+    }
+
+    // Tell the agent its way out: a flat "no" with no next step just invites it to retry, rephrase,
+    // or work around the block. Skipped for Beam's own self-protection -- that guardrail is never
+    // meant to be appealed through this channel.
+    if (decision.action === "deny" && decision.rule !== "beam.self-protection") {
+      const target = (toolInput.file_path ?? toolInput.path ?? data.file_path ?? toolInput.url ?? data.url ?? command ?? "").toString().replace(/"/g, '\\"');
+      // --agent/--tool must name the real agent and tool that's blocked here, not the CLI's own
+      // "cli"/"Bash" defaults -- an approval is recorded under exactly those two fields
+      // (approved-actions.ts), and the retry this is meant to unblock will report the real ones,
+      // not the defaults. A mismatch here is why an approval silently fails to grant the retry.
+      const toolName = String(data.tool_name ?? "Bash").replace(/"/g, '\\"');
+      if (target) decision = { ...decision, reason: `${decision.reason ?? "Blocked by workspace policy."} If this is necessary, ask a workspace admin for an exception: beam policy ask "${target}" "<explain why you need this>" --agent "${sourceAgent}" --tool "${toolName}"` };
+    }
     data.policy_decision = { action: decision.action, rule: decision.rule, reason: decision.reason, risk_score: decision.riskScore, risk_level: decision.riskLevel, risk_factors: decision.riskFactors };
     const hookEvent = String(data.hook_event_name ?? "PreToolUse");
     let event = safeNormalize(data);
@@ -804,6 +851,28 @@ function outsideWorkspacePaths(cwd: string, target: string, command: string): st
       const escaped = relative(root, path);
       return escaped === ".." || escaped.startsWith(`..${sep}`) || isAbsolute(escaped);
     });
+}
+
+// Exempts exactly `beam policy ask`/`pending` from every policy check -- filing or reading a
+// request is harmless and must always be reachable, even for a fully disabled agent. Deliberately
+// NOT `approve`/`reject`: those decide a request rather than merely file or read one, and exempting
+// them would let an agent on an unenrolled, single-machine setup file its own request and
+// immediately self-approve it, defeating the whole point of asking a human.
+function isApprovalEscapeHatch(tool: string, command: string): boolean {
+  if (!/^(?:bash|shell|terminal|exec_command|shell_command|run_shell_command|command|execute_bash|run_command|run_terminal_cmd)$/i.test(tool)) return false;
+  const trimmed = command.trim();
+  // Command substitution ($(...) and backticks) stays live even inside double quotes in a POSIX
+  // shell, so a malicious payload hidden in the reason/target argument -- `beam policy ask
+  // "$(rm -rf /)" "x"` -- can't be waved through just because it's quoted; checked against the
+  // raw string, before anything is stripped.
+  if (/\$\(|`/.test(trimmed)) return false;
+  // Control operators (; & | < > newline) lose their meaning once quoted, so a legitimate reason
+  // like "deploy; already reviewed" must not trip this -- checked with quoted spans stripped out
+  // first. Anything left outside quotes (real chaining, e.g. `beam policy ask x y && rm -rf /`)
+  // still gets caught.
+  const unquoted = trimmed.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, "");
+  if (/[;&|<>\n]/.test(unquoted)) return false;
+  return /^(?:\S*[\\/])?beam(?:\.exe)?\s+policy\s+(?:ask\s+\S[\s\S]*|pending\b(?:\s+--?[\w-]+(?:\s+\S+)?)*\s*)$/i.test(trimmed);
 }
 
 function isBeamSelfProtectionTarget(tool: string, command: string, target: string): boolean {

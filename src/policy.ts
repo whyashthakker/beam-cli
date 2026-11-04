@@ -110,22 +110,33 @@ export function evaluate(bundle: PolicyBundle | null, ctx: ActionContext): Decis
   if (!bundle) return { action: "allow", ...base };
   if (bundle.errors?.length) return { action: "deny", ...base, reason: `Security policy rejected: ${bundle.errors.join("; ")}`, rule: "policy.invalid" };
   if (bundle.notAfter && Date.parse(bundle.notAfter) < Date.now()) return { action: "allow", ...base };
-  const pathTargets = bundle.rules.rules?.some((r) => r.path && (bundle.rules.mode !== "observe" || r.enforce)) ? policyPathTargets(ctx) : undefined;
+  const pathTargets = bundle.rules.rules?.some((r) => r.path) ? policyPathTargets(ctx) : undefined;
   // A manager can enforce a narrow mitigation without enabling unrelated policy
   // rules or risk thresholds for this member's other tools and agents.
   const mandatory = (bundle.rules.rules ?? []).filter((r) => r.enforce === true && r.action === "BLOCK" && matches(r, { ...ctx, riskScore: score, pathTargets })).sort((a, b) => specificity(b) - specificity(a))[0];
   if (mandatory) return { ...base, mode: "enforce", action: "deny", reason: mandatory.reason, policy: "local policy", rule: mandatory.id };
-  if (bundle.rules.mode === "observe") return { action: "allow", ...base };
-  // A disabled agent is a suspension, so a more specific command ALLOW must not
-  // re-enable it. User-scoped bundles limit this suspension to their recipient.
+  const observe = bundle.rules.mode === "observe";
+  // A disabled agent is a suspension, so a more specific command ALLOW must not re-enable it.
+  // User-scoped bundles limit this suspension to their recipient. This is an explicit block, same
+  // as a BLOCK rule below -- it takes effect in Observe mode too, same reasoning as those: Observe
+  // only ever suppresses the *implicit* risk-score heuristic and ASK/REDACT rules, which need a
+  // human actually watching to act on them; an explicit "block this" does not need a human to mean
+  // what it says. Advisory still softens it to "ask" rather than a silent local deny.
   if (bundle.rules.disabledAgents.some(a => a.toLowerCase() === ctx.agent.toLowerCase())) {
-    return { ...base, action: bundle.rules.mode === "enforce" ? "deny" : "ask", reason: `${ctx.agent} is disabled by workspace policy.`, policy: "local policy", rule: "legacy.disabled-agent" };
+    return { ...base, action: bundle.rules.mode === "advisory" ? "ask" : "deny", reason: `${ctx.agent} is disabled by workspace policy.`, policy: "local policy", rule: "legacy.disabled-agent" };
   }
   const candidates: Array<{ r: PolicyRule; rank: number }> = [];
   for (const r of bundle.rules.rules ?? []) if (matches(r, { ...ctx, riskScore: score, pathTargets })) candidates.push({ r, rank: specificity(r) });
   for (const tool of bundle.rules.blockedTools) { const r: PolicyRule = { id: `legacy.tool.${tool}`, tool, action: "BLOCK", reason: `The ${tool} tool is blocked by workspace policy.` }; if (matches(r, { ...ctx, riskScore: score })) candidates.push({ r, rank: 1 }); }
   for (const pattern of bundle.rules.blockedCommandPatterns) { try { if (new RegExp(pattern, "i").test(ctx.command)) candidates.push({ r: { id: `legacy.command.${pattern}`, action: "BLOCK", reason: `Command matches blocked pattern: /${pattern}/` }, rank: 1 }); } catch { /* preserve legacy fail-open behavior; structured rules are validated and reported */ } }
   const selected = candidates.sort((a, b) => b.rank - a.rank || safety[b.r.action] - safety[a.r.action])[0]?.r;
+  if (observe) {
+    // Pure monitoring, except an explicit BLOCK still blocks: a structured BLOCK rule, a legacy
+    // blocked tool, or a blocked command pattern. ASK/REDACT rules and the risk-score heuristic
+    // below need a human watching this device to act on them, so those stay silent in Observe.
+    if (selected?.action === "BLOCK") return { ...base, action: "deny", reason: selected.reason, policy: "local policy", rule: selected.id };
+    return { action: "allow", ...base };
+  }
   const thresholds = bundle.rules.risk ?? { askAt: 30, blockAt: 70 }; let action: PolicyAction = selected?.action ?? "ALLOW";
   if (!selected && score >= (thresholds.blockAt ?? 70)) action = "BLOCK"; else if (!selected && score >= (thresholds.askAt ?? 30)) action = "ASK";
   const reason = selected?.reason ?? (action === "BLOCK" ? `Risk score ${score} exceeds the block threshold.` : action === "ASK" ? `Risk score ${score} requires approval.` : action === "REDACT" ? "Sensitive data must be transformed before this action." : undefined);
