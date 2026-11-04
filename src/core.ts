@@ -1,4 +1,4 @@
-import { activityFor, activityType, type Activity } from "./activity.js";
+import { activityFor, activityType, commandOf, type Activity } from "./activity.js";
 import { hookKind } from "./hook-catalog.js";
 import { assessAccessFinding } from "./access-risk.js";
 import { classifyActionContext, type ActionContext } from "./action-context.js";
@@ -145,7 +145,7 @@ export function normalize(raw: Obj): Event {
   if (JSON.stringify(raw).length > 100_000) throw new Error("One record exceeds 100 KB.");
   const input = obj(raw.tool_input ?? raw.input);
   const tool = str(raw.tool_name ?? raw.tool);
-  const command = str(raw.command ?? raw.observed_command ?? input.command);
+  const command = commandOf(raw);
   const path = str(raw.file_path ?? input.file_path ?? input.path);
   const url = str(raw.url ?? input.url);
   let type = str(raw.event_type ?? raw.observed_event_type);

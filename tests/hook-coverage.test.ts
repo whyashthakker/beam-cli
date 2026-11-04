@@ -79,6 +79,28 @@ describe('agent installation lifecycle', () => {
 
 describe('native payloads and action details', () => {
   it.each([
+    ['codex', { tool_name: 'functions.exec_command', tool_input: { cmd: 'cat .env.local' } }],
+    ['claude-code', { tool_name: 'Bash', tool_input: { command: 'cat .env.local' } }],
+    ['cursor', { tool_name: 'Shell', tool_input: { command: ['bash', '-lc', 'cat .env.local'] } }],
+    ['copilot-cli', { toolName: 'bash', toolArgs: '{"command":"cat .env.local"}' }],
+    ['gemini', { tool_name: 'run_shell_command', tool_input: { command: 'cat .env.local' } }],
+    ['windsurf', { tool_info: { command_line: 'cat .env.local' } }],
+    ['antigravity', { toolCall: { name: 'execute_bash', args: { command: 'cat .env.local' } } }],
+    ['cline', { preToolUse: { tool: 'execute_command', parameters: { command: 'cat .env.local' } } }],
+    ['qwen', { tool_name: 'run_shell_command', tool_input: { cmd: 'cat .env.local' } }],
+    ['hermes', { tool_name: 'terminal', tool_input: { command_line: 'cat .env.local' } }],
+    ['opencode', { tool_name: 'bash', tool_input: { command: 'cat .env.local' } }],
+    ['pi', { tool_name: 'bash', input: { command: 'cat .env.local' } }],
+    ['goose', { tool_name: 'shell', tool_input: { script: 'cat .env.local' } }],
+  ] as const)('%s retains a native shell command and generates its restriction', (agent, raw) => {
+    const event = agent === 'windsurf' ? 'pre_run_command' : 'PreToolUse';
+    const normalized = normalize(adaptHookPayload(agent, raw, event));
+    expect(normalized.type).toBe('command.exec');
+    expect(normalized.summary).toBe('cat .env.local');
+    expect(normalized.mitigationCandidate?.pattern).toBeTruthy();
+    expect(new RegExp(normalized.mitigationCandidate!.pattern, 'i').test('cat -n .env.local')).toBe(true);
+  });
+  it.each([
     ['windsurf','pre_read_code',{ trajectory_id:'s', tool_info:{ file_path:'/repo/a.ts' } },'file.read','proposed'],
     ['windsurf','post_run_command',{ trajectory_id:'s', tool_info:{ command:'pwd' } },'command.exec','completed hook'],
     ['antigravity','PreToolUse',{ toolCall:{ name:'read_file', args:{ path:'/repo/a.ts' } } },'file.read','proposed'],

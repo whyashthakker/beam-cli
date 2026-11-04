@@ -1,6 +1,6 @@
 import { spoolHookEvent } from "./hook-spool.js";
 import { hookKind } from "./hook-catalog.js";
-import { activityFor } from "./activity.js";
+import { activityFor, commandOf } from "./activity.js";
 import { classifyActionContext } from "./action-context.js";
 import { environmentRisk } from "./access-risk.js";
 import { mkdir, open, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
@@ -425,7 +425,7 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
     //    blocks can deny matching calls while unrelated calls remain in observe mode.
     const toolInput = data.tool_input && typeof data.tool_input === "object"
       ? (data.tool_input as Record<string, unknown>) : {};
-    const command = String(data.command ?? toolInput.command ?? toolInput.cmd ?? "");
+    const command = commandOf(data);
     let decision = evaluate(await readPolicy().catch(() => null), {
       agent: sourceAgent,
       eventType: promptGate ? "prompt.submit" : undefined,

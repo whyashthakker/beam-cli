@@ -1,4 +1,5 @@
 import { hookSpec, hookKind } from './hook-catalog.js';
+import { commandOf } from './activity.js';
 import type { Obj } from './agents.js';
 const obj = (v: unknown): Obj => v && typeof v === 'object' && !Array.isArray(v) ? v as Obj : {};
 function parseArgs(value: unknown): unknown {
@@ -44,7 +45,7 @@ export function adaptHookPayload(sourceAgent: string, raw: Obj, suppliedEvent?: 
     tool_response: raw.tool_response ?? raw.tool_result ?? raw.toolResult ?? raw.tool_output ?? raw.toolOutput ?? raw.result ?? raw.output ?? raw.metadata ?? fields.result ?? fields.output,
     hook_event_name: event,
     timestamp: typeof raw.timestamp === 'number' && Number.isFinite(raw.timestamp) ? new Date(raw.timestamp < 100000000000 ? raw.timestamp * 1000 : raw.timestamp).toISOString() : raw.timestamp,
-    command: raw.command ?? fields.command ?? fields.commandLine ?? fields.command_line ?? args.command ?? args.command_line ?? args.cmd,
+    command: commandOf({ ...raw, command: raw.command ?? fields.command ?? fields.commandLine ?? fields.command_line, tool_name: tool, tool_input: toolInput }),
     file_path: raw.file_path ?? fields.file_path ?? fields.filePath ?? fields.path ?? args.file_path ?? args.filePath ?? args.path,
     ...(prompt !== undefined ? { prompt } : {}),
     ...(kind === 'prompt' ? { event_type: 'prompt.submit', tool_name: tool ?? event } : {}),

@@ -114,3 +114,27 @@ it("bounds normalized identifiers to the workspace ingest contract", () => {
     event_type: "t".repeat(500), tool_name: "x".repeat(500) });
   expect([row.agent.length, row.session.length, row.type.length, row.tool.length]).toEqual([100, 200, 100, 100]);
 });
+
+it("delivers generated regexes for every catalogued agent through local ingest and the outbox", async () => {
+  const app = await createCollector({ directory, token: "test-token", rulesHome: directory });
+  queues.push(app.forwardQueue);
+  const sent: Record<string, any>[] = [];
+  global.fetch = async (_url, init) => { sent.push(...JSON.parse(String(init?.body))); return Response.json({ accepted: HOOK_CATALOG.length }); };
+  const payload = HOOK_CATALOG.map(spec => adaptHookPayload(spec.id, {
+    session_id: `regex-${spec.id}`, tool_use_id: `regex-${spec.id}`, tool_name: "exec_command",
+    tool_input: { cmd: "python3 -c \"from pathlib import Path; Path('page.html').write_text('new content')\"" },
+  }, spec.events.find(name => hookKind(name) === "pre")));
+  const response = await app.fetch(new Request("http://127.0.0.1:4319/ingest", {
+    method: "POST", headers: { Authorization: "Bearer test-token" }, body: JSON.stringify(payload),
+  }));
+  expect(response.status).toBe(200);
+  await app.forwardQueue.flush();
+  expect(new Set(sent.map(row => row.agent))).toEqual(new Set(HOOK_CATALOG.map(spec => spec.id)));
+  for (const row of sent) {
+    expect(row.type).toBe("command.exec");
+    expect(row.mitigationCandidate).toMatchObject({ kind: "command", version: 1 });
+    const regex = new RegExp(row.mitigationCandidate.pattern, "i");
+    expect(regex.test("python3 -c \"from pathlib import Path; Path('page.html').write_text('changed again')\"")).toBe(true);
+    expect(regex.test("python3 -c \"from pathlib import Path; Path('other.html').write_text('new content')\"")).toBe(false);
+  }
+});

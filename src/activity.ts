@@ -7,10 +7,24 @@ export interface Activity {
   status?: string; error?: string; details?: unknown; truncated: boolean;
 }
 const object = (v: unknown): Obj => v && typeof v === 'object' && !Array.isArray(v) ? v as Obj : {};
+/** One command projection for telemetry, detection, and pre-tool policy enforcement. */
+export function commandOf(raw: Obj): string {
+  const input = object(raw.tool_input ?? raw.input);
+  const value = [raw.command, raw.observed_command, raw.command_line, raw.commandLine, raw.cmd, input.command, input.cmd, input.command_line, input.commandLine, input.script, input.commandText]
+    .find(v => typeof v === 'string' && v.trim() || Array.isArray(v) && v.length > 0);
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value) && value.every(v => typeof v === 'string')) {
+    if (/^(?:.*[\\/])?(?:ba|z|da|k)?sh(?:\.exe)?$/i.test(value[0]) && /^-[a-z]*c[a-z]*$/i.test(value[1] ?? '') && typeof value[2] === 'string') return value[2];
+    return value.map(v => /^[\w./:@=-]+$/.test(v) ? v : "'" + v.replace(/'/g, "'\\''") + "'").join(' ');
+  }
+  const tool = String(raw.tool_name ?? raw.tool ?? '');
+  if (/^(?:bash|shell|terminal|exec_command|shell_command|run_shell_command)$/i.test(tool) && typeof raw.tool_input === 'string') return raw.tool_input;
+  return '';
+}
 export function activityType(raw: Obj, fallback: string): string {
   const tool = String(raw.tool_name ?? raw.tool ?? '').toLowerCase();
   const input = object(raw.tool_input ?? raw.input);
-  if (/^(bash|shell|exec_command|shell_command|exec|terminal|run_shell_command|execute_command|run_command|run_terminal_cmd|runterminalcommand|runinterminal|powershell)$/.test(tool)) return 'command.exec';
+  if (/(?:^|[.:])(?:bash|shell|sh|zsh|exec_command|shell_command|exec|terminal|local_shell|command|execute_bash|run_shell_command|execute_command|run_command|run_terminal_cmd|runterminalcommand|runinterminal|powershell|pwsh)$/.test(tool)) return 'command.exec';
   if (/^(read|readfile|read_file|read_text_file|view|view_file)$/.test(tool)) return 'file.read';
   if (/^(write|edit|write_file|edit_file|str_replace_editor|str_replace|apply_patch|replace|replace_in_file|multiedit|write_to_file|editfile|editfiles|createfile|create_file|create|writefile|replace_string_in_file|insert_edit_into_file|multi_replace_string_in_file)$/.test(tool)) return 'file.write';
   if (/^(ls|list_dir|list_directory|list_files|readdir|directory_tree|listdirectory|listdir)$/.test(tool)) return 'directory.read';

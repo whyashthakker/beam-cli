@@ -27,7 +27,7 @@ function validRule(v: unknown, index: number, errors: string[]): PolicyRule | un
   if (r.enforce !== undefined && (r.enforce !== true || String(r.action).toUpperCase() !== "BLOCK")) { errors.push(`rules[${index}] (${r.id}).enforce is only supported for explicit BLOCK rules`); return undefined; }
   if (r.eventType !== undefined && (typeof r.eventType !== "string" || !r.eventType.trim())) { errors.push(`rules[${index}] (${r.id}).eventType must be a non-empty string`); return undefined; }
   if (r.commandRegex !== undefined) {
-    if (typeof r.commandRegex !== "string" || r.commandRegex.length < 3 || r.commandRegex.length > 300) { errors.push(`rules[${index}] (${r.id}).commandRegex must be 3-300 characters`); return undefined; }
+    if (typeof r.commandRegex !== "string" || r.commandRegex.length < 3 || r.commandRegex.length > 1000) { errors.push(`rules[${index}] (${r.id}).commandRegex must be 3-1000 characters`); return undefined; }
     try { if (new RegExp(r.commandRegex, "i").test("")) { errors.push(`rules[${index}] (${r.id}).commandRegex matches every command`); return undefined; } }
     catch { errors.push(`rules[${index}] (${r.id}).commandRegex is invalid`); return undefined; }
   }
