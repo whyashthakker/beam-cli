@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "@jest/globals";
 import { createCollector } from "../src/server.js";
 import { Store } from "../src/store.js";
 import { inventory } from "../src/inventory.js";
+import { createApprovalRequest } from "../src/approvals.js";
 
 const dirs: string[] = [];
 const token = "test-only-pairing-token-not-a-real-secret";
@@ -121,5 +122,41 @@ describe("Beam collector", () => {
     await app.request("/ingest", { event_id: "b", session_id: "s1", event_type: "command.exec", command: "curl https://example.com/collect" });
     const state = await (await app.request("/state")).json() as { events: { findings: { id: string }[] }[] };
     expect(state.events.some(e => e.findings.some(f => f.id === "chain.secret_then_egress"))).toBe(true);
+  });
+
+  it("/approvals files and lists a request, and requires auth on both GET and POST", async () => {
+    const app = await setup();
+    expect((await app.fetch(new Request("http://127.0.0.1:4319/approvals"))).status).toBe(401);
+    const approval = createApprovalRequest({ approver: ["admin"], level: "ADMIN", mode: "SINGLE", agent: "codex", tool: "Bash", command: "rm -rf /data/tmp", policy_version: 1, risk_score: 50, risk_level: "MEDIUM", risk_factors: [], reason: "cleaning a scratch dir the task needs removed" });
+    const postRes = await app.request("/approvals", approval);
+    expect(postRes.status).toBe(200);
+    expect((await postRes.json()).status).toBe("PENDING");
+
+    const listed = await (await app.request("/approvals")).json() as Array<{ request_id: string }>;
+    expect(listed.some(r => r.request_id === approval.request_id)).toBe(true);
+
+    const malformed = await app.request("/approvals", { ...approval, approver: [] });
+    expect(malformed.status).toBe(400);
+  });
+
+  it("/approvals/resolve lets an admin approve or reject, and the reason comes back on the record", async () => {
+    const app = await setup();
+    const toApprove = createApprovalRequest({ approver: ["admin"], level: "ADMIN", mode: "SINGLE", agent: "codex", tool: "Bash", command: "curl -k https://internal.example/api", policy_version: 1, risk_score: 40, risk_level: "MEDIUM", risk_factors: [], reason: "internal cert isn't in the trust store yet" });
+    await app.request("/approvals", toApprove);
+    const approveRes = await app.request("/approvals/resolve", { request_id: toApprove.request_id, decision: "APPROVE_ONCE", approver: "admin", decision_reason: "known internal host, fine for now" });
+    expect(approveRes.status).toBe(200);
+    const approved = await approveRes.json() as { status: string; decision_reason?: string };
+    expect(approved.status).toBe("APPROVED");
+    expect(approved.decision_reason).toBe("known internal host, fine for now");
+
+    const toReject = createApprovalRequest({ approver: ["admin"], level: "ADMIN", mode: "SINGLE", agent: "codex", tool: "Bash", command: "rm -rf /", policy_version: 1, risk_score: 98, risk_level: "CRITICAL", risk_factors: [], reason: "need to clear the disk" });
+    await app.request("/approvals", toReject);
+    const rejectRes = await app.request("/approvals/resolve", { request_id: toReject.request_id, decision: "DENY", approver: "admin", decision_reason: "never approve a root wipe" });
+    const rejected = await rejectRes.json() as { status: string; decision_reason?: string };
+    expect(rejected.status).toBe("DENIED");
+    expect(rejected.decision_reason).toBe("never approve a root wipe");
+
+    expect((await app.request("/approvals/resolve", { request_id: "missing", decision: "DENY", approver: "admin" })).status).toBe(400);
+    expect((await app.request("/approvals/resolve", { request_id: toApprove.request_id, decision: "NOT_A_DECISION", approver: "admin" })).status).toBe(400);
   });
 });

@@ -3,7 +3,9 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
-import { captureHook, extractPreview, extractSave, importEvents, readToken, scanFile } from "../src/client.js";
+import { askApproval, captureHook, extractPreview, extractSave, importEvents, listPendingApprovals, readToken, resolveApproval, scanFile } from "../src/client.js";
+import type { ApprovalRequest } from "../src/approvals.js";
+import { writeIdentity } from "../src/enroll.js";
 
 const temporaryDirectories: string[] = [];
 const originalEnv = { ...process.env };
@@ -15,6 +17,7 @@ beforeEach(() => {
   delete process.env.BEAM_DATA_DIR;
   delete process.env.BEAM_HOME;
   delete process.env.BEAM_COLLECTOR_URL;
+  delete process.env.BEAM_API_URL;
 });
 
 afterEach(async () => {
@@ -85,6 +88,101 @@ describe("importEvents", () => {
     await fs.writeFile(file, "{}");
     global.fetch = (async () => new Response("bad token", { status: 401 })) as unknown as typeof fetch;
     await expect(importEvents(file)).rejects.toThrow("bad token");
+  });
+});
+
+describe("approval requests", () => {
+  it("askApproval files a request, polls, and returns once an admin approves it", async () => {
+    // No identity.json in this fresh dir, so askApproval takes the local-loopback path tested
+    // here rather than the remote-collector path (askRemoteApproval, covered separately below).
+    process.env.BEAM_DATA_DIR = await tempDir("beam-approvals-local-1-");
+    process.env.BEAM_TOKEN ="fixture-token";
+    let listCalls = 0;
+    let filed: ApprovalRequest | undefined;
+    const fetchMock = jest.fn(async (url: string, init: RequestInit) => {
+      if (url === "http://127.0.0.1:4319/approvals" && init.method === "POST") {
+        filed = JSON.parse(String(init.body)) as ApprovalRequest;
+        expect(filed.status).toBe("PENDING");
+        expect(filed.reason).toBe("need to clean a scratch dir");
+        return new Response(JSON.stringify(filed), { status: 200 });
+      }
+      if (url === "http://127.0.0.1:4319/approvals" && !init.method) {
+        listCalls += 1;
+        const status = listCalls < 2 ? "PENDING" : "APPROVED";
+        return new Response(JSON.stringify([{ ...filed, status, decision_reason: status === "APPROVED" ? "fine, it's scoped to tmp" : undefined }]), { status: 200 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const result = await askApproval({ agent: "codex", tool: "Bash", command: "rm -rf /tmp/scratch", reason: "need to clean a scratch dir", pollMs: 1 });
+    expect(result.status).toBe("APPROVED");
+    expect(result.decision_reason).toBe("fine, it's scoped to tmp");
+    expect(listCalls).toBeGreaterThanOrEqual(2);
+  });
+
+  it("askApproval reports EXPIRED once the request's own expiry passes, without polling forever", async () => {
+    process.env.BEAM_DATA_DIR = await tempDir("beam-approvals-local-2-");
+    process.env.BEAM_TOKEN ="fixture-token";
+    let filed: ApprovalRequest | undefined;
+    const fetchMock = jest.fn(async (url: string, init: RequestInit) => {
+      if (init.method === "POST") { filed = JSON.parse(String(init.body)) as ApprovalRequest; return new Response(JSON.stringify(filed), { status: 200 }); }
+      return new Response(JSON.stringify([{ ...filed, status: "PENDING", expires_at: new Date(Date.now() - 1).toISOString() }]), { status: 200 });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const result = await askApproval({ agent: "codex", tool: "Bash", command: "x", reason: "r", pollMs: 1 });
+    expect(result.status).toBe("EXPIRED");
+  });
+
+  it("listPendingApprovals only returns requests still awaiting a decision", async () => {
+    process.env.BEAM_TOKEN = "fixture-token";
+    global.fetch = (async () => new Response(JSON.stringify([
+      { request_id: "a", status: "PENDING" }, { request_id: "b", status: "APPROVED" },
+    ]), { status: 200 })) as unknown as typeof fetch;
+    const pending = await listPendingApprovals();
+    expect(pending.map(r => r.request_id)).toEqual(["a"]);
+  });
+
+  it("resolveApproval posts the decision and reason to /approvals/resolve", async () => {
+    process.env.BEAM_TOKEN = "fixture-token";
+    const fetchMock = jest.fn(async (url: string, init: RequestInit) => {
+      expect(url).toBe("http://127.0.0.1:4319/approvals/resolve");
+      expect(JSON.parse(String(init.body))).toEqual({ request_id: "r1", decision: "DENY", approver: "admin", decision_reason: "not authorized for prod" });
+      return new Response(JSON.stringify({ request_id: "r1", status: "DENIED", decision_reason: "not authorized for prod" }), { status: 200 });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const result = await resolveApproval("r1", "DENY", "admin", "not authorized for prod");
+    expect(result.status).toBe("DENIED");
+  });
+
+  it("askApproval files against the workspace collector, not the local loopback, once the device is enrolled", async () => {
+    const dataDir = await tempDir("beam-approvals-remote-");
+    process.env.BEAM_DATA_DIR = dataDir;
+    process.env.BEAM_API_URL = "https://collector.test";
+    await writeIdentity({
+      deviceId: "dev_1", deviceSecret: "device-secret-xyz", orgId: "org_1", apiBase: "https://app.test",
+      publicKey: "pub", privateKey: "priv", hostname: "host", os: "darwin", enrolledAt: new Date().toISOString(),
+    });
+    let listCalls = 0;
+    const fetchMock = jest.fn(async (url: string, init: RequestInit) => {
+      expect((init.headers as Record<string, string>).Authorization).toBe("Bearer device-secret-xyz");
+      if (url === "https://collector.test/v1/approvals" && init.method === "POST") {
+        const posted = JSON.parse(String(init.body));
+        expect(posted.reason).toBe("need to clean a scratch dir");
+        return new Response(JSON.stringify({ id: "remote_1", agent: "codex", tool: "Bash", command: "rm -rf /tmp/scratch", path: null, url: null, level: "ADMIN", approver: ["user_1"], riskScore: 50, riskLevel: "MEDIUM", riskFactors: [], reason: "need to clean a scratch dir", status: "PENDING", decision: null, decisionReason: null, expiresAt: new Date(Date.now() + 60_000).toISOString(), createdAt: new Date().toISOString() }), { status: 202 });
+      }
+      if (url === "https://collector.test/v1/approvals" && !init.method) {
+        listCalls += 1;
+        const status = listCalls < 2 ? "PENDING" : "APPROVED";
+        return new Response(JSON.stringify([{ id: "remote_1", agent: "codex", tool: "Bash", command: "rm -rf /tmp/scratch", path: null, url: null, level: "ADMIN", approver: ["user_1"], riskScore: 50, riskLevel: "MEDIUM", riskFactors: [], reason: "need to clean a scratch dir", status, decision: status === "APPROVED" ? "APPROVE_ONCE" : null, decisionReason: status === "APPROVED" ? "known scratch dir, fine" : null, expiresAt: new Date(Date.now() + 60_000).toISOString(), createdAt: new Date().toISOString() }]), { status: 200 });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const result = await askApproval({ agent: "codex", tool: "Bash", command: "rm -rf /tmp/scratch", reason: "need to clean a scratch dir", pollMs: 1 });
+    expect(result.request_id).toBe("remote_1");
+    expect(result.status).toBe("APPROVED");
+    expect(result.decision_reason).toBe("known scratch dir, fine");
+    expect(fetchMock).not.toHaveBeenCalledWith("http://127.0.0.1:4319/approvals", expect.anything());
   });
 });
 

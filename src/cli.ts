@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
 import { startServer } from "./serve.js";
-import { captureHook, extractPreview, extractSave, importEvents, readToken, reloadRemoteRules, scanFile } from "./client.js";
+import { askApproval, captureHook, extractPreview, extractSave, importEvents, listPendingApprovals, readToken, reloadRemoteRules, resolveApproval, scanFile } from "./client.js";
 import { supportsExtraction } from "./extract.js";
 import { AGENTS } from "./agents.js";
 import { installAllDetectedHooks, installHook, uninstallAllHooks, uninstallHook } from "./install.js";
@@ -910,6 +910,65 @@ rule.command("reload")
     const result = await reloadRemoteRules();
     console.log(`Loaded ${result.loaded} custom rule${result.loaded === 1 ? "" : "s"} from ${result.path}.`);
     for (const e of result.errors) console.log(`✖ ${e}`);
+  });
+
+const policy = program.command("policy").description("Request and resolve human approval for an action a security policy blocked");
+
+policy.command("ask <target> <reason>")
+  .description("Ask for permission to use a blocked command, path, or URL, and wait for a decision. On an enrolled device this goes to the workspace (an admin resolves it from the dashboard); otherwise it's resolved locally with 'beam policy pending'/'approve'/'reject' on this machine")
+  .option("--tool <name>", "Tool name to record on the request", "Bash")
+  .option("--agent <name>", "Agent name to record on the request", "cli")
+  .option("--approver <name>", "Who must decide this -- only meaningful when unenrolled; an enrolled device defaults to the workspace's own owners/admins")
+  .option("--timeout <seconds>", "How long to wait for a decision before giving up", "600")
+  .action(async (target: string, reason: string, opts: { tool: string; agent: string; approver?: string; timeout: string }) => {
+    const isUrl = /^https?:\/\//i.test(target);
+    const isPath = !isUrl && (target.startsWith("/") || target.startsWith("./") || target.startsWith("../") || target.startsWith("~"));
+    const timeoutMs = Number(opts.timeout) * 1000;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("--timeout must be a positive number of seconds.");
+    console.log(`Asking ${opts.approver ?? "admin"} for approval of ${target}… (up to ${opts.timeout}s)`);
+    const request = await askApproval({
+      agent: opts.agent, tool: opts.tool, reason,
+      command: isUrl || isPath ? undefined : target,
+      path: isPath ? target : undefined,
+      url: isUrl ? target : undefined,
+      approver: opts.approver, timeoutMs,
+    });
+    if (request.status === "APPROVED") {
+      console.log(`✔ Approved (${request.request_id}).${request.decision_reason ? ` ${request.decision_reason}` : ""} Continue.`);
+      return;
+    }
+    console.log(`✖ ${request.status} (${request.request_id}).${request.decision_reason ? ` ${request.decision_reason}` : " No reason was given."}`);
+    process.exitCode = 1;
+  });
+
+policy.command("pending")
+  .alias("ls")
+  .description("List approval requests waiting on a decision, on this machine's own local collector. An enrolled device's requests are resolved from the workspace dashboard instead, not here")
+  .action(async () => {
+    const pending = await listPendingApprovals();
+    if (!pending.length) { console.log("No pending approval requests."); return; }
+    for (const r of pending) {
+      console.log(`${r.request_id}  [${r.level}] ${r.agent} ${r.tool}: ${r.path || r.url || r.command || "(no target)"}`);
+      if (r.reason) console.log(`  reason: ${r.reason}`);
+      console.log(`  expires: ${r.expires_at}`);
+    }
+  });
+
+policy.command("approve <id>")
+  .description("Approve a pending request filed on this machine's own local collector (not an enrolled device's workspace request -- those are approved from the dashboard)")
+  .option("--note <text>", "Optional note the requester will see")
+  .option("--approver <name>", "Your name or id, recorded on the decision", "admin")
+  .action(async (id: string, opts: { note?: string; approver: string }) => {
+    const result = await resolveApproval(id, "APPROVE_ONCE", opts.approver, opts.note);
+    console.log(`${result.request_id}: ${result.status}`);
+  });
+
+policy.command("reject <id> <reason>")
+  .description("Reject a pending request filed on this machine's own local collector, with a reason the requester will see (not an enrolled device's workspace request -- those are rejected from the dashboard)")
+  .option("--approver <name>", "Your name or id, recorded on the decision", "admin")
+  .action(async (id: string, reason: string, opts: { approver: string }) => {
+    const result = await resolveApproval(id, "DENY", opts.approver, reason);
+    console.log(`${result.request_id}: ${result.status} — ${result.decision_reason}`);
   });
 
 const trust = program.command("trust").description("Manage the global allowlist of outside-workspace paths Beam won't ask about again (advisory/enforce mode only)");

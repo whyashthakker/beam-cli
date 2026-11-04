@@ -11,6 +11,10 @@ export interface ApprovalRequest {
   repository?: string; branch?: string; policy_id?: string; policy_version: number; risk_score: number;
   risk_level: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"; risk_factors: string[]; created_at: string; expires_at: string;
   status: ApprovalStatus; decision?: ApprovalDecision; fingerprint: string;
+  /** Why the requester says it needs this access. Shown to the approver; not itself a grant. */
+  reason?: string;
+  /** The approver's own explanation, set when the decision is applied (see applyApproval()). */
+  decision_reason?: string;
 }
 export interface ApprovalPolicy { level: ApprovalLevel; approver?: string; timeoutMs?: number; securityApprover?: string; adminApprover?: string }
 export interface ApproverResolver { getManager(user: string): string | undefined; getApprovers(request: ApprovalRequest, policy: ApprovalPolicy): string[] }
@@ -55,14 +59,17 @@ export function formatApprovalRequest(request: ApprovalRequest): string {
   const resource = request.path || request.url || request.command || request.tool;
   return `[${request.level}] ${request.agent} ${request.tool}: ${resource} (risk ${request.risk_score}/100 ${request.risk_level})`;
 }
-export function applyApproval(request: ApprovalRequest, decision: ApprovalDecision, approver: string, now = Date.now()): ApprovalRequest {
+export function applyApproval(request: ApprovalRequest, decision: ApprovalDecision, approver: string, now = Date.now(), decisionReason?: string): ApprovalRequest {
   if (!validateApprovalRequest(request)) return { ...request, status: "DENIED", decision: "DENY" };
   if (Date.parse(request.expires_at) <= now || decision === "EXPIRE") return { ...request, status: "EXPIRED", decision: "EXPIRE" };
   if (request.level !== "USER" && approver === request.user) return { ...request, status: "DENIED", decision: "DENY" };
   if (!request.approver.includes(approver)) return { ...request, status: "DENIED", decision: "DENY" };
-  if (decision === "DENY") return { ...request, status: "DENIED", decision };
+  // decisionReason only ever reflects a genuine decision made below by an authorized approver on
+  // a still-pending request -- never attached to the fail-closed guard rejections above, which
+  // aren't a real person's explanation and shouldn't be presented as one to the requester.
+  if (decision === "DENY") return { ...request, status: "DENIED", decision, decision_reason: decisionReason };
   if (request.status !== "PENDING") return request;
-  return { ...request, status: "APPROVED", decision };
+  return { ...request, status: "APPROVED", decision, decision_reason: decisionReason };
 }
 export function approvalStillValid(request: ApprovalRequest, current: Omit<ApprovalRequest, "request_id" | "created_at" | "expires_at" | "status" | "fingerprint">, now = Date.now()): boolean {
   return request.status === "APPROVED" && Date.parse(request.expires_at) > now && request.fingerprint === approvalFingerprint(current);

@@ -6,12 +6,13 @@ import { environmentRisk } from "./access-risk.js";
 import { mkdir, open, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { getBeamHome, getCollectorUrl, getDataDirectory } from "./config.js";
+import { getApiUrl, getBeamHome, getCollectorUrl, getDataDirectory } from "./config.js";
 import { normalize, scanText, setIgnoredRules, type Event, type Scan } from "./core.js";
 import { adaptHookPayload } from "./hook-adapters.js";
 import { forwardEvents } from "./forward.js";
 import { evaluate, readPolicy, type Decision } from "./policy.js";
 import { extractAgent } from "./extract.js";
+import { readIdentity, type Identity } from "./enroll.js";
 import { loadCustomRules } from "./custom-rules.js";
 import { redactSensitive } from "./data-detectors.js";
 import { redactWithSessionEntities } from "./entity-redaction.js";
@@ -23,6 +24,7 @@ import { addBlockedTarget, isTargetBlocked, readBlockedTargets } from "./blocked
 import { promptTty } from "./tty-prompt.js";
 import { gateSkill } from "./skill-gate.js";
 import { notePrompt, sessionContextFor, sessionTitlesEnabled } from "./session-title.js";
+import { createApprovalRequest, type ApprovalDecision, type ApprovalLevel, type ApprovalRequest } from "./approvals.js";
 
 export async function readToken(): Promise<string> {
   if (process.env.BEAM_TOKEN) return process.env.BEAM_TOKEN;
@@ -43,6 +45,16 @@ async function send(route: string, body: string): Promise<unknown> {
   return response.json();
 }
 
+async function get(route: string): Promise<unknown> {
+  const url = getCollectorUrl();
+  const response = await fetch(`${url.origin}${route}`, {
+    headers: { Authorization: `Bearer ${await readToken()}` },
+    signal: AbortSignal.timeout(5000)
+  });
+  if (!response.ok) throw new Error(`Collector rejected request: ${await response.text()}`);
+  return response.json();
+}
+
 async function boundedFile(filePath: string): Promise<string> {
   const stats = await stat(filePath);
   if (stats.size > 2_000_000) throw new Error("File exceeds 2 MB. Split it into batches.");
@@ -57,6 +69,123 @@ export interface RuleReloadResult { path: string; loaded: number; errors: string
 
 export async function reloadRemoteRules(): Promise<RuleReloadResult> {
   return send("/rules/reload", "{}") as Promise<RuleReloadResult>;
+}
+
+// Human-in-the-loop exception to a policy block: file a request with the running collector and
+// wait for an admin to resolve it (`beam policy approve`/`reject`, or the dashboard). Blocks this
+// process for up to `timeoutMs` -- fine for an explicit CLI invocation with nowhere else to be,
+// unlike the pre-action hook path, which never waits on a human (see client.ts's main hook
+// handler) because the host agent imposes its own short timeout on that process.
+export interface AskApprovalOptions {
+  agent: string; tool: string; reason: string;
+  command?: string; path?: string; url?: string;
+  approver?: string; level?: ApprovalLevel;
+  /** How long to wait for a decision before giving up and reporting EXPIRED. Default 10 minutes. */
+  timeoutMs?: number;
+  pollMs?: number;
+}
+// The remote collector's ApprovalRequest row (apps/collector, Postgres/Prisma -- camelCase,
+// `id` as its key, no `fingerprint`). Distinct from this file's own snake_case ApprovalRequest
+// (approvals.ts, `request_id` as its key), which is what the rest of the CLI displays and what
+// the local-only resolveApproval()/listPendingApprovals() below speak. Mapped once here so
+// askApproval()'s caller only ever deals with one shape regardless of which path answered.
+interface RemoteApprovalRequest {
+  id: string; agent: string; tool: string; command: string | null; path: string | null; url: string | null;
+  level: ApprovalLevel; approver: string[];
+  riskScore: number; riskLevel: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL"; riskFactors: string[];
+  reason: string | null;
+  status: ApprovalRequest["status"]; decision: ApprovalDecision | null; decisionReason: string | null;
+  expiresAt: string; createdAt: string;
+}
+function fromRemoteApproval(remote: RemoteApprovalRequest): ApprovalRequest {
+  return {
+    request_id: remote.id, approver: remote.approver, level: remote.level, mode: "SINGLE",
+    agent: remote.agent, tool: remote.tool, command: remote.command ?? "",
+    path: remote.path ?? undefined, url: remote.url ?? undefined,
+    policy_version: 1, risk_score: remote.riskScore, risk_level: remote.riskLevel, risk_factors: remote.riskFactors,
+    created_at: remote.createdAt, expires_at: remote.expiresAt,
+    status: remote.status, decision: remote.decision ?? undefined,
+    fingerprint: "", // approvalStillValid()'s dedup concept never applies to a remote-filed request
+    reason: remote.reason ?? undefined, decision_reason: remote.decisionReason ?? undefined,
+  };
+}
+
+// An enrolled device's request needs a workspace admin to see and resolve it, which only ever
+// happens on the shared collector -- same getApiUrl() + device-secret precedent as
+// forwardMcpInventory/forwardSkillInventory in forward.ts, never the local loopback server (which
+// has no concept of "another person" to ask). The collector's own /v1/approvals is
+// device-authenticated and device-scoped on purpose: a device can file and poll its own request,
+// but there is deliberately no device-authenticated way to resolve one -- that would let a device
+// approve its own blocked action. Resolution is an admin action in the dashboard (or, for a
+// single, unenrolled machine, the local `beam policy approve`/`reject` below).
+async function askRemoteApproval(identity: Identity, options: AskApprovalOptions, timeoutMs: number): Promise<ApprovalRequest> {
+  const base = getApiUrl();
+  const auth = { Authorization: `Bearer ${identity.deviceSecret}` };
+  const postRes = await fetch(`${base}/v1/approvals`, {
+    method: "POST", signal: AbortSignal.timeout(5000),
+    headers: { ...auth, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      agent: options.agent, tool: options.tool, command: options.command, path: options.path, url: options.url,
+      reason: options.reason, level: options.level, approver: options.approver ? [options.approver] : undefined,
+      timeoutSeconds: Math.max(1, Math.min(3600, Math.round(timeoutMs / 1000))),
+    }),
+  });
+  if (!postRes.ok) throw new Error(`Collector rejected request: ${await postRes.text()}`);
+  const filed = fromRemoteApproval(await postRes.json() as RemoteApprovalRequest);
+  const pollMs = options.pollMs ?? 2000;
+  for (;;) {
+    const listRes = await fetch(`${base}/v1/approvals`, { headers: auth, signal: AbortSignal.timeout(5000) });
+    if (!listRes.ok) throw new Error(`Collector rejected request: ${await listRes.text()}`);
+    const all = (await listRes.json() as RemoteApprovalRequest[]).map(fromRemoteApproval);
+    const current = all.find(r => r.request_id === filed.request_id);
+    if (!current) throw new Error("The collector lost track of this approval request.");
+    if (current.status !== "PENDING") return current;
+    if (Date.parse(current.expires_at) <= Date.now()) return { ...current, status: "EXPIRED", decision: "EXPIRE" };
+    await new Promise(resolve => setTimeout(resolve, pollMs));
+  }
+}
+
+export async function askApproval(options: AskApprovalOptions): Promise<ApprovalRequest> {
+  const timeoutMs = options.timeoutMs ?? 10 * 60_000;
+  const identity = await readIdentity();
+  if (identity) return askRemoteApproval(identity, options, timeoutMs);
+  const request = createApprovalRequest({
+    approver: [options.approver ?? "admin"],
+    level: options.level ?? "ADMIN",
+    mode: "SINGLE",
+    agent: options.agent,
+    tool: options.tool,
+    command: options.command ?? "",
+    path: options.path,
+    url: options.url,
+    policy_version: 1,
+    risk_score: 50,
+    risk_level: "MEDIUM",
+    risk_factors: [],
+    reason: options.reason,
+  }, timeoutMs);
+  await send("/approvals", JSON.stringify(request));
+  const pollMs = options.pollMs ?? 2000;
+  for (;;) {
+    const all = await get("/approvals") as ApprovalRequest[];
+    const current = all.find(r => r.request_id === request.request_id);
+    if (!current) throw new Error("The collector lost track of this approval request.");
+    if (current.status !== "PENDING") return current;
+    if (Date.parse(current.expires_at) <= Date.now()) return { ...current, status: "EXPIRED", decision: "EXPIRE" };
+    await new Promise(resolve => setTimeout(resolve, pollMs));
+  }
+}
+
+// Local-machine only, deliberately: see askRemoteApproval()'s comment above for why an enrolled
+// device has no remote equivalent of these two yet (that's an admin-authenticated dashboard
+// surface, not this device-authenticated collector).
+export async function listPendingApprovals(): Promise<ApprovalRequest[]> {
+  const all = await get("/approvals") as ApprovalRequest[];
+  return all.filter(r => r.status === "PENDING");
+}
+
+export async function resolveApproval(requestId: string, decision: ApprovalDecision, approver: string, decisionReason?: string): Promise<ApprovalRequest> {
+  return send("/approvals/resolve", JSON.stringify({ request_id: requestId, decision, approver, decision_reason: decisionReason })) as Promise<ApprovalRequest>;
 }
 
 export interface ScanOptions { mcp?: boolean; save?: boolean }
