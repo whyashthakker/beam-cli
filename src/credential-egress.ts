@@ -2,7 +2,19 @@ import type { MatchSpan } from "./rule-matches.js";
 // A bounded, dependency-free shell heuristic, shared by the CLI and edge SDK.
 // Unlike a whole-text keyword conjunction, only transfer arguments / connected
 // stdin are sinks. This is not a general shell or JavaScript taint analyzer.
-const SENSITIVE = /(?:\.env(?:\b|[./])|\.ssh[\\/]|id_(?:rsa|ed25519)|\.aws[\\/]credentials|\.pgpass\b|\.docker[\\/]config\.json|credentials\.json|\b(?:printenv|process\.env|os\.environ)\b|(?:api[_-]?key|access[_-]?token|password|secret)\b|\$\{?[\w]*(?:TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL)[\w]*\}?)/i;
+// The last alternative had no leading \b, so "secret"/"password" matched as a bare suffix
+// inside any longer identifier (APP_SECRET, CALLS_APP_SECRET, USER_PASSWORD) instead of
+// requiring the word to stand alone -- exactly the literal "key=value"/"password=..." shape
+// this is meant to catch. A leading \b keeps that shape while no longer matching the suffix.
+const SENSITIVE = /(?:\.env(?:\b|[./])|\.ssh[\\/]|id_(?:rsa|ed25519)|\.aws[\\/]credentials|\.pgpass\b|\.docker[\\/]config\.json|credentials\.json|\b(?:printenv|process\.env|os\.environ)\b|\b(?:api[_-]?key|access[_-]?token|password|secret)\b)/i;
+// A bare named-variable reference ($CF_API_TOKEN, ${OPENAI_KEY}) names a credential without
+// carrying its value -- and putting one in an HTTP header is the single most common, legitimate
+// API-auth pattern there is ("Authorization: Bearer $TOKEN" in literally every API's own docs).
+// Treating that as "possible credential exposure" produced the dominant false-positive source
+// on reference documentation. It still counts everywhere a credential's actual value (not just
+// its name) could be moving: scp/rsync targets, raw socket tools, piped stdin, and anywhere SENSITIVE
+// above also matches (a real file path or literal field assignment).
+const NAMED_REFERENCE = /\$\{?[\w]*(?:TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL)[\w]*\}?/i;
 type Token = { value: string; raw: string; start: number; end: number };
 type Command = { tokens: Token[]; pipe: boolean; start: number; end: number };
 
@@ -103,7 +115,16 @@ function shellExposure(text: string, depth: number): boolean {
   }
   let sensitiveStdin = false;
   const sensitiveVariables = new Set<string>();
-  const sensitive = (value: string) => SENSITIVE.test(value) || [...value.matchAll(/\$\{?([A-Za-z_]\w*)/g)].some(m => sensitiveVariables.has(m[1]));
+  const taintedReference = (value: string) => [...value.matchAll(/\$\{?([A-Za-z_]\w*)/g)].some(m => sensitiveVariables.has(m[1]));
+  const sensitive = (value: string) => SENSITIVE.test(value) || NAMED_REFERENCE.test(value) || taintedReference(value);
+  // Curl/wget header arguments only: a named-by-reference credential alone (no real file/literal
+  // signal, no taint from an actually-sensitive assignment) is the ordinary auth-header shape and
+  // is not sensitive here on its own. See NAMED_REFERENCE above.
+  // A header value that is nothing but a single {placeholder} ("X-Auth-Key: {api_key}") is API
+  // documentation's fill-in-the-blank convention -- not a real value and not a variable
+  // reference, so it carries no more signal than NAMED_REFERENCE already excludes above.
+  const PLACEHOLDER_VALUE = /:\s*\{[\w-]+\}\s*$/;
+  const sensitiveHeader = (value: string) => !PLACEHOLDER_VALUE.test(value) && (SENSITIVE.test(value) || taintedReference(value));
   for (const command of commands(visible.join("\n"))) {
     const { tokens, pipe } = command; const at = executable(tokens); const cmd = name(tokens[at]);
     for (const token of tokens) {
@@ -131,11 +152,13 @@ function shellExposure(text: string, depth: number): boolean {
         // A URL path mentioning 'secret' is not a secret payload. Query values
         // and userinfo can carry credentials; payload/header/file options can too.
         if (/^https?:\/\//i.test(arg) && ((/[?&](?:api[_-]?key|token|password|secret)=/i.test(arg)) || /^https?:\/\/[^/@\s]+:[^/@\s]+@/i.test(arg) || /[?&][^=]+=\$/.test(arg) && sensitive(arg))) return true;
-        const compact = /^-(?:d|F|H|u|T)(.+)$/.exec(arg);
-        if (compact && sensitive(compact[1])) return true;
-        if (/^(?:-d|-F|-H|-u|-T|--json|--data(?:-raw|-binary|-urlencode)?|--form|--header|--user|--upload-file|--post-data|--post-file)(?:=|$)/.test(arg)) {
+        const compact = /^-([dFHuT])(.+)$/.exec(arg);
+        if (compact && (compact[1] === "H" ? sensitiveHeader : sensitive)(compact[2])) return true;
+        const longFlag = /^(-d|-F|-H|-u|-T|--json|--data(?:-raw|-binary|-urlencode)?|--form|--header|--user|--upload-file|--post-data|--post-file)(?:=|$)/.exec(arg);
+        if (longFlag) {
+          const isHeader = longFlag[1] === "-H" || longFlag[1] === "--header";
           const payload = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : args[++i] ?? "";
-          if (sensitive(payload)) return true;
+          if ((isHeader ? sensitiveHeader : sensitive)(payload)) return true;
           if (sensitiveStdin && /(?:@-|\/dev\/stdin|\/proc\/self\/fd\/0)/.test(payload)) return true;
         }
         if (/^<(?:\s*)/.test(arg) && sensitive(arg + (args[i + 1] ?? ""))) return true;

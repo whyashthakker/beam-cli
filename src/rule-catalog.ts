@@ -109,6 +109,11 @@ function otherDestructiveOperation(s: string): boolean { return otherDestructive
 // improvising. Mirrors the CREDENTIAL_REFERENCE check in data-detectors.ts.
 const UNRESOLVED_REFERENCE = /\bop:\/\/|@Microsoft\.KeyVault\(|\bvault:[\w/-]|\binfisical:\/\/|\bdoppler:\/\/|\$\{\{\s*secrets\.|__[A-Z][A-Z0-9_]*_REF_[\w-]+__/i;
 
+// Shared by destructive.production below: split out so the heading-aware matcher can reuse the
+// same two patterns the old allMatch(...) used.
+const PROD_TARGET = /\b(?:production|prod|prd)\b/i;
+const PROD_VERB = /\b(?:deploy|delete|drop|truncate|migrate|apply|destroy|restart|rollback|scale)\b/i;
+
 export const builtinRules: Rule[] = [
   { id: "destructive.delete", title: "Destructive operation", severity: "high", category: "impact", explanation: "Recursive deletion or a destructive data operation. Scoped temporary test cleanup is MEDIUM; broad or uncertain targets remain HIGH. Review the target before allowing it.", match: anyMatch(functionalMatch(rmRecursiveForce, recursiveDeleteSpans), otherDestructiveMatcher), severityFor: s => !otherDestructiveOperation(s) && isScopedTemporaryCleanup(s) ? "medium" : "high" },
   { id: "destructive.disk_wipe", title: "Disk or partition wipe", severity: "critical", category: "impact", explanation: "This targets an entire disk, partition or filesystem rather than individual files, and is unrecoverable. Confirm this is an authorized, intentional wipe.", match: patternMatch(DISK_WIPE) },
@@ -119,7 +124,14 @@ export const builtinRules: Rule[] = [
   { id: "destructive.account", title: "Deletes a system account", severity: "high", category: "impact", explanation: "This removes a user or group account, which can include its home directory and files. Confirm the account is no longer needed.", match: patternMatch(/\buserdel\s+-r\b|\bgroupdel\b|\bRemove-LocalUser\b|\bnet\s+user\s+\S+\s+\/delete\b|\bdscl\s+\.\s+-delete\s+\/Users\//i) },
   { id: "integrity.protection_disabled", title: "OS security control disabled", severity: "critical", category: "integrity", explanation: "This turns off a platform security control (System Integrity Protection, Gatekeeper, execution policy, or System Restore), which weakens the machine's security posture beyond this one action.", match: patternMatch(/\bcsrutil\s+disable\b|\bspctl\s+--master-disable\b|\bsecurity\s+delete-keychain\b|\bSet-ExecutionPolicy\s+Unrestricted\b|\bDisable-WindowsOptionalFeature\b|\bDisable-ComputerRestore\b/i) },
   { id: "network.firewall_disabled", title: "Firewall rules flushed or disabled", severity: "high", category: "integrity", explanation: "This removes or disables firewall protection on the host. Confirm the host doesn't need it, or that replacement rules are applied immediately.", match: patternMatch(/\biptables\s+-F\b|\bufw\s+(?:--force\s+reset|disable)\b|\bnetsh\s+advfirewall\s+set\s+allprofiles\s+state\s+off\b/i) },
-  { id: "destructive.production", title: "Production change", severity: "high", category: "impact", explanation: "This action targets a production environment. Confirm the scope and rollback plan before proceeding.", match: allMatch(patternMatch(/\b(?:production|prod|prd)\b/i), patternMatch(/\b(?:deploy|delete|drop|truncate|migrate|apply|destroy|restart|rollback|scale)\b/i)) },
+  { id: "destructive.production", title: "Production change", severity: "high", category: "impact", explanation: "This action targets a production environment. Confirm the scope and rollback plan before proceeding.",
+    // Both words can co-occur in a markdown heading or doc title ("# Deploy production") that is
+    // not itself a command. Require the co-occurrence on one line that isn't a heading, so prose
+    // describing production deploys doesn't read the same as a command that performs one.
+    match: functionalMatch(
+      s => s.split(/\r?\n/).some(line => { const t = line.trim(); return !/^#{1,6}\s/.test(t) && PROD_TARGET.test(t) && PROD_VERB.test(t); }),
+      text => allMatch(patternMatch(PROD_TARGET), patternMatch(PROD_VERB)).spans?.(text) ?? [],
+    ) },
   // Dumping the *whole* environment (every var, name and value) is the risky shape: that's what
   // can hand over credentials the agent was never told about. Referencing one named variable
   // ($PORT, $NODE_ENV, ${DATABASE_URL}) is how every normal dev workflow reads its own config and
@@ -127,10 +139,38 @@ export const builtinRules: Rule[] = [
   // called out as noisy. That case now only shows up (at "info", logged but not an approval gate)
   // in credentials.environment_ref below, and only for the few var-name shapes anyone would
   // actually call a credential; everyday vars like $PORT or $NODE_ENV don't get flagged anywhere.
-  { id: "credentials.environment", title: "Environment variable access", severity: "high", category: "secrets", explanation: "The action reads every exported environment variable at once (not one named variable), which can expose credentials the agent was never told about.", match: patternMatch(/\b(?:printenv|env|export\s+-p|process\.env|os\.environ|System\.getenv|declare\s+-x|Get-ChildItem\s+env:)\b|\/proc\/self\/environ\b|(?:^|[;&|]\s*)set(?:\s*$|\s+-o\b)/i) },
+  { id: "credentials.environment", title: "Environment variable access", severity: "high", category: "secrets", explanation: "The action reads every exported environment variable at once (not one named variable), which can expose credentials the agent was never told about.",
+    // Bare "env" used to be a plain \b...\b alternative, so it matched the standalone token inside
+    // "env.FLAGS", "this.env.AI.run(...)", or a TypeScript "Env" binding/generic -- none of which
+    // dump the environment. It now needs its own boundaries: not preceded by "." or a word char
+    // (so it isn't someone's property/namespace access), and not immediately followed by ".", "(",
+    // or "<" (a method call, property access, or generic type argument), so only the bare shell
+    // command or standalone identifier still matches.
+    // Cloudflare Workers code conventionally declares "interface Env { ... }" and takes a
+    // lowercase "env" binding parameter ("fetch(request, env, ctx)", "(req, env) =>",
+    // "import { env } from ..."). That is every Workers-based skill's docs, and a boundary-only
+    // exclusion list can't keep up with every syntactic shape "env" shows up adjacent to as an
+    // identifier (":" for a type, "," in a param list, "}" closing a destructure, "=>", ...).
+    // The real "env" command is only ever meaningful as the first word of a shell command, so
+    // this now requires exactly that shape -- optionally after a command separator -- instead of
+    // trying to list every JS/TS context where "env" is just a parameter name.
+    match: anyMatch(
+      // process.env.CF_ACCOUNT_ID / os.environ["R2_WAREHOUSE"] read one named property, same as
+      // $PORT or ${DATABASE_URL} below -- not the bulk dump this rule means to catch. Only the
+      // bare object (passed, spread, or iterated whole) still counts.
+      patternMatch(/\b(?:printenv|export\s+-p|process\.env(?![.[])|os\.environ(?![.[])|System\.getenv|declare\s+-x|Get-ChildItem\s+env:)\b|\/proc\/self\/environ\b|(?:^|[;&|]\s*)set(?:\s*$|\s+-o\b)/i),
+      patternMatch(/(?:^|\n|[;&|]\s*)env\b(?![.\w(<])/),
+    ) },
   { id: "credentials.environment_ref", title: "Named credential variable referenced", severity: "info", category: "secrets", explanation: "A single environment variable whose name looks like a credential (KEY/SECRET/TOKEN/PASSWORD/CREDENTIAL) is referenced by name. Logged for visibility; this alone isn't a reason to block the ordinary case of an app reading its own configured secret.", match: patternMatch(/\$\{?[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)S?\}?\b/) },
   { id: "credentials.access", title: "Sensitive credential reference", severity: "medium", category: "secrets", explanation: "This action or instruction references a credential location. Confirm the agent needs access.", match: patternMatch(secret) },
-  { id: "source.private_files", title: "Private source or configuration access", severity: "high", category: "secrets", explanation: "This action accesses a private credential or configuration file. Confirm that the agent needs the contents.", match: patternMatch(/(?:\.env(?:\.[\w.-]+)?|\.ssh[\\/]|\.aws[\\/]credentials|id_(?:rsa|ed25519)|\.npmrc|\.netrc|kubeconfig|private.?key|\.pgpass\b|\.docker[\\/]config\.json|\.gnupg[\\/]|credentials\.json)/i) },
+  { id: "source.private_files", title: "Private source or configuration access", severity: "high", category: "secrets", explanation: "This action accesses a private credential or configuration file. Confirm that the agent needs the contents.",
+    // \.env(?:\.[\w.-]+)? had no boundaries, so it matched the literal substring ".env" inside
+    // "this.env.AI.run(...)" (a property access, not a dotenv file) and inside ".environment" (a
+    // different word entirely, since nothing required the match to end at "env"). It now needs
+    // "not preceded by a word character" (so a leading property-access dot like "this.env" is
+    // excluded) and "not followed by a word character unless it's another dotted extension" (so
+    // ".environment" doesn't partially match as ".env").
+    match: patternMatch(/(?:(?<!\w)\.env(?:\.[\w-]+)?(?!\w)|\.ssh[\\/]|\.aws[\\/]credentials|id_(?:rsa|ed25519)|\.npmrc|\.netrc|kubeconfig|private.?key|\.pgpass\b|\.docker[\\/]config\.json|\.gnupg[\\/]|credentials\.json)/i) },
   { id: "mcp.write", title: "MCP write operation", severity: "high", category: "impact", explanation: "The MCP tool appears to modify data or send an external side effect. Require approval before allowing it.", match: patternMatch(/\bmcp(?:__|:)[^\s]*(?:create|update|delete|write|send|post|put|patch|execute|run|publish|deploy|remove|save|insert|add|grant|revoke|assign)\b/i) },
   { id: "credentials.egress", title: "Possible credential exposure", severity: "critical", category: "exfil", explanation: "A transfer command carries a sensitive payload, or sensitive output feeds an outbound command. This is a possible exposure, not proof of delivery; check the destination and authorization.", match: functionalMatch(possibleCredentialExposure, credentialExposureSpans) },
   { id: "secrets.unresolved_reference_launch", title: "Vault reference used directly instead of resolved", severity: "medium", category: "secrets", explanation: "This command includes a secret-manager reference (op://, Azure Key Vault, Vault, Infisical, Doppler, a GitHub Actions secrets expression, or a broker placeholder) typed in literally rather than resolved by its own CLI or platform. The agent cannot resolve it into the real value -- have a human or CI process start the real service instead, with its existing resolver already wired up.", match: patternMatch(UNRESOLVED_REFERENCE) },
@@ -139,7 +179,12 @@ export const builtinRules: Rule[] = [
   { id: "recon.network_sweep", title: "Network sweep", severity: "medium", category: "recon", explanation: "A scanner targets a network range. Verify scope and authorization before the agent probes other systems (ATT&CK T1046).", match: allMatch(patternMatch(/\b(?:nmap|masscan|rustscan)\b/i), patternMatch(/(?:\d{1,3}\.){3}\d{1,3}\/\d{1,2}|(?:\d{1,3}\.){3}\d{1,3}-\d{1,3}/)) },
   { id: "privilege.elevation", title: "Elevated privileges", severity: "medium", category: "privilege", explanation: "The action requests elevated privileges or broad write permissions.", match: patternMatch(/\bsudo\s|\bdoas\s|(?:^|[\s;&|`(])su\s+(?:-\s*\w*|root)\b|\bpkexec\b|\brunas\s+\/user:|\bchmod\s+(?:-R\s+)?(?:777\b|[ugoa]*\+s\b|[2467][0-7]{3}\b)/i) },
   { id: "network.metadata", title: "Cloud metadata access", severity: "high", category: "secrets", explanation: "Cloud metadata endpoints can expose temporary instance credentials.", match: patternMatch(/169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200/i) },
-  { id: "persistence.config", title: "Security-sensitive configuration", severity: "high", category: "persistence", explanation: "A persistence or agent configuration target is referenced. Check the intended change and trust boundary.", match: patternMatch(/authorized_keys|\bcrontab\b|LaunchAgents[\\/]|ANTHROPIC_BASE_URL/i) },
+  { id: "persistence.config", title: "Security-sensitive configuration", severity: "high", category: "persistence", explanation: "A persistence or agent configuration target is referenced. Check the intended change and trust boundary.",
+    // \bcrontab\b matched the "crontab" in crontab.guru (a validator website, not the command), so
+    // the bare word needs a guard against being immediately followed by a domain-style ".word".
+    // "[Crontab Guru](https://crontab.guru/)" -- a markdown link to the validator site -- still
+    // matched via its link *text* ("Crontab Guru"), not just the URL the first guard covers.
+    match: patternMatch(/authorized_keys|\bcrontab\b(?!\.\w)(?!\s+Guru\b)|LaunchAgents[\\/]|ANTHROPIC_BASE_URL/i) },
   { id: "network.reverse-shell", title: "Reverse shell pattern", severity: "critical", category: "exec", explanation: "This pattern can connect a command shell to another machine.", match: patternMatch(/\/dev\/tcp\/|\bnc\b[^\n]{0,300}?\s-e\s|socket[\s\S]{0,200}?subprocess|\bNew-Object\s+(?:System\.)?Net\.Sockets\.TCPClient\b|\bsocat\b[^\n]{0,300}?\bexec[:=]|\bsocket\([^\n]{0,150}?getprotobyname\(["']tcp["']\)[\s\S]{0,200}?\bconnect\(/i) },
   { id: "instructions.override", title: "Instruction override attempt", severity: "high", category: "integrity", explanation: "Instructions attempt to override existing safeguards or conceal activity from the user. Checked against the same folded view used for prompt-injection monitoring (Unicode/width normalization and base64 decoding), not a literal-text match, so stylized or encoded phrasing is caught too.", match: functionalMatch(promptAttack.override) },
   { id: "source_control.history_rewrite", title: "Git history rewrite", severity: "medium", category: "source_control", explanation: "Force-pushing or rewriting shared history can silently discard other people's commits. Confirm the branch isn't shared before proceeding.", match: patternMatch(/\bgit\s+push\s+[^\n]{0,1000}?(?:--force(?:-with-lease)?|-f\b)|\bgit\s+filter-(?:branch|repo)\b/i) },

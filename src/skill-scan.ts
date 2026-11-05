@@ -47,6 +47,13 @@ const SKIP_CORE_FOR_SKILLS = new Set(["instructions.override", "mcp.write"]);
 
 const TEXT_EXT = /\.(?:md|mdx|txt|json|ya?ml|toml|sh|bash|zsh|py|js|mjs|cjs|ts|rb|ps1)$/i;
 const SKIP_DIR = new Set([".git", "node_modules", ".venv", "__pycache__"]);
+// Benchmark/test fixtures conventionally hold adversarial-looking example text on purpose (a
+// prompt-injection benchmark's own test cases, for instance) -- that is data the skill's code
+// reads and tests against, not an instruction the agent will obey. Injection rules treat file
+// content as "the agent will read and follow this," which is right for SKILL.md and reference
+// docs but wrong for a fixture whose entire point is to contain the phrase being tested against.
+// Risk rules (actual commands) still run on these files -- only the injection-rule pass is skipped.
+const FIXTURE_DIR = /(?:^|[\\/])(?:evals?|fixtures?|test-?data|__tests__|tests?)[\\/]/i;
 const MAX_FILES = 200;
 const MAX_FILE_BYTES = 500_000;
 
@@ -141,7 +148,7 @@ async function scanPaths(dir: string, name: string, paths: string[]): Promise<Sk
     const content = await readFile(path, "utf8");
     if (!content.trim()) continue;
     hash.update(`${rel}\0${content}\0`);
-    const findings = [...scanInjection(content), ...scanRisky(content)];
+    const findings = [...(FIXTURE_DIR.test(rel) ? [] : scanInjection(content)), ...scanRisky(content)];
     try { for (const f of scanText(rel, content, "skill").findings) if (!SKIP_CORE_FOR_SKILLS.has(f.id) && !findings.some(x => x.id === f.id)) findings.push(narrowToLine(f, content)); }
     catch { /* over the scanText size cap; injection rules above still ran */ }
     files.push({ file: rel, findings });
