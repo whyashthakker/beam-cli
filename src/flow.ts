@@ -2,7 +2,8 @@ import { basename } from "node:path";
 import { shellActionCommands } from "./credential-egress.js";
 import type { ActionContext } from "./action-context.js";
 import { narrateCommand, friendlyName, shortPath } from "./plain-explain.js";
-import { PRIVATE_PATH, isTemplateEnvPath, touchesSecretContent, patchTargetText } from "./secret-use.js";
+import { touchesSecretContent, patchTargetText, executedText } from "./secret-use.js";
+import { commandsOf, outwardFor, usesSecrets, hostOf, hostsIn, isPrivate, type FlowOutward } from "./outbound.js";
 import { detectSensitive } from "./data-detectors.js";
 
 /**
@@ -16,7 +17,7 @@ import { detectSensitive } from "./data-detectors.js";
  * dashboard falls back to the event's own summary for those, so nothing depends on this existing.
  */
 export type FlowKind = "prompt" | "read" | "write" | "search" | "run" | "web" | "mcp" | "delete" | "git" | "other";
-export type FlowOutward = { kind: "push" | "upload" | "post" | "publish" | "deploy"; target?: string };
+export type { FlowOutward } from "./outbound.js";
 export type FlowInfo = {
   v: 1;
   label: string;
@@ -36,58 +37,8 @@ export type FlowInfo = {
 
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 const list = (items: (string | undefined)[], max = 6) => [...new Set(items.filter((x): x is string => !!x))].slice(0, max).map(x => clip(x, 70));
-const hostOf = (url: string | undefined): string | undefined => {
-  if (!url) return undefined;
-  try { return new URL(/^[a-z]+:\/\//i.test(url) ? url : `https://${url}`).hostname.toLowerCase() || undefined; } catch { return undefined; }
-};
 const MCP_WRITE = /(?:create|update|delete|write|send|post|put|patch|execute|run|publish|deploy|remove|save|insert|add|grant|revoke|assign)/i;
 const SECRET_KINDS = new Set(["SECRET", "API_KEY", "PASSWORD", "PRIVATE_KEY"]);
-const CREDENTIAL_VAR = /\$\{?[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*_(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)S?\}?/;
-
-type Cmd = { cmd: string; args: string[] };
-function commandsOf(command: string): Cmd[] {
-  const out: Cmd[] = [];
-  for (const c of shellActionCommands(command)) {
-    const t = c.tokens; let at = 0;
-    while (/^[A-Za-z_]\w*=/.test(t[at]?.value ?? "")) at++;
-    if (t[at]?.value === "sudo") at++;
-    const cmd = basename(t[at]?.value ?? "").toLowerCase();
-    if (cmd) out.push({ cmd, args: t.slice(at + 1).map(x => x.value) });
-  }
-  return out;
-}
-
-const isPrivate = (p: string) => PRIVATE_PATH.test(p) && !isTemplateEnvPath(p);
-
-/** What this command sends outward, if anything (a push, an upload, a POST, a publish, a deploy). */
-function outwardOf(cmds: Cmd[], ctx: ActionContext | undefined, safe: (s: string) => string): FlowOutward | undefined {
-  for (const { cmd, args } of cmds) {
-    const sub = args.find(a => !a.startsWith("-"));
-    if (cmd === "git" && sub === "push") return { kind: "push", target: ctx?.repository?.remote?.path ?? ctx?.repository?.name };
-    if (/^(?:docker|podman)$/.test(cmd) && sub === "push") { const ref = args.filter(a => !a.startsWith("-"))[1]; return { kind: "push", target: ref ? clip(safe(ref.split(":")[0]), 70) : undefined }; }
-    if (/^(?:npm|pnpm|yarn|bun)$/.test(cmd) && sub === "publish") return { kind: "publish", target: "package registry" };
-    if (/^(?:twine|cargo|gem)$/.test(cmd) && /^(?:upload|publish|push)$/.test(sub ?? "")) return { kind: "publish", target: cmd };
-    if (/^(?:vercel|netlify|railway|fly|flyctl|heroku|wrangler|firebase)$/.test(cmd) && (/^(?:deploy|up|publish|push|release)$/.test(sub ?? "") || args.includes("--prod"))) return { kind: "deploy", target: cmd };
-    if (cmd === "gh" && /^(?:pr|gist|issue|release|repo)$/.test(sub ?? "") && /^(?:create|comment|edit|upload|merge)$/.test(args.filter(a => !a.startsWith("-"))[1] ?? "")) return { kind: "post", target: ctx?.repository?.remote?.path ?? "GitHub" };
-    if (cmd === "aws" && sub === "s3") { const dest = args.find(a => /^s3:\/\//.test(a)); if (dest && /^(?:cp|sync|mv)$/.test(args.filter(a => !a.startsWith("-"))[1] ?? "")) return { kind: "upload", target: clip(safe(dest), 70) }; }
-    if (/^(?:scp|rsync|sftp)$/.test(cmd)) { const remote = args.find(a => /^[^/\s-][^/\s]*@?[^/\s]*:/.test(a) && !a.startsWith("-")); if (remote) return { kind: "upload", target: clip(safe(remote.split(":")[0].replace(/^.*@/, "")), 70) }; }
-    if (/^(?:curl|wget)$/.test(cmd)) {
-      const url = args.find(a => /^https?:\/\//i.test(a.replace(/^["']|["']$/g, "")))?.replace(/^["']|["']$/g, "");
-      const sends = args.some(a => /^(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form|-T|--upload-file|--post-data|--post-file)$/.test(a) || /^-d.+/.test(a))
-        || args.some((a, i) => /^(?:-X|--request)$/.test(a) && /^(?:POST|PUT|PATCH)$/i.test(args[i + 1] ?? ""));
-      if (sends) return { kind: args.some(a => /^(?:-T|--upload-file|-F|--form)$/.test(a)) ? "upload" : "post", target: hostOf(url) };
-    }
-  }
-  return undefined;
-}
-
-function referencesSecret(cmds: Cmd[], command: string): boolean {
-  if (cmds.some(({ args }) => args.some(a => isPrivate(a.replace(/^@/, "")) || /@[^\s]*\.env\b/.test(a)))) return true;
-  if (CREDENTIAL_VAR.test(command)) return true;
-  // `git add .env && git push`: anything private staged earlier in the same command.
-  return cmds.some(({ cmd, args }) => cmd === "git" && args[0] === "add" && args.slice(1).some(a => isPrivate(a)));
-}
-
 function exposureOf(toolResponse: unknown): FlowInfo["exposure"] | undefined {
   if (toolResponse === undefined || toolResponse === null) return undefined;
   let text: string;
@@ -128,7 +79,7 @@ export function buildFlow(i: FlowInput): FlowInfo | undefined {
         read: list(actions.filter(a => (a.operation === "file-read" || a.operation === "file-search" || a.operation === "source-search") && a.target && a.target !== "standard input").map(a => shortPath(a.target!, safe))),
         wrote: list(actions.filter(a => a.operation === "file-write").map(a => a.target && shortPath(a.target, safe))),
         deleted: list(actions.filter(a => a.operation === "delete").map(a => a.target && shortPath(a.target, safe))),
-        hosts: list(actions.filter(a => a.operation === "network-request").map(a => hostOf(a.target))),
+        hosts: list([...actions.filter(a => a.operation === "network-request").map(a => hostOf(a.target)), ...hostsIn(executedText(i.command))]),
         ran: list(cmds.map(c => c.cmd).filter(c => !/^(?:cd|echo|printf|true|false|export|set|sleep|cut|wc|sort|uniq|tr|head|tail|xargs|tee)$/.test(c)), 5),
         staged: list(cmds.filter(c => c.cmd === "git" && c.args[0] === "add").flatMap(c => c.args.slice(1).filter(a => !a.startsWith("-")).map(a => (a === "." ? "everything" : shortPath(a, safe))))),
       };
@@ -139,8 +90,8 @@ export function buildFlow(i: FlowInput): FlowInfo | undefined {
         : actions.some(a => a.operation === "file-search" || a.operation === "source-search") ? "search"
         : actions.some(a => a.operation === "file-read") ? "read"
         : "run";
-      outward = outwardOf(cmds, i.context, safe);
-      if (outward) carries = referencesSecret(cmds, i.command) ? "yes" : "no-sign";
+      outward = outwardFor(i.command, cmds, i.context, safe);
+      if (outward) carries = usesSecrets(i.command, cmds, i.context) ? "yes" : "no-sign";
       const privateTouched = actions.some(a => isPrivate(a.resolvedPath ?? a.target ?? "")) || cmds.some(c => c.args.some(a => isPrivate(a)));
       if (privateTouched && i.context && touchesSecretContent(i.command, i.context)) sensitive = true;
     } else if (i.type === "file.read") { kind = "read"; label = i.path ? `read ${friendlyName(i.path, safe)}` : "read a file"; effects = { read: i.path ? list([shortPath(i.path, safe)]) : [] }; if (i.path && isPrivate(i.path)) sensitive = true; }

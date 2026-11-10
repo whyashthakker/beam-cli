@@ -41,7 +41,7 @@ it('the AWS load_dotenv script is opened + risky',()=>{
   const cmd=`cd /Users/ganesh/Desktop/r-api-fast-api-apps; python3 - <<'EOF'\nimport os,boto3\nfrom dotenv import load_dotenv; load_dotenv(".env")\ns=boto3.client("s3",aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"))\nEOF`;
   const p=explain('source.private_files','high',cmd)!;
   expect(p.opened).toBe('contents'); expect(p.verdict).toBe('risky');
-  expect(p.steps.join(' ')).toMatch(/short script/);
+  expect(p.steps.join(' ')).toMatch(/short Python script/);
 });
 it('whole-environment dumps are described plainly',()=>{
   const p=explain('credentials.environment','high','printenv')!;

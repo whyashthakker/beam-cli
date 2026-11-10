@@ -2,6 +2,7 @@ import { basename } from "node:path";
 import { shellActionCommands } from "./credential-egress.js";
 import type { ActionContext } from "./action-context.js";
 import { PRIVATE_PATH, isTemplateEnvPath, touchesSecretContent, executedText } from "./secret-use.js";
+import { commandsOf, hostOf, hostsIn, outwardFor, usesSecrets } from "./outbound.js";
 
 /**
  * Event-specific plain-language facts, built without any model: what the agent actually did, step
@@ -22,6 +23,10 @@ export type PlainExplanation = {
   verdict: "routine" | "check" | "risky";
   /** One sentence tying this event to the rule: what the detector saw vs. what really happened. */
   nuance?: string;
+  /** Hosts the command contacts (curl/wget, and URLs inside inline scripts), at most 4. */
+  contacted?: string[];
+  /** A request the command sends outward, and whether credentials are in play in the same command. */
+  sent?: { kind: "post" | "upload" | "push" | "publish" | "deploy"; target?: string; withSecret: boolean };
 };
 
 const MAX_STEPS = 6;
@@ -57,7 +62,7 @@ const GIT: Record<string, string> = {
   rm: "removed files through git", mv: "moved files through git", merge: "merged branches", rebase: "rewrote branch history", fetch: "fetched updates",
 };
 
-function describe(cmd: string, args: string[], safe: (s: string) => string): string | undefined {
+function describe(cmd: string, args: string[], safe: (s: string) => string, command = ""): string | undefined {
   const files = args.filter(a => !a.startsWith("-") && !/^\d+(?:,\d+)?p?$/.test(a));
   if (/^(?:cat|head|tail|less|more|nl|bat|xxd|strings|od|sed)$/.test(cmd)) {
     // sed's first non-option argument is its script (1,40p), not a file.
@@ -85,7 +90,14 @@ function describe(cmd: string, args: string[], safe: (s: string) => string): str
     if (cmd === "npx" || cmd === "bunx") return `ran the tool “${safe(sub ?? "")}” on demand`;
     return `ran ${cmd} ${safe(sub ?? "")}`.trim();
   }
-  if (/^(?:python[\d.]*|node|deno|ruby|perl|php)$/.test(cmd)) return args.some(a => a === "-" ) ? "ran a short script typed into the command" : files[0] ? `ran the script ${nice(files[0], safe)}` : "ran a short script";
+  if (/^(?:python[\d.]*|node|deno|ruby|perl|php)$/.test(cmd)) {
+    const language = /^python/.test(cmd) ? "Python" : ({ node: "Node", deno: "Deno", ruby: "Ruby", perl: "Perl", php: "PHP" } as Record<string, string>)[cmd]!;
+    const at = args.findIndex(a => /^(?:-e|-p|-pe|--eval|--print|-c)$/.test(a));
+    const contacts = (hosts: string[]) => (hosts.length ? ` that contacts ${hosts.length <= 3 ? hosts.join(", ").replace(/, ([^,]*)$/, " and $1") : list(hosts, 3)}` : "");
+    if (at >= 0) return `ran an inline ${language} script${contacts(hostsIn(args[at + 1] ?? ""))}`; // the code is the argument, not a file
+    if (args.some(a => a === "-")) return `ran a short ${language} script typed into the command${contacts(hostsIn(executedText(command)))}`;
+    return files[0] ? `ran the script ${nice(files[0], safe)}` : `ran a short ${language} script`;
+  }
   if (/^(?:curl|wget)$/.test(cmd)) {
     const url = args.find(a => /^https?:\/\//i.test(a.replace(/^["']|["']$/g, "")));
     const host = url ? url.replace(/^["']/, "").replace(/^https?:\/\//i, "").split(/[/?#"']/)[0] : undefined;
@@ -115,15 +127,20 @@ export function narrateCommand(command: string, safe: (s: string) => string): { 
     while (/^[A-Za-z_]\w*=/.test(t[at]?.value ?? "")) at++;
     if (t[at]?.value === "sudo") { admin = true; at++; }
     const cmd = basename(t[at]?.value ?? "").toLowerCase();
-    if (!cmd || PLUMBING.has(cmd)) continue;
-    // Redirections (`2>/dev/null`, `> out.log`) are plumbing, not things the command acted on.
-    const raw = t.slice(at + 1).map(x => x.value); const args: string[] = [];
+    if (!cmd) continue;
+    // Redirections (`2>/dev/null`, `> out.log`) are plumbing, not things the command acted on -- except
+    // that a redirect into a real file is worth saying ("wrote to ...").
+    const raw = t.slice(at + 1).map(x => x.value); const args: string[] = []; let out: string | undefined;
     for (let i = 0; i < raw.length; i++) {
-      if (/^(?:\d*>>?|&>>?|<)$/.test(raw[i])) { i++; continue; }
-      if (/^(?:\d*>>?|&>>?|<)\S/.test(raw[i]) || /^\d*>&\d*$/.test(raw[i])) continue;
+      if (/^(?:\d*>>?|&>>?|<)$/.test(raw[i])) { if (!raw[i].startsWith("<") && raw[i + 1] && raw[i + 1] !== "/dev/null") out = raw[i + 1]; i++; continue; }
+      if (/^(?:\d*>>?|&>>?|<)\S/.test(raw[i])) { const target = raw[i].replace(/^(?:\d*>>?|&>>?)/, ""); if (!raw[i].startsWith("<") && target && target !== "/dev/null" && !target.startsWith("&")) out = target; continue; }
+      if (/^\d*>&\d*$/.test(raw[i])) continue;
       args.push(raw[i]);
     }
-    const text = describe(cmd, args, safe);
+    const plumbing = PLUMBING.has(cmd);
+    if (plumbing && !(out && /^(?:echo|printf)$/.test(cmd))) continue;
+    let text = plumbing ? undefined : describe(cmd, args, safe, command);
+    if (out) text = text ? `${text}, saving the output to ${nice(out, safe)}` : `wrote to ${nice(out, safe)}`;
     if (!text) continue;
     if (all.includes(text)) continue;
     all.push(text);
@@ -176,10 +193,17 @@ export function explainFinding(input: {
     }
   }
 
+  // What the command reaches out to, and whether it sends something using credentials.
+  const cmds = commandsOf(command);
+  const contacted = [...new Set([...(context?.actions ?? []).filter(a => a.operation === "network-request").map(a => hostOf(a.target)).filter((h): h is string => !!h), ...hostsIn(executedText(command))])].slice(0, 4);
+  const outward = outwardFor(command, cmds, context, safe);
+  const sent = outward ? { kind: outward.kind, ...(outward.target ? { target: outward.target } : {}), withSecret: usesSecrets(command, cmds, context) } : undefined;
+
   let verdict: PlainExplanation["verdict"] = "check";
   if (severity === "critical" || opened === "contents" || (!ACCESS_RULES.has(ruleId) && severity === "high" && narrated.admin)) verdict = "risky";
   else if (ACCESS_RULES.has(ruleId) && (opened === "none" || opened === "names-only")) verdict = "routine";
   else if (severity === "low" || severity === "info") verdict = "routine";
 
-  return { v: 1, steps, ...(opened ? { opened } : {}), ...(touched.length ? { touched } : {}), verdict, ...(nuance ? { nuance: clip(nuance, 220) } : {}) };
+  if (sent?.withSecret && verdict === "routine") verdict = "check";
+  return { v: 1, steps, ...(opened ? { opened } : {}), ...(touched.length ? { touched } : {}), verdict, ...(nuance ? { nuance: clip(nuance, 220) } : {}), ...(contacted.length ? { contacted } : {}), ...(sent ? { sent } : {}) };
 }
