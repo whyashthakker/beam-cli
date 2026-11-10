@@ -2,7 +2,7 @@
 // the same catalog backs agent hooks (core.ts) and the in-app SDK (sdk.ts), which can run in
 // edge runtimes.
 import { promptAttack } from "./prompt-attacks.js";
-import { isScopedTemporaryCleanup, isLowRiskCleanup } from "./destructive-risk.js";
+import { isScopedTemporaryCleanup, isLowRiskCleanup, isProjectScopedCleanup, isSymlinkOnlyDelete } from "./destructive-risk.js";
 import { patternMatch, anyMatch, allMatch, functionalMatch, type Matcher, type MatchSpan } from "./rule-matches.js";
 import { credentialExposureSpans, possibleCredentialExposure } from "./credential-egress.js";
 
@@ -225,7 +225,7 @@ const PROD_TARGET = /\b(?:production|prod|prd)\b/i;
 const PROD_VERB = /\b(?:deploy|delete|drop|truncate|migrate|apply|destroy|restart|rollback|scale)\b/i;
 
 export const builtinRules: Rule[] = [
-  { id: "destructive.delete", title: "Destructive operation", severity: "high", category: "impact", explanation: "Recursive deletion or a destructive data operation. Scoped temporary test cleanup is MEDIUM; broad or uncertain targets remain HIGH. Review the target before allowing it.", match: anyMatch(functionalMatch(rmRecursiveForce, recursiveDeleteSpans), otherDestructiveMatcher), severityFor: s => otherDestructiveOperation(s) ? "high" : isLowRiskCleanup(s) ? "low" : isScopedTemporaryCleanup(s) ? "medium" : "high" },
+  { id: "destructive.delete", title: "Destructive operation", severity: "high", category: "impact", explanation: "Recursive deletion or a destructive data operation. Scoped temporary test cleanup is MEDIUM; broad or uncertain targets remain HIGH. Review the target before allowing it.", match: anyMatch(functionalMatch(rmRecursiveForce, recursiveDeleteSpans), otherDestructiveMatcher), severityFor: s => isSymlinkOnlyDelete(s) ? "low" : otherDestructiveOperation(s) ? "high" : isLowRiskCleanup(s) ? "low" : isScopedTemporaryCleanup(s) || isProjectScopedCleanup(s) ? "medium" : "high" },
   { id: "destructive.disk_wipe", title: "Disk or partition wipe", severity: "critical", category: "impact", explanation: "This targets an entire disk, partition or filesystem rather than individual files, and is unrecoverable. Confirm this is an authorized, intentional wipe.", match: patternMatch(DISK_WIPE) },
   { id: "destructive.fork_bomb", title: "Fork bomb", severity: "critical", category: "impact", explanation: "This pattern spawns processes exponentially and can make the machine unresponsive.", match: patternMatch(FORK_BOMB) },
   { id: "destructive.audit_trail", title: "Audit trail or recovery point erased", severity: "critical", category: "integrity", explanation: "This clears shadow copies, event logs or shell history. It is also the standard precursor to covering up a destructive or malicious action; confirm the reason before allowing it.", match: patternMatch(/\bvssadmin\b[^\n]{0,100}?delete\s+shadows|\bwevtutil\b[^\n]{0,50}?\bcl\b|\bClear-EventLog\b|\bhistory\s+-c\b|\bunset\s+HISTFILE\b|\bHISTSIZE\s*=\s*0\b|\bbcdedit\b[^\n]{0,50}?\/deletevalue/i) },

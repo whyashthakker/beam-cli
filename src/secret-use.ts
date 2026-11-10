@@ -88,6 +88,9 @@ export const isSourceFilePath = (text: string) => SOURCE_PATH.test(text.trim()) 
 // not treated that way.
 const EDITS_FILE = /\.write_text\(|\.write\(|\bwriteFile(?:Sync)?\(|\bopen\([^)]*['"][wa]b?['"]/;
 const DOES_THINGS = /\bsubprocess\b|\bPopen\b|\bos\.(?:system|popen|remove|unlink|rmdir|removedirs|exec\w*|spawn\w*)\b|\bshutil\b|\brmtree\b|\bunlink\b|\bexec\s*\(|\beval\s*\(|child_process|\bspawn(?:Sync)?\s*\(|\bexec(?:Sync|File)?\s*\(|\bfs\.(?:rm|rmdir|unlink)|\brmSync\b|\brequests\.|\burllib\b|\burlopen\b|\bfetch\s*\(|\bsocket\b|\bsystem\s*\(/;
+// String literals removed, so words inside the file content being written ("subprocess",
+// "requests.", "exec(") don't make a plain editing script look like it does things.
+const STRINGS = /"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`/g;
 export function withoutEditorScripts(text: string): string {
   const blocks = heredocBlocks(text);
   if (!blocks.length) return text;
@@ -96,7 +99,7 @@ export function withoutEditorScripts(text: string): string {
     const opener = b.header.slice(0, b.header.search(/<</));
     const body = text.slice(b.start, b.end);
     if (!INTERPRETER_HEREDOC.test(opener) || /(?:^|[;&|]\s*)(?:cat|tee)\b[^;&|]*$/.test(opener)) continue;
-    if (!EDITS_FILE.test(body) || DOES_THINGS.test(body) || CONTENT_LOAD.test(body)) continue;
+    if (!EDITS_FILE.test(body) || DOES_THINGS.test(body.replace(STRINGS, '""')) || CONTENT_LOAD.test(body)) continue;
     out += text.slice(at, b.start); at = b.end;
   }
   return out + text.slice(at);
