@@ -1,6 +1,7 @@
 import { activityFor, activityType, commandOf, type Activity } from "./activity.js";
 import { hookKind } from "./hook-catalog.js";
 import { assessAccessFinding } from "./access-risk.js";
+import { executedText, patchTargetText, isSourceFilePath, withoutEditorScripts, withoutDataHeredocs, isStartupOrScriptPath } from "./secret-use.js";
 import { classifyActionContext, type ActionContext } from "./action-context.js";
 import { commandBehaviorRegex } from "./mitigation-pattern.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -70,11 +71,31 @@ export function setIgnoredRules(entries: IgnoredRuleEntry[], agent?: string): vo
 export function ruleCatalog(): Omit<Rule, "match" | "severityFor">[] {
   return activeRules().map(({ match: _, severityFor: _severityFor, ...rule }) => rule);
 }
-export function detect(text: string, request?: {tool:string;input:Record<string,unknown>;cwd:string;command:string}): Finding[] {
-  const rules=activeRules().filter(r=>r.match(text)&&!ignoredRuleIds.has(r.id));
+export function detect(text: string, request?: {tool:string;input:Record<string,unknown>;cwd:string;command:string;prose?:boolean}): Finding[] {
+  // Code or prose written into a file (cat > f <<EOF ...) is data, not something that runs, so
+  // the access rules must still match once those bodies are removed.
+  // File-editing scripts (python3 - <<EOF ... write_text ...) carry text, not commands.
+  const scan=request?.command?withoutEditorScripts(withoutDataHeredocs(text)):text;
+  const executed=request?.command?executedText(scan):text;
+  // An apply_patch edit is judged by the files it targets, not the code it adds.
+  const patchTargets=patchTargetText(text);
+  const accessRule=(id:string)=>id==="credentials.environment"||id==="credentials.access"||id==="source.private_files";
+  // A lone path to a source file ("lib/account-password.ts") is judged by real secret-file paths,
+  // not by a credential-sounding word in its name.
+  const sourcePath=isSourceFilePath(text);
+  const rules=activeRules().filter(r=>{
+    if(ignoredRuleIds.has(r.id))return false;
+    // Code added by a patch is written, not run: execution/impact rules judge what runs.
+    // Neither a patch's added code (unless it edits a startup/script file) nor a user's own prompt text runs anything.
+    const inert=(patchTargets!==undefined&&!patchTargets.split("\n").some(isStartupOrScriptPath))||request?.prose===true;
+    if(inert&&(r.category==="exec"||r.category==="impact"))return false;
+    if(patchTargets!==undefined&&accessRule(r.id))return r.match(patchTargets);
+    if(sourcePath&&r.id==="credentials.access")return false;
+    return r.match(text)&&(scan===text||r.category==='custom'||r.match(scan))&&(executed===text||!accessRule(r.id)||r.match(executed));
+  });
   const access=rules.some(r=>["credentials.environment","source.private_files","credentials.access"].includes(r.id)) ? classifyActionContext(request?.tool??"Bash",request?.input??{},request?.cwd??"",request?.command??text,s=>s,false) : undefined;
   return rules.flatMap(r => {
-    const assessment=access?assessAccessFinding(r.id,access):undefined;
+    const assessment=access?assessAccessFinding(r.id,access,request?.command?executed:undefined):undefined;
     if(assessment && "suppress" in assessment)return [];
     const calibrated=assessment && "severity" in assessment?assessment:undefined;
     const spans = r.match.spans?.(text) ?? [];
@@ -181,7 +202,7 @@ export function normalize(raw: Obj): Event {
   if (!raw.event_type && !raw.observed_event_type) type = activityType(raw, type);
   const activity = activityFor(raw, redact);
   const detail = command || path || url || (typeof raw.prompt === "string" ? raw.prompt : "") || activity?.searchTerms?.join("; ") || activity?.urls?.join("; ") || activity?.paths?.join("; ") || str(raw.content_preview ?? raw.observed_content_preview ?? raw.summary) || tool || type;
-  const findings = /(?:result|message|telemetry)/.test(type) ? [] : detect(detail,{tool,input,cwd:str(raw.cwd??raw.project_path),command});
+  const findings = /(?:result|message|telemetry)/.test(type) ? [] : detect(detail,{tool,input,cwd:str(raw.cwd??raw.project_path),command,prose:type==="prompt.submit"});
   const commandPattern = type === "command.exec" ? commandBehaviorRegex(redact(command)) : null;
   if (raw.record_type === "finding") {
     findings.push({ id: str(raw.rule_id, "imported.finding"), title: redact(str(raw.title, "Imported finding")), severity: ["critical", "high", "medium", "low", "info"].includes(str(raw.severity)) ? raw.severity as Severity : "medium", explanation: "Imported rule match. It indicates a pattern, not proof of compromise or action completion.", evidence: redact(detail).slice(0, 600) });

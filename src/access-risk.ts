@@ -1,8 +1,9 @@
 import type { ActionContext } from "./action-context.js";
 import type { Severity } from "./rule-catalog.js";
+import { touchesSecretContent, isTemplateEnvPath } from "./secret-use.js";
 
 const routineName = (name:string) => /^(?:AWS_REGION|AWS_DEFAULT_REGION|NODE_ENV|PORT|HOST|LANG|TZ|CI|TERM|PWD)$/.test(name);
-const privatePath = (path:string) => /(?:^|[/\\])\.env(?:[.\\/]|rc\b|$)|\.ssh[/\\]|\.aws[/\\]credentials\b|id_(?:rsa|ed25519)|\.npmrc\b|\.netrc\b|kubeconfig|\.pgpass\b|credentials\.json/i.test(path);
+const privatePath = (path:string) => !isTemplateEnvPath(path) && /(?:^|[/\\])\.env(?:[.\\/]|rc\b|$)|\.ssh[/\\]|\.aws[/\\]credentials\b|id_(?:rsa|ed25519)|\.npmrc\b|\.netrc\b|kubeconfig|\.pgpass\b|credentials\.json/i.test(path);
 function scopedTemporaryConfiguration(path:string):boolean {
   if(/[$`*?{}()[\]~]/.test(path)||path.split(/[\\/]/).some(p=>p==="."||p===".."))return false;
   const match=/^\/(?:tmp|private\/tmp|var\/tmp)\/([A-Za-z0-9._-]+)\//.exec(path);
@@ -24,12 +25,15 @@ export function environmentRisk(context:ActionContext):AccessAssessment|undefine
   if(actions.length && actions.every(a=>["file-read","file-search","source-search","file-write","delete","git-change","network-request","network-scan","mcp-call"].includes(a.operation)))return {suppress:true};
   return undefined;
 }
-export function assessAccessFinding(ruleId:string,context:ActionContext):AccessAssessment|undefined {
+export function assessAccessFinding(ruleId:string,context:ActionContext,text?:string):AccessAssessment|undefined {
   if(ruleId==="credentials.environment")return environmentRisk(context);
   if(ruleId!=="source.private_files"&&ruleId!=="credentials.access")return undefined;
   if(context.truncated)return undefined;
   const reads=context.actions.filter(a=>["file-read","file-search","file-write"].includes(a.operation)&&privatePath(a.resolvedPath??a.target??""));
   if(reads.length && !context.actions.some(a=>a.operation==="command") && reads.every(a=>scopedTemporaryConfiguration(a.resolvedPath??a.target??"")))return {severity:"medium",explanation:"The request targets a private configuration location under a narrowly scoped temporary test directory. Its contents are not verified as fake or harmless; review access and returned output."};
   if(context.actions.length&&context.actions.every(a=>a.operation==="source-search"))return ruleId==="source.private_files"?{suppress:true}:{severity:"info",explanation:"The request searches source code for credential-related text. This reference alone does not establish a credential-file read or disclosure."};
+  // The text names a secret file or credential word, but nothing in the command opens, loads,
+  // copies or prints it (editing code, `git check-ignore .env`, `ls -a | grep env`, ...).
+  if(text!==undefined&&context.actions.length&&!touchesSecretContent(text,context))return ruleId==="source.private_files"?{suppress:true}:{severity:"info",explanation:"The command mentions a credential-related name or path without opening, loading or copying its contents. Recorded for visibility."};
   return undefined;
 }

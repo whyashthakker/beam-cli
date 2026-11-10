@@ -2,7 +2,7 @@
 // the same catalog backs agent hooks (core.ts) and the in-app SDK (sdk.ts), which can run in
 // edge runtimes.
 import { promptAttack } from "./prompt-attacks.js";
-import { isScopedTemporaryCleanup } from "./destructive-risk.js";
+import { isScopedTemporaryCleanup, isLowRiskCleanup } from "./destructive-risk.js";
 import { patternMatch, anyMatch, allMatch, functionalMatch, type Matcher, type MatchSpan } from "./rule-matches.js";
 import { credentialExposureSpans, possibleCredentialExposure } from "./credential-egress.js";
 
@@ -17,13 +17,62 @@ const secret = /(?:\.env(?:\b|[./])|\.ssh[\\/]|id_rsa|id_ed25519|\.aws[\\/]crede
 // rules also run on attacker-written text inside customer apps (App monitoring). Each line's
 // pipes are split once and scanned in order.
 const EXEC_AFTER_PIPE = /^\s*(?:sudo\s+)?(?:(?:ba|z|fi)?sh|python3?|node|ruby|perl|pwsh|powershell)\b/i;
+// "curl ... | python3 -c '...'" or "| node script.js" feeds the download to a program you already
+// have as plain input; only an interpreter that reads its PROGRAM from stdin (bash, sh -s,
+// python3 -, node -) runs what was downloaded.
+const wordsOf = (s: string) => s.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+const scriptArg = (t: string) => /^[A-Za-z0-9_.\/~$][\w.\/~${}@:+-]*$/.test(t);
+function execAfterPipe(segment: string): RegExpExecArray | null {
+  const m = EXEC_AFTER_PIPE.exec(segment); if (!m) return null;
+  const name = m[0].trim().split(/\s+/).pop()!.toLowerCase();
+  const rest = wordsOf(segment.slice(m[0].length));
+  if (/^(?:pwsh|powershell)$/.test(name)) return m;
+  for (const t of rest) {
+    if (/^(?:ba|z|fi)?sh$/.test(name)) {
+      if (t === "-s") return m;
+      if (/^-[a-z]*c[a-z]*$/i.test(t)) return null;
+      if (scriptArg(t) && !t.startsWith("-")) return null;
+      if (!t.startsWith("-")) return m;
+    } else if (/^python/.test(name)) {
+      if (t === "-") return m;
+      if (/^-[a-z]*[cm][a-z]*$/i.test(t) || (scriptArg(t) && !t.startsWith("-"))) return null;
+      if (!t.startsWith("-")) return m;
+    } else if (name === "node") {
+      if (t === "-") return m;
+      if (/^(?:-e|-p|-pe|--eval|--print)$/.test(t) || (scriptArg(t) && !t.startsWith("-"))) return null;
+      if (!t.startsWith("-")) return m;
+    } else {
+      if (/^-[a-z]*[eEr][a-z]*$/.test(t) || (scriptArg(t) && !t.startsWith("-"))) return null;
+      if (!t.startsWith("-")) return m;
+    }
+  }
+  return m;
+}
+// Split a line at single pipes (not `||`). A `|` inside quotes still counts -- it is a real pipe
+// when the quoted text is shell code (subprocess.run("curl ... | bash"), bash -c "...", ssh host
+// "...") -- except where the quote holds a regex for grep/sed/awk/etc., where `|` is alternation.
+const REGEX_CONTEXT = /(?:\b(?:e?grep|rg|ag|ack|sed|awk|gawk|pgrep|pkill|jq|rename)\b|\s-[eE]\s*|--regexp(?:=|\s+)|--include=|--exclude=|--glob[= ]|\s-g\s*)[^|]*$/;
+function splitPipes(line: string): string[] {
+  const parts: string[] = []; let quote = ""; let from = 0; let regexQuote = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === "\\" && quote !== "'") { i++; continue; }
+    if (quote) { if (c === quote) { quote = ""; regexQuote = false; continue; } if (!(c === "|" && !regexQuote)) continue; }
+    else if (c === "'" || c === '"') { quote = c; regexQuote = REGEX_CONTEXT.test(line.slice(from, i)); continue; }
+    if (c !== "|") continue;
+    if (line[i + 1] === "|") { i++; continue; }
+    parts.push(line.slice(from, i)); from = i + 1;
+  }
+  parts.push(line.slice(from));
+  return parts;
+}
 function pipesIntoShell(s: string, newArmer: () => (segment: string) => boolean): boolean {
   for (const line of s.split("\n")) {
     if (!line.includes("|")) continue;
     const arms = newArmer();
     let armed = false;
-    for (const [i, segment] of line.split("|").entries()) {
-      if (i > 0 && armed && EXEC_AFTER_PIPE.test(segment)) return true;
+    for (const [i, segment] of splitPipes(line).entries()) {
+      if (i > 0 && armed && execAfterPipe(segment)) return true;
       armed = arms(segment) || armed;
     }
   }
@@ -34,8 +83,8 @@ function pipelineMatcher(newArmer: () => (segment: string) => boolean): Matcher 
     const spans: MatchSpan[] = []; let offset = 0;
     for (const line of text.split("\n")) {
       const arms = newArmer(); let armedAt: number | undefined; let cursor = 0;
-      for (const segment of line.split("|")) {
-        const executed = EXEC_AFTER_PIPE.exec(segment);
+      for (const segment of splitPipes(line)) {
+        const executed = execAfterPipe(segment);
         if (armedAt !== undefined && executed) { spans.push({start: offset + armedAt, end: offset + cursor + executed[0].length, label: "Pipeline into an interpreter"}); break; }
         if (arms(segment)) armedAt = cursor;
         else armedAt = undefined;
@@ -80,12 +129,73 @@ function rmRecursiveForce(s: string): boolean { return recursiveDeleteSpans(s).l
 
 // Download-then-execute split across a command chain instead of a pipe: `curl -o x.sh ... && chmod
 // +x x.sh && ./x.sh`. One segment fetches, a later segment (joined by && or ;) runs what it fetched.
-const DOWNLOAD_THEN_EXEC = /\b(?:curl|wget)\b[^\n]{0,300}?(?:\s-[oO]\s|--output\b)[^\n]{0,300}?(?:&&|;)[^\n]{0,300}?(?:chmod\s+\+x|\.\/\S|(?:ba|z)?sh\b|python3?\b|node\b)/i;
+// "curl -o f URL && bash f": the file that was downloaded is the file that runs. A -o that belongs
+// to another program (grep -o), a download to /dev/null, or an unrelated later python3/node is not.
+function splitCommands(line: string): { text: string; start: number }[] {
+  const out: { text: string; start: number }[] = []; let from = 0;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === "\\") { i++; continue; }
+    const sep = c === ";" ? 1 : c === "&" && line[i + 1] === "&" ? 2 : 0;
+    if (!sep) continue;
+    out.push({ text: line.slice(from, i), start: from }); i += sep - 1; from = i + 1;
+  }
+  out.push({ text: line.slice(from), start: from });
+  return out;
+}
+// `sh -c "curl ... && bash f"` / `ssh host "..."`: look inside the quoted command.
+const unwrap = (segment: string) => segment.trim()
+  .replace(/^(?:sudo\s+)?(?:(?:ba|z|da)?sh\s+-[a-z]*c|ssh\s+(?:-\S+\s+)*\S+)\s+["']/, "")
+  .replace(/["')\s]+$/, "");
+const unquote = (t: string) => t.replace(/^(["'])(.*)\1$/, "$2");
+const baseName = (p: string) => p.replace(/[?#].*$/, "").split("/").filter(Boolean).pop() ?? "";
+function downloadedFile(segment: string): string | undefined {
+  if (splitPipes(segment).length > 1) return undefined;
+  const w = wordsOf(unwrap(segment)).map(unquote);
+  let at = 0; while (/^\w+=/.test(w[at] ?? "") || w[at] === "sudo") at++;
+  const tool = w[at]?.split("/").pop(); if (tool !== "curl" && tool !== "wget") return undefined;
+  const url = w.find(t => /^https?:\/\//i.test(t));
+  for (let i = at + 1; i < w.length; i++) {
+    const t = w[i];
+    let file: string | undefined;
+    if (t === "-o" || t === "--output" || (tool === "curl" && /^-[a-zA-Z]+o$/.test(t)) || (tool === "wget" && /^-[a-zA-Z]*O$/.test(t))) file = w[i + 1];
+    else if (/^--output=/.test(t)) file = t.slice(9);
+    else if (tool === "curl" && (/^-[a-zA-Z]*O$/.test(t) || t === "--remote-name")) file = url ? baseName(url) : undefined;
+    if (file !== undefined) return file === "-" || file === "/dev/null" ? undefined : file;
+  }
+  return tool === "wget" && url ? baseName(url) || undefined : undefined;
+}
+function runsFile(segment: string, files: string[]): boolean {
+  const w = wordsOf(unwrap(segment)).map(unquote);
+  let at = 0; while (/^\w+=/.test(w[at] ?? "") || w[at] === "sudo") at++;
+  const head = w[at]; if (!head) return false;
+  const isIt = (t: string | undefined) => !!t && files.some(f => t === f || t.endsWith("/" + f.replace(/^\.?\//, "")) || t === "./" + f);
+  if (head === "chmod") return w.slice(at + 1).some(isIt);
+  if (/^(?:(?:ba|z|fi|da)?sh|python[\d.]*|node|ruby|perl|php|source|\.)$/.test(head.split("/").pop()!)) return isIt(w.slice(at + 1).find(t => !t.startsWith("-")));
+  return (head.includes("/") || head.startsWith("./")) && isIt(head);
+}
+function downloadThenExecSpans(text: string): MatchSpan[] {
+  const spans: MatchSpan[] = []; let offset = 0;
+  for (const line of text.split("\n")) {
+    const files: string[] = []; let from = -1;
+    for (const seg of splitCommands(line)) {
+      const file = downloadedFile(seg.text);
+      if (file) { files.push(file); if (from < 0) from = seg.start; continue; }
+      if (files.length && runsFile(seg.text, files)) { spans.push({ start: offset + from, end: offset + seg.start + seg.text.length, label: "Downloaded file is run" }); break; }
+    }
+    offset += line.length + 1;
+  }
+  return spans;
+}
+const DOWNLOAD_THEN_EXEC = functionalMatch(text => downloadThenExecSpans(text).length > 0, downloadThenExecSpans);
 // PowerShell's `IEX (New-Object Net.WebClient).DownloadString(...)` / `iwr ... | iex`, the
 // single most common Windows download-and-run one-liner; and a Python process that fetches and
 // executes in the same call instead of piping to a shell.
 const POWERSHELL_DOWNLOAD_EXEC = /\bdownloadstring\s*\(|\b(?:iex|invoke-expression)\b[^\n]{0,300}?(?:iwr|invoke-webrequest|downloadstring)\b|\b(?:iwr|invoke-webrequest)\b[^\n]{0,300}?\|\s*(?:iex|invoke-expression)\b/i;
-const PYTHON_FETCH_EXEC = /\b(?:exec|eval)\s*\(\s*(?:compile\s*\(\s*)?(?:urllib\.request\.urlopen|urlopen|requests\.get|urlretrieve)\b/i;
+const PYTHON_FETCH_EXEC = /\b(?:exec|eval)\s*\(\s*(?:compile\s*\(\s*)?(?:[\w.]*\.)?(?:urlopen|urlretrieve)\b|\b(?:exec|eval)\s*\(\s*(?:compile\s*\(\s*)?(?:requests|httpx)\.(?:get|post)\b/i;
+// bash <(curl ...), sh -c "$(curl ...)", eval "$(curl ...)", source <(curl ...), . <(curl ...);
+// node fetch(...).then(r => r.text()).then(eval); deno run https://...
+const FETCH_AND_RUN = /(?:\b(?:(?:ba|z|fi|da|k)?sh|source|eval|python[\d.]*|node|ruby|perl|php)\b(?:\s+-[a-z]*c)?|(?:^|[;&|\s])\.)\s+["']?(?:<\(|\$\(|`)\s*(?:sudo\s+)?(?:curl|wget)\b|\bfetch\s*\([^\n]{0,400}?\)\s*\.then\s*\([^\n]{0,200}?text\(\)\s*\)\s*\.then\s*\(\s*(?:eval|new\s+Function)\b|\beval\s*\(\s*await\s+[^\n]{0,80}?fetch\b|\bdeno\s+(?:run|eval)\b[^\n]{0,200}?\bhttps?:\/\//i;
 
 // Disk, partition and filesystem-level wipes: destroy an entire volume rather than files inside
 // it, and are unrecoverable even with the deleted file still referenced elsewhere.
@@ -95,7 +205,7 @@ const FORK_BOMB = /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
 // Dropping an entire datastore instead of rows in it: Redis/Mongo have no SQL DROP/TRUNCATE syntax.
 const DATASTORE_WIPE = /\bFLUSHALL\b|\bFLUSHDB\b|db\.dropDatabase\s*\(\)/i;
 
-const otherDestructiveMatcher = anyMatch(patternMatch(/\bfind\b[^\n]{0,300}?-delete\b|\brsync\b[^\n]{0,300}?--delete\b|\bshred\b[^\n]{0,100}?-\w*u|\bshutil\.rmtree\s*\(|(?:\bfs\.)?\brm(?:dir)?Sync\s*\([^\n]{0,200}?recursive\s*:\s*true|\brd\s+\/s\s+\/q\b|\bRemove-Item\b[^\n]{0,1000}?(?:-Recurse|-Force)|\b(?:drop\s+(?:table|database)|truncate\s+(?:table\s+)?\w+)|\bgit\s+(?:reset\s+--hard|clean\s+-[^\n]{0,1000}?f)/i), patternMatch(DATASTORE_WIPE));
+const otherDestructiveMatcher = anyMatch(patternMatch(/\bfind\b[^\n]{0,300}?-delete\b|\brsync\b[^\n]{0,300}?--delete\b|\bshred\b[^\n]{0,100}?-\w*u|\bshutil\.rmtree\s*\(|(?:\bfs\.)?\brm(?:dir)?Sync\s*\([^\n]{0,200}?recursive\s*:\s*true|\brd\s+\/s\s+\/q\b|\bRemove-Item\b[^\n]{0,1000}?(?:-Recurse|-Force)|\b(?:drop\s+(?:table|database)|truncate\s+table\s+\w+)|(?:^|[;&|\n]\s*)(?:sudo\s+)?truncate\s+-s\s*0\b|(?:^|[;\n("'])\s*truncate\s+(?:only\s+)?\w+(?:\.\w+)?\s*(?:;|\bcascade\b|\brestart\b)|\bgit\s+(?:reset\s+--hard|clean\s+-[^\n]{0,1000}?f)/i), patternMatch(DATASTORE_WIPE));
 function otherDestructiveOperation(s: string): boolean { return otherDestructiveMatcher(s); }
 
 // A vault/secret-manager reference (op://, Azure Key Vault, HashiCorp Vault, Infisical, Doppler,
@@ -115,7 +225,7 @@ const PROD_TARGET = /\b(?:production|prod|prd)\b/i;
 const PROD_VERB = /\b(?:deploy|delete|drop|truncate|migrate|apply|destroy|restart|rollback|scale)\b/i;
 
 export const builtinRules: Rule[] = [
-  { id: "destructive.delete", title: "Destructive operation", severity: "high", category: "impact", explanation: "Recursive deletion or a destructive data operation. Scoped temporary test cleanup is MEDIUM; broad or uncertain targets remain HIGH. Review the target before allowing it.", match: anyMatch(functionalMatch(rmRecursiveForce, recursiveDeleteSpans), otherDestructiveMatcher), severityFor: s => !otherDestructiveOperation(s) && isScopedTemporaryCleanup(s) ? "medium" : "high" },
+  { id: "destructive.delete", title: "Destructive operation", severity: "high", category: "impact", explanation: "Recursive deletion or a destructive data operation. Scoped temporary test cleanup is MEDIUM; broad or uncertain targets remain HIGH. Review the target before allowing it.", match: anyMatch(functionalMatch(rmRecursiveForce, recursiveDeleteSpans), otherDestructiveMatcher), severityFor: s => otherDestructiveOperation(s) ? "high" : isLowRiskCleanup(s) ? "low" : isScopedTemporaryCleanup(s) ? "medium" : "high" },
   { id: "destructive.disk_wipe", title: "Disk or partition wipe", severity: "critical", category: "impact", explanation: "This targets an entire disk, partition or filesystem rather than individual files, and is unrecoverable. Confirm this is an authorized, intentional wipe.", match: patternMatch(DISK_WIPE) },
   { id: "destructive.fork_bomb", title: "Fork bomb", severity: "critical", category: "impact", explanation: "This pattern spawns processes exponentially and can make the machine unresponsive.", match: patternMatch(FORK_BOMB) },
   { id: "destructive.audit_trail", title: "Audit trail or recovery point erased", severity: "critical", category: "integrity", explanation: "This clears shadow copies, event logs or shell history. It is also the standard precursor to covering up a destructive or malicious action; confirm the reason before allowing it.", match: patternMatch(/\bvssadmin\b[^\n]{0,100}?delete\s+shadows|\bwevtutil\b[^\n]{0,50}?\bcl\b|\bClear-EventLog\b|\bhistory\s+-c\b|\bunset\s+HISTFILE\b|\bHISTSIZE\s*=\s*0\b|\bbcdedit\b[^\n]{0,50}?\/deletevalue/i) },
@@ -174,7 +284,7 @@ export const builtinRules: Rule[] = [
   { id: "mcp.write", title: "MCP write operation", severity: "high", category: "impact", explanation: "The MCP tool appears to modify data or send an external side effect. Require approval before allowing it.", match: patternMatch(/\bmcp(?:__|:)[^\s]*(?:create|update|delete|write|send|post|put|patch|execute|run|publish|deploy|remove|save|insert|add|grant|revoke|assign)\b/i) },
   { id: "credentials.egress", title: "Possible credential exposure", severity: "critical", category: "exfil", explanation: "A transfer command carries a sensitive payload, or sensitive output feeds an outbound command. This is a possible exposure, not proof of delivery; check the destination and authorization.", match: functionalMatch(possibleCredentialExposure, credentialExposureSpans) },
   { id: "secrets.unresolved_reference_launch", title: "Vault reference used directly instead of resolved", severity: "medium", category: "secrets", explanation: "This command includes a secret-manager reference (op://, Azure Key Vault, Vault, Infisical, Doppler, a GitHub Actions secrets expression, or a broker placeholder) typed in literally rather than resolved by its own CLI or platform. The agent cannot resolve it into the real value -- have a human or CI process start the real service instead, with its existing resolver already wired up.", match: patternMatch(UNRESOLVED_REFERENCE) },
-  { id: "execution.remote", title: "Remote code execution pattern", severity: "high", category: "exec", explanation: "Downloaded content is fetched and run without review: piped into a shell or interpreter, fetched and executed in one step, or downloaded and run as separate chained commands.", match: anyMatch(anyMatch(anyMatch(pipelineMatcher(downloads), patternMatch(DOWNLOAD_THEN_EXEC)), patternMatch(POWERSHELL_DOWNLOAD_EXEC)), patternMatch(PYTHON_FETCH_EXEC)) },
+  { id: "execution.remote", title: "Remote code execution pattern", severity: "high", category: "exec", explanation: "Downloaded content is fetched and run without review: piped into a shell or interpreter, fetched and executed in one step, or downloaded and run as separate chained commands.", match: anyMatch(anyMatch(anyMatch(anyMatch(pipelineMatcher(downloads), DOWNLOAD_THEN_EXEC), patternMatch(POWERSHELL_DOWNLOAD_EXEC)), patternMatch(PYTHON_FETCH_EXEC)), patternMatch(FETCH_AND_RUN)) },
   { id: "execution.obfuscated", title: "Encoded execution", severity: "high", category: "exec", explanation: "Encoded content is decoded for execution. Review the decoded payload separately; Beam never executes it.", match: anyMatch(pipelineMatcher(decodes), patternMatch(/\b(?:powershell|pwsh)\b[^\n]{0,500}?\s-(?:enc|encodedcommand)\b/i)) },
   { id: "recon.network_sweep", title: "Network sweep", severity: "medium", category: "recon", explanation: "A scanner targets a network range. Verify scope and authorization before the agent probes other systems (ATT&CK T1046).", match: allMatch(patternMatch(/\b(?:nmap|masscan|rustscan)\b/i), patternMatch(/(?:\d{1,3}\.){3}\d{1,3}\/\d{1,2}|(?:\d{1,3}\.){3}\d{1,3}-\d{1,3}/)) },
   { id: "privilege.elevation", title: "Elevated privileges", severity: "medium", category: "privilege", explanation: "The action requests elevated privileges or broad write permissions.", match: patternMatch(/\bsudo\s|\bdoas\s|(?:^|[\s;&|`(])su\s+(?:-\s*\w*|root)\b|\bpkexec\b|\brunas\s+\/user:|\bchmod\s+(?:-R\s+)?(?:777\b|[ugoa]*\+s\b|[2467][0-7]{3}\b)/i) },
@@ -185,7 +295,7 @@ export const builtinRules: Rule[] = [
     // "[Crontab Guru](https://crontab.guru/)" -- a markdown link to the validator site -- still
     // matched via its link *text* ("Crontab Guru"), not just the URL the first guard covers.
     match: patternMatch(/authorized_keys|\bcrontab\b(?!\.\w)(?!\s+Guru\b)|LaunchAgents[\\/]|ANTHROPIC_BASE_URL/i) },
-  { id: "network.reverse-shell", title: "Reverse shell pattern", severity: "critical", category: "exec", explanation: "This pattern can connect a command shell to another machine.", match: patternMatch(/\/dev\/tcp\/|\bnc\b[^\n]{0,300}?\s-e\s|socket[\s\S]{0,200}?subprocess|\bNew-Object\s+(?:System\.)?Net\.Sockets\.TCPClient\b|\bsocat\b[^\n]{0,300}?\bexec[:=]|\bsocket\([^\n]{0,150}?getprotobyname\(["']tcp["']\)[\s\S]{0,200}?\bconnect\(/i) },
+  { id: "network.reverse-shell", title: "Reverse shell pattern", severity: "critical", category: "exec", explanation: "This pattern can connect a command shell to another machine.", match: patternMatch(/\/dev\/tcp\/|\bnc\b[^\n]{0,300}?\s-e\s|\bsocket\b(?=[\s\S]{0,400}?\.connect\s*\()[\s\S]{0,400}?(?:subprocess|pty\.spawn|dup2|\/bin\/(?:ba)?sh)|\bNew-Object\s+(?:System\.)?Net\.Sockets\.TCPClient\b|\bsocat\b[^\n]{0,300}?\bexec[:=]|\bsocket\([^\n]{0,150}?getprotobyname\(["']tcp["']\)[\s\S]{0,200}?\bconnect\(/i) },
   { id: "instructions.override", title: "Instruction override attempt", severity: "high", category: "integrity", explanation: "Instructions attempt to override existing safeguards or conceal activity from the user. Checked against the same folded view used for prompt-injection monitoring (Unicode/width normalization and base64 decoding), not a literal-text match, so stylized or encoded phrasing is caught too.", match: functionalMatch(promptAttack.override) },
   { id: "source_control.history_rewrite", title: "Git history rewrite", severity: "medium", category: "source_control", explanation: "Force-pushing or rewriting shared history can silently discard other people's commits. Confirm the branch isn't shared before proceeding.", match: patternMatch(/\bgit\s+push\s+[^\n]{0,1000}?(?:--force(?:-with-lease)?|-f\b)|\bgit\s+filter-(?:branch|repo)\b/i) },
   { id: "integrity.tls_bypass", title: "Certificate or signature verification disabled", severity: "medium", category: "integrity", explanation: "Disabling TLS/certificate verification removes protection against a tampered or impersonated destination.", match: patternMatch(/\bcurl\b[^\n]{0,1000}?(?:-k\b|--insecure)|\bwget\b[^\n]{0,1000}?--no-check-certificate|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*['"]?0|\bgit\b[^\n]{0,1000}?-c\s+http\.sslVerify=false|\bverify\s*=\s*False\b|\brejectUnauthorized\s*:\s*false\b/i) },

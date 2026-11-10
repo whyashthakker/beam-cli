@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import { comboFindings, scanRisky } from "./skill-risk-rules.js";
-import { firstInstruction } from "./skill-context.js";
+import { isMention, firstInstruction } from "./skill-context.js";
 import { detect, redact, risk, scanText, severityRank, type Finding, type Severity } from "./core.js";
 
 // Prompt-injection rules for skill content only. Kept out of core.ts's builtinRules on purpose:
@@ -126,6 +126,15 @@ function narrowToLine(finding: Finding, content: string): Finding {
   return { ...finding, evidence: snippet(finding.evidence) };
 }
 
+// A core-rule finding whose every matched span is only being mentioned or quoted in the docs
+// ("flag any `curl | bash`", a blockquote, an example.com install line) is not an instruction.
+function onlyMentions(finding: Finding, content: string): boolean {
+  const spans = finding.indicators;
+  if (!spans?.length) return false;
+  const lines = content.split(/\r?\n/);
+  return spans.every(ind => ind.line === ind.endLine && isMention(lines[ind.line - 1] ?? "", ind.column - 1, ind.endColumn - ind.column, "command", { prev: lines[ind.line - 2], next: lines[ind.line] }));
+}
+
 // Scans every text file in a skill folder -- not just SKILL.md, since bundled scripts and
 // reference docs are loaded or executed by the agent too. Never executes anything.
 export async function scanSkillDir(dir: string, name: string): Promise<SkillScan> {
@@ -135,6 +144,16 @@ export async function scanSkillDir(dir: string, name: string): Promise<SkillScan
 // One markdown file on its own (a stray skills.md), without sweeping its whole parent folder.
 export async function scanSkillFile(file: string): Promise<SkillScan> {
   return scanPaths(join(file, ".."), basename(file), [file]);
+}
+
+/** The per-file skill pipeline: injection rules, risk rules, then the core rules (minus the ones a
+ * skill's own prose triggers and anything only mentioned). Exported so tools can re-judge one
+ * stored evidence line the same way a fresh scan would. */
+export function scanSkillContent(rel: string, content: string): Finding[] {
+  const findings = [...(FIXTURE_DIR.test(rel) ? [] : scanInjection(content)), ...scanRisky(content)];
+  try { for (const f of scanText(rel, content, "skill").findings) if (!SKIP_CORE_FOR_SKILLS.has(f.id) && !findings.some(x => x.id === f.id) && !onlyMentions(f, content)) findings.push(narrowToLine(f, content)); }
+  catch { /* over the scanText size cap; injection rules above still ran */ }
+  return findings;
 }
 
 async function scanPaths(dir: string, name: string, paths: string[]): Promise<SkillScan> {
@@ -148,9 +167,7 @@ async function scanPaths(dir: string, name: string, paths: string[]): Promise<Sk
     const content = await readFile(path, "utf8");
     if (!content.trim()) continue;
     hash.update(`${rel}\0${content}\0`);
-    const findings = [...(FIXTURE_DIR.test(rel) ? [] : scanInjection(content)), ...scanRisky(content)];
-    try { for (const f of scanText(rel, content, "skill").findings) if (!SKIP_CORE_FOR_SKILLS.has(f.id) && !findings.some(x => x.id === f.id)) findings.push(narrowToLine(f, content)); }
-    catch { /* over the scanText size cap; injection rules above still ran */ }
+    const findings = scanSkillContent(rel, content);
     files.push({ file: rel, findings });
   }
   const fileFindings = files.flatMap(f => f.findings.map(x => ({ ...x, file: f.file })));

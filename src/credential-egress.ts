@@ -198,6 +198,21 @@ function heredocDataRanges(text: string): {start:number;end:number}[] {
   }
   return hidden;
 }
+/** Heredoc bodies with the command line that opens them, so callers can tell data written to a
+ * file (cat/tee/git commit) from code handed to an interpreter (python3 -, node -, bash). */
+export function heredocBlocks(text: string): { start: number; end: number; header: string }[] {
+  const blocks: { start: number; end: number; header: string }[] = [];
+  const lines = text.split("\n"); let offset = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]; const doc = /<<(-)?\s*(?:'([^']+)'|"([^"]+)"|([\w]+))/.exec(line);
+    offset += line.length + 1;
+    if (!doc) continue;
+    const start = offset; const delimiter = doc[2] ?? doc[3] ?? doc[4];
+    while (++i < lines.length) { offset += lines[i].length + 1; if ((doc[1] ? lines[i].replace(/^\t+/, "") : lines[i]) === delimiter) break; }
+    blocks.push({ start, end: offset, header: line });
+  }
+  return blocks;
+}
 export function shellActionCommands(text: string) {
   const hidden = heredocDataRanges(text);
   return commands(text).filter(command => !hidden.some(range => command.start < range.end && command.end > range.start));

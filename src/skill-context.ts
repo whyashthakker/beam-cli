@@ -44,7 +44,11 @@ export function isMention(line: string, start: number, length: number, kind: "ph
   // A sentence often runs across a line break, so the neighbouring lines count as context too.
   const before = `${near.prev ? `${near.prev} ` : ""}${line.slice(0, start)}`.slice(-160);
   if (NEGATION.test(before.slice(-40))) return true;
-  if (kind === "command") return EXAMPLE_FRAMING.test(before) || DETECTION_FRAMING.test(before);
+  if (kind === "command") {
+    // A blockquote line, or a command aimed at a placeholder host (example.com), is documentation.
+    return EXAMPLE_FRAMING.test(before) || DETECTION_FRAMING.test(before) || /^\s*>/.test(line)
+      || /\b(?:example\.(?:com|org|net|invalid)|your-?(?:domain|site|host))\b/i.test(line.slice(start, end));
+  }
 
   // Injection phrases. A bare quote is not enough (`Always start with "ignore previous
   // instructions"` is still an order); it has to be framed as an example or reviewed, or refused
