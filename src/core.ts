@@ -1,6 +1,7 @@
 import { activityFor, activityType, commandOf, type Activity } from "./activity.js";
 import { hookKind } from "./hook-catalog.js";
 import { assessAccessFinding } from "./access-risk.js";
+import { explainFinding, type PlainExplanation } from "./plain-explain.js";
 import { executedText, patchTargetText, isSourceFilePath, withoutEditorScripts, withoutDataHeredocs, isStartupOrScriptPath } from "./secret-use.js";
 import { classifyActionContext, type ActionContext } from "./action-context.js";
 import { commandBehaviorRegex } from "./mitigation-pattern.js";
@@ -15,7 +16,7 @@ export type DetectionIndicator = {
   start: number; end: number; line: number; column: number; endLine: number; endColumn: number;
   coordinateSpace: "inspected-input"; truncated: boolean;
 };
-export type Finding = { id: string; title: string; severity: Severity; explanation: string; evidence: string; line?: number; category?: string; indicators?: DetectionIndicator[]; detector?: { name: "beam-cli"; version: string; schemaVersion: 1; evidenceStatus: "exact" | "unavailable" } };
+export type Finding = { id: string; title: string; severity: Severity; explanation: string; evidence: string; line?: number; category?: string; plain?: PlainExplanation; indicators?: DetectionIndicator[]; detector?: { name: "beam-cli"; version: string; schemaVersion: 1; evidenceStatus: "exact" | "unavailable" } };
 export type Event = {
   id: string; timestamp: string; receivedAt: string; agent: string; session: string; lines?: LineChanges; sessionTitle?: string; sessionTitleSource?: "prompt" | "agent"; turn?: { n: number; topic: string; shift: boolean };
   type: string; tool: string; summary: string; project: string; source: string;
@@ -108,7 +109,12 @@ export function detect(text: string, request?: {tool:string;input:Record<string,
         column: span.start - before.lastIndexOf("\n"), endLine: through.split("\n").length,
         endColumn: span.end - through.lastIndexOf("\n"), coordinateSpace: "inspected-input" };
     });
-    return [{ id: r.id, title: r.title, category: r.category, severity: calibrated?.severity ?? r.severityFor?.(text) ?? r.severity,
+    const severity=calibrated?.severity ?? r.severityFor?.(text) ?? r.severity;
+    // Plain-language narration of what the command did, for people who don't read shell. Only for
+    // real commands (not prose, skills or patches), and never allowed to break detection.
+    let plain: PlainExplanation | undefined;
+    if(request?.command&&!request.prose&&patchTargets===undefined){ try{ plain=explainFinding({ruleId:r.id,severity,command:request.command,context:access,safe:redact}); }catch{ plain=undefined; } }
+    return [{ id: r.id, title: r.title, category: r.category, severity, ...(plain?{plain}:{}),
       explanation: calibrated?.explanation ?? r.explanation, evidence: redact(text).slice(0, 600), indicators,
       detector: { name: "beam-cli", version: beamVersion(), schemaVersion: 1 as const, evidenceStatus: indicators.length ? "exact" as const : "unavailable" as const } }];
   });
