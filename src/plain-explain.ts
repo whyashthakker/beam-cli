@@ -30,6 +30,16 @@ const clip = (s: string, n = 140) => (s.length > n ? s.slice(0, n - 1) + "…" :
 // Pipe tails and plumbing: they shape output but are not an action worth narrating.
 const PLUMBING = new Set(["cut", "wc", "sort", "uniq", "tr", "awk", "xargs", "tee", "cd", "echo", "printf", "true", "false", "export", "set", "unset", "sleep", "clear", "pwd", "[", "[[", "test", "read", "exit", "wait", "alias", "time", "nohup"]);
 
+/** Last two path segments, no quotes -- the form used inside data fields. */
+export function shortPath(path: string, safe: (s: string) => string): string {
+  const clean = path.replace(/^["']|["']$/g, "");
+  if (/[$`]/.test(clean)) return "a file chosen by the command";
+  const parts = clean.replace(/\/+$/, "").split("/").filter(Boolean);
+  return safe(parts.length > 2 ? parts.slice(-2).join("/") : parts.join("/") || clean);
+}
+/** Quoted friendly name for reading in a sentence. */
+export const friendlyName = (path: string, safe: (s: string) => string): string => nice(path, safe);
+
 function nice(path: string, safe: (s: string) => string): string {
   const clean = path.replace(/^["']|["']$/g, "");
   if (/[$`]/.test(clean)) return "a file chosen by the command";

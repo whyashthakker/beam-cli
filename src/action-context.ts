@@ -1,6 +1,8 @@
 import { dirname, basename, isAbsolute, join, resolve } from "node:path";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { shellActionCommands } from "./credential-egress.js";
+import { readOriginRemote, registriesIn, type RepoRemote, type RegistryRef } from "./repo-remote.js";
+export type { RepoRemote, RegistryRef } from "./repo-remote.js";
 
 export type ActionOperation = "file-read" | "file-search" | "source-search" | "environment-lookup" | "environment-dump" | "file-write" | "delete" | "network-request" | "network-scan" | "git-change" | "mcp-call" | "command";
 export type ClassifiedAction = {
@@ -13,7 +15,9 @@ export type ClassifiedAction = {
 };
 export type ActionContext = {
   schemaVersion: 1; workingDirectory?: string;
-  repository?: { root: string; name: string; branch?: string; commit?: string };
+  repository?: { root: string; name: string; branch?: string; commit?: string; remote?: RepoRemote };
+  /** Container registries (AWS ECR, GHCR, Docker Hub, ...) the command pushes to or pulls from. */
+  registries?: RegistryRef[];
   actions: ClassifiedAction[]; truncated: boolean;
 };
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -36,7 +40,8 @@ function repositoryAt(cwd: string, safe: (s: string) => string): ActionContext["
       const common=smallFile(join(gitdir,"commondir"));
       const refRoot=common?resolve(gitdir,common):gitdir;
       const commit=ref?smallFile(join(refRoot,ref)):head;
-      return {root:safe(root),name:safe(basename(root)),branch:ref?safe(ref.slice(11)):undefined,commit:commit && /^[a-f0-9]{40,64}$/i.test(commit)?commit:undefined};
+      const remote=readOriginRemote(refRoot);
+      return {root:safe(root),name:safe(basename(root)),branch:ref?safe(ref.slice(11)):undefined,commit:commit && /^[a-f0-9]{40,64}$/i.test(commit)?commit:undefined,...(remote?{remote}:{})};
     }
     const parent=dirname(root);if(parent===root)break;root=parent;
   }
@@ -124,5 +129,6 @@ export function classifyActionContext(tool: string, input: Record<string,unknown
     if(cmd==="git"&&/^(?:push|reset|clean|filter-branch|filter-repo)$/.test(args[0]??"")){add({operation:"git-change",evidence:"shell-syntax",target:safe(args[0]),executable:cmd,privileged});continue;}
     if(!/^(?:echo|printf|ls|mkdir|true|head|wc)$/.test(cmd))add({operation:"command",evidence:"shell-syntax",executable:safe(cmd),privileged});
   }
-  return {schemaVersion:1,workingDirectory:cwd?safe(cwd):undefined,repository:includeRepository?repositoryAt(cwd,safe):undefined,actions,truncated:omitted};
+  const registries=command?registriesIn(command):[];
+  return {schemaVersion:1,workingDirectory:cwd?safe(cwd):undefined,repository:includeRepository?repositoryAt(cwd,safe):undefined,...(registries.length?{registries}:{}),actions,truncated:omitted};
 }

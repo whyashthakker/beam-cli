@@ -2,6 +2,7 @@ import { activityFor, activityType, commandOf, type Activity } from "./activity.
 import { hookKind } from "./hook-catalog.js";
 import { assessAccessFinding } from "./access-risk.js";
 import { explainFinding, type PlainExplanation } from "./plain-explain.js";
+import { buildFlow, type FlowInfo } from "./flow.js";
 import { executedText, patchTargetText, isSourceFilePath, withoutEditorScripts, withoutDataHeredocs, isStartupOrScriptPath } from "./secret-use.js";
 import { classifyActionContext, type ActionContext } from "./action-context.js";
 import { commandBehaviorRegex } from "./mitigation-pattern.js";
@@ -27,6 +28,7 @@ export type Event = {
   actionContext?: ActionContext;
   actionLog?: { text: string; truncated: boolean };
   mitigationCandidate?: { kind: "command"; pattern: string; version: 1 };
+  flow?: FlowInfo;
   policy_decision?: { action: string; rule?: string; reason?: string; risk_score?: number; risk_level?: string; risk_factors?: string[] };
   inputTokens?: number; outputTokens?: number; costUsd?: number;
 };
@@ -241,6 +243,16 @@ export function normalize(raw: Obj): Event {
     risk_level: ["LOW", "MEDIUM", "HIGH", "CRITICAL"].includes(str(decision.risk_level)) ? str(decision.risk_level) : undefined,
     risk_factors: Array.isArray(decision.risk_factors) ? decision.risk_factors.filter((v): v is string => typeof v === "string").slice(0, 15).map(clean) : undefined,
   } : undefined;
+  // One compact record per event so the dashboard can draw the session as a chain of steps.
+  const classified = command ? classifyActionContext(tool, input, str(raw.cwd ?? raw.project_path), command, clean) : undefined;
+  const flow = buildFlow({
+    type, tool, command, path, url, phase, policyAction: policyDecision?.action,
+    promptTopic: number(raw.turn) ? clean(str(raw.turn_topic)).slice(0, 100) || undefined : undefined,
+    toolResponse: raw.tool_response ?? raw.tool_result ?? raw.toolResult ?? raw.tool_output ?? raw.toolOutput,
+    toolUseId: toolUseId || undefined, turn: number(raw.turn) ? Math.floor(number(raw.turn) as number) : undefined,
+    mcp: mcpServer || explicitMcpTool ? { server: mcpServer || "unknown", tool: mcpTool || undefined } : undefined,
+    context: classified, safe: clean,
+  });
   return {
     id: createHash("sha256").update(
       stableId ? `${str(raw.source_agent)}:${str(obj(raw.endpoint).hostname)}:${stableId}`
@@ -260,7 +272,8 @@ export function normalize(raw: Obj): Event {
       tags: Array.isArray(raw.tags) ? raw.tags.filter((v): v is string => typeof v === "string").slice(0, 100).map(clean) : [],
       evidence: redact(JSON.stringify(raw.evidence_refs ?? raw.evidence ?? {})).slice(0, 8000) },
     ...(mcpServer || explicitMcpTool || explicitMcpResource ? { mcp: { server: clean(mcpServer || "unknown"), ...(mcpTool ? { tool: clean(mcpTool) } : {}), ...(explicitMcpResource ? { resource: clean(explicitMcpResource) } : {}), requestType: mcpRequestType } } : {}),
-    ...(findings.length ? { actionContext: classifyActionContext(tool, input, str(raw.cwd ?? raw.project_path), command, clean) } : {}),
+    ...(findings.length ? { actionContext: classified ?? classifyActionContext(tool, input, str(raw.cwd ?? raw.project_path), command, clean) } : {}),
+    ...(flow ? { flow } : {}),
     ...(findings.length ? { actionLog: { text: redact(detail).slice(0, 16000), truncated: redact(detail).length > 16000 } } : {}),
     ...(commandPattern ? { mitigationCandidate: { kind: "command" as const, pattern: commandPattern, version: 1 as const } } : {}),
     ...(type === "file.write" && changedLines(raw.tool_input ?? raw.input) ? { lines: changedLines(raw.tool_input ?? raw.input) } : {}),
