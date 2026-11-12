@@ -15,10 +15,11 @@ import { evaluate, readPolicy, type Decision } from "./policy.js";
 import { extractAgent } from "./extract.js";
 import { readIdentity, type Identity } from "./enroll.js";
 import { loadCustomRules } from "./custom-rules.js";
-import { detectSensitive, redactSensitive, type DataFinding } from "./data-detectors.js";
+import { configureDetectors, detectSensitive, redactSensitive, type DataFinding } from "./data-detectors.js";
+import { countNetwork, networkMode, TOPOLOGY_KINDS } from "./network-detectors.js";
 import { applyGitGate, gitGateMode } from "./git-gate.js";
 import { takeWrapperNotices } from "./wrapper-notice.js";
-import { recordEvent, takeTurnSummary, vaultScope, attachLedgerOutput, commandSendsOverNetwork, maskVaulted, promptFindings, recordSubstitution, redactAndVault, resolvePlaceholders, takeUnreportedLedger } from "./pii-vault.js";
+import { recordNetwork, recordEvent, takeTurnSummary, vaultScope, attachLedgerOutput, commandSendsOverNetwork, maskVaulted, promptFindings, recordSubstitution, redactAndVault, resolvePlaceholders, takeUnreportedLedger } from "./pii-vault.js";
 import { addNotice, flushNotices, resetNotices, summarizeFindings, withNotice } from "./hook-notice.js";
 import { redactWithSessionEntities } from "./entity-redaction.js";
 import { recordAndCheckAnomaly } from "./behavioral-anomaly.js";
@@ -517,6 +518,12 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
     sourceAgent = String(data.source_agent ?? sourceAgent);
     data.source_agent = sourceAgent;
     data.source_type = "hook";
+    // Network topology: how it is treated is a policy setting. Beam's own logs always omit it; the model
+    // only loses it in "redact"/"block" mode. Addresses are never put in a notice, only kinds and counts.
+    const startPolicy = await readPolicy().catch(() => null);
+    const netMode = networkMode(startPolicy?.rules.networkTopology, process.env.BEAM_NETWORK_TOPOLOGY);
+    configureDetectors({ skipKinds: netMode === "off" ? TOPOLOGY_KINDS : undefined });
+    const modelSkip = netMode === "redact" || netMode === "block" || netMode === "off" ? undefined : TOPOLOGY_KINDS;
 
     const eventKind = hookKind(String(data.hook_event_name ?? ""));
     const promptGate = eventKind === "prompt" && ["claude-code", "codex", "cursor", "gemini"].includes(sourceAgent);
@@ -533,8 +540,9 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
       }
       const promptPolicy = await readPolicy().catch(() => null);
       const promptMode = promptPolicy?.rules.piiPrompt ?? (["block", "warn", "off"].includes(process.env.BEAM_PII_PROMPT ?? "") ? process.env.BEAM_PII_PROMPT as "block" | "warn" | "off" : "block");
-      const found = promptMode === "off" ? { blocking: [], advisory: [] } : promptFindings(data.prompt, promptPolicy?.rules.customDetectors);
+      const found = promptMode === "off" ? { blocking: [], advisory: [] } : promptFindings(data.prompt, promptPolicy?.rules.customDetectors, netMode === "block");
       const promptSession = vaultScope(String(data.session_id ?? data.sessionId ?? ""));
+      if (netMode !== "off") await recordNetwork(promptSession, "your prompt", countNetwork(data.prompt)).catch(() => {});
       if (promptMode === "block" && promptGate && found.blocking.length && promptSession) {
         // The agent can't rewrite a typed prompt, so the only way the model never sees these values is
         // to stop the prompt: vault the real values and hand the user a placeholder version to resend.
@@ -568,20 +576,23 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
           const scope = vaultScope(String(data.session_id ?? ""));
           const resp = data.tool_response as Record<string, unknown> | string | undefined;
           const printed = typeof resp === "string" ? resp : typeof resp?.stdout === "string" ? resp.stdout : "";
-          if (toolUseId && printed) await attachLedgerOutput(scope, toolUseId, (await redactAndVault((await maskVaulted(printed, scope)).text, scope, bundle?.rules.customDetectors, undefined, true)).text.trim());
+          if (toolUseId && printed) await attachLedgerOutput(scope, toolUseId, (await redactAndVault((await maskVaulted(printed, scope)).text, scope, bundle?.rules.customDetectors, undefined, true, modelSkip)).text.trim());
         } catch { /* the summary just omits the output */ }
-        await emitRedactedOutput(sourceAgent, data.tool_response, vaultScope(String(data.session_id ?? "")), bundle?.rules.customDetectors)
+        if (netMode !== "off") await recordNetwork(vaultScope(String(data.session_id ?? "")), "tool output", countNetwork(JSON.stringify(data.tool_response ?? ""))).catch(() => {});
+        await emitRedactedOutput(sourceAgent, data.tool_response, vaultScope(String(data.session_id ?? "")), bundle?.rules.customDetectors, modelSkip)
           .catch(() => addNotice("could not check this tool's output for sensitive data; it may contain unredacted values."));
       }
       await captureActivity(data);
       if (String(data.hook_event_name ?? "").toLowerCase() === "stop") {
-        const turn = await takeTurnSummary(vaultScope(String(data.session_id ?? ""))).catch(() => ({ events: [], commands: [] }));
+        const turn = await takeTurnSummary(vaultScope(String(data.session_id ?? ""))).catch(() => ({ events: [] as string[], commands: [] as Array<{ command: string; ids: string[]; output?: string }>, network: {} as Record<string, Record<string, number>> }));
         const clip = (text: string, n: number) => text.length > n ? `${text.slice(0, n)}…` : text;
         const parts = [
           ...turn.events,
           ...turn.commands.map(r => `ran \`${clip(r.command, 100)}\` with ${r.ids.join(", ")} substituted${r.output ? ` → output: \`${clip(r.output, 120)}\`` : ""}`),
         ];
-        if (parts.length) addNotice(`this turn: ${parts.join(" · ")}. The model only saw placeholders.`);
+        const seen = Object.entries(turn.network).map(([source, counts]) => `${source}: ${Object.entries(counts).map(([kind, n]) => `${n}× ${kind}`).join(", ")}`);
+        if (seen.length) parts.push(`network addresses seen (${seen.join("; ")}) — ${netMode === "report" ? "reported only; internal addresses are kept out of Beam's logs, public IPs are not touched" : netMode === "redact" ? "internal addresses were replaced with placeholders; public IPs are not touched" : "internal addresses are blocked in prompts and replaced elsewhere; public IPs are not touched"}`);
+        if (parts.length) addNotice(`this turn: ${parts.join(" · ")}.${turn.events.length || turn.commands.length ? " The model only saw placeholders." : ""}`);
       }
       flushNotices(sourceAgent, String(data.hook_event_name ?? ""));
       if (sourceAgent === "cline") process.stdout.write(JSON.stringify({ cancel: false }));
@@ -708,6 +719,7 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
         }
       }
     } catch { addNotice("burst detection failed for this action, so it was not counted toward the anomaly check."); }
+    if (eventKind === "pre" && netMode !== "off") await recordNetwork(vaultScope(String(data.session_id ?? "")), "a command", countNetwork(command)).catch(() => {});
     // Git gate: scan what a `git commit` / `git push` / `git add` would commit, publish or stage.
     if (eventKind === "pre" && SHELL_TOOL.test(String(data.tool_name ?? ""))) {
       decision = applyGitGate(decision, {
@@ -1055,14 +1067,14 @@ function claudeStyleHookEventName(event: string): string {
 // Only wired for claude-code (see agents.ts notes): Codex's PostToolUse payload shape and
 // updatedToolOutput support are unverified, and sending a rewrite a client doesn't honor would
 // silently do nothing while looking like protection.
-async function emitRedactedOutput(agent: string, toolResponse: unknown, sessionId: string, customDetectors?: Array<{ name: string; pattern: string; replacement: string }>): Promise<void> {
+async function emitRedactedOutput(agent: string, toolResponse: unknown, sessionId: string, customDetectors?: Array<{ name: string; pattern: string; replacement: string }>, skipKinds?: ReadonlySet<string>): Promise<void> {
   if (agent !== "claude-code" || toolResponse === null || toolResponse === undefined) return;
   const outputFindings: DataFinding[] = []; const vaultedIds: string[] = [];
   const redactValue = async (value: unknown): Promise<unknown> => {
     if (typeof value === "string") {
       const masked = await maskVaulted(value, sessionId);
       for (const id of masked.ids) if (!vaultedIds.includes(id)) vaultedIds.push(id);
-      const result = await redactAndVault(masked.text, sessionId, customDetectors, undefined, true);
+      const result = await redactAndVault(masked.text, sessionId, customDetectors, undefined, true, skipKinds);
       outputFindings.push(...result.findings); return result.text;
     }
     if (Array.isArray(value)) return Promise.all(value.map(redactValue));

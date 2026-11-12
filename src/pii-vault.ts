@@ -16,11 +16,12 @@ import { dirname, join } from "node:path";
 import { getDataDirectory } from "./config.js";
 import { detectSensitive, type CustomDetector, type DataFinding } from "./data-detectors.js";
 import { redactWithSessionEntities } from "./entity-redaction.js";
+import { TOPOLOGY_KINDS } from "./network-detectors.js";
 import { withFileLock } from "./file-lock.js";
 
 interface VaultValue { kind: string; enc: string }
 interface LedgerEntry { at: string; tool: string; command: string; ids: string[]; toolUseId?: string; output?: string }
-interface SessionVault { updatedAt: string; values: Record<string, VaultValue>; ledger: LedgerEntry[]; reported: number; events?: string[]; reportedEvents?: number }
+interface SessionVault { updatedAt: string; values: Record<string, VaultValue>; ledger: LedgerEntry[]; reported: number; events?: string[]; reportedEvents?: number; network?: Record<string, Record<string, number>> }
 type VaultFile = Record<string, SessionVault>;
 
 const TTL_MS = 24 * 60 * 60 * 1000;
@@ -88,8 +89,8 @@ const session = (file: VaultFile, id: string, now: string): SessionVault => (fil
  * Redacts `text` with session-numbered placeholders (same ids entity-redaction assigns) AND stores
  * each real value encrypted so a later command can use the placeholder.
  */
-export async function redactAndVault(text: string, sessionId: string, custom: CustomDetector[] = [], home = getDataDirectory(), onlyBlockingKinds = false): Promise<{ text: string; findings: DataFinding[] }> {
-  const redacted = await redactWithSessionEntities(text, sessionId, custom, home);
+export async function redactAndVault(text: string, sessionId: string, custom: CustomDetector[] = [], home = getDataDirectory(), onlyBlockingKinds = false, skipKinds?: ReadonlySet<string>): Promise<{ text: string; findings: DataFinding[] }> {
+  const redacted = await redactWithSessionEntities(text, sessionId, custom, home, skipKinds);
   if (!redacted.findings.length || !sessionId) return redacted;
   const key = await loadKey(home);
   // Tool output is full of phone-shaped numbers (timestamps, ids). Redact them all, but only vault the
@@ -169,16 +170,27 @@ export async function recordEvent(sessionId: string, text: string, home = getDat
   await mutate(home, (file, now) => { const s = session(file, sessionId, now); s.updatedAt = now; (s.events ??= []).push(text.slice(0, 300)); });
 }
 
+/** Counts of network addresses seen this turn, by where (your prompt / a command / tool output) and kind. Never the addresses. */
+export async function recordNetwork(sessionId: string, source: string, counts: Record<string, number>, home = getDataDirectory()): Promise<void> {
+  if (!sessionId || !Object.keys(counts).length) return;
+  await mutate(home, (file, now) => {
+    const s = session(file, sessionId, now); s.updatedAt = now;
+    const bucket = ((s.network ??= {})[source] ??= {});
+    for (const [kind, n] of Object.entries(counts)) bucket[kind] = (bucket[kind] ?? 0) + n;
+  });
+}
+
 /** Everything Beam did since the last end-of-turn report; marks it reported. */
-export async function takeTurnSummary(sessionId: string, home = getDataDirectory()): Promise<{ events: string[]; commands: LedgerEntry[] }> {
-  if (!sessionId) return { events: [], commands: [] };
+export async function takeTurnSummary(sessionId: string, home = getDataDirectory()): Promise<{ events: string[]; commands: LedgerEntry[]; network: Record<string, Record<string, number>> }> {
+  if (!sessionId) return { events: [], commands: [], network: {} };
   return mutate(home, (file) => {
     const s = file[sessionId];
-    if (!s) return { events: [], commands: [] };
+    if (!s) return { events: [], commands: [], network: {} };
+    const network = s.network ?? {}; s.network = {};
     const events = (s.events ?? []).slice(s.reportedEvents ?? 0);
     const commands = s.ledger.slice(s.reported);
     s.reportedEvents = (s.events ?? []).length; s.reported = s.ledger.length;
-    return { events, commands };
+    return { events, commands, network };
   });
 }
 
@@ -196,9 +208,11 @@ export async function takeUnreportedLedger(sessionId: string, home = getDataDire
 
 /** Findings worth blocking a prompt over (high-confidence identity, financial and credential data). */
 const BLOCKING_KINDS = new Set(["SSN", "CREDIT_CARD", "IBAN", "NATIONAL_ID", "PASSPORT", "DRIVER_LICENSE", "DOB", "MRN", "HEALTH_PLAN_ID", "MEDICAL_ID", "PHI", "SECRET", "API_KEY", "PASSWORD", "PRIVATE_KEY"]);
-export function promptFindings(text: string, custom: CustomDetector[] = []): { blocking: DataFinding[]; advisory: DataFinding[] } {
+export function promptFindings(text: string, custom: CustomDetector[] = [], topologyBlocking = false): { blocking: DataFinding[]; advisory: DataFinding[] } {
   const all = detectSensitive(text, custom);
-  return { blocking: all.filter(f => BLOCKING_KINDS.has(f.kind) || f.kind === "CUSTOM"), advisory: all.filter(f => !BLOCKING_KINDS.has(f.kind) && f.kind !== "CUSTOM") };
+  // Network topology is report-only unless the policy says to block/redact it.
+  const blocks = (kind: string) => BLOCKING_KINDS.has(kind) || kind === "CUSTOM" || (topologyBlocking && TOPOLOGY_KINDS.has(kind));
+  return { blocking: all.filter(f => blocks(f.kind)), advisory: all.filter(f => !blocks(f.kind)) };
 }
 
 // A shell command that sends data over the network, so substituting a real value into it is a

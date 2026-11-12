@@ -1,6 +1,7 @@
 import { NATIONAL_ID_DETECTORS } from "./pii-validators.js";
 import { PHI_DETECTORS } from "./phi-detectors.js";
-export type DetectorKind = "EMAIL" | "PHONE" | "SSN" | "CREDIT_CARD" | "IBAN" | "NATIONAL_ID" | "PASSPORT" | "DRIVER_LICENSE" | "MRN" | "HEALTH_PLAN_ID" | "MEDICAL_ID" | "PHI" | "ADDRESS" | "DOB" | "SECRET" | "API_KEY" | "PASSWORD" | "PRIVATE_KEY" | "CUSTOM";
+import { NETWORK_DETECTORS } from "./network-detectors.js";
+export type DetectorKind = "EMAIL" | "PHONE" | "SSN" | "CREDIT_CARD" | "IBAN" | "NATIONAL_ID" | "PASSPORT" | "DRIVER_LICENSE" | "MRN" | "HEALTH_PLAN_ID" | "MEDICAL_ID" | "PHI" | "INTERNAL_IP" | "INTERNAL_HOST" | "NETWORK_RANGE" | "ADDRESS" | "DOB" | "SECRET" | "API_KEY" | "PASSWORD" | "PRIVATE_KEY" | "CUSTOM";
 export interface DataFinding { kind: DetectorKind; confidence: number; start: number; end: number; replacement: string }
 
 // Checksum validators keep the PII detectors from flagging arbitrary digit strings (build ids,
@@ -67,6 +68,7 @@ const detectors: Array<{ kind: DetectorKind; pattern: RegExp; replacement: strin
   { kind: "DOB", pattern: /\b(?:dob|date[ _-]?of[ _-]?birth|birth[ _-]?date|born(?: on)?)\s*[:=]?\s*["']?(?:\d{4}-\d{2}-\d{2}|\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4})/gi, replacement: "[DOB_REDACTED]" },
   ...NATIONAL_ID_DETECTORS,
   ...PHI_DETECTORS,
+  ...NETWORK_DETECTORS,
   // Phone numbers need real structure. The previous pattern joined ANY run of 9-15 digits across spaces,
   // dots and dashes, so whisper timestamps ("12.34 15.67 0.12"), dates, ids and lists of numbers were all
   // redacted as phones. Each format below is anchored (no adjacent word/dot/dash characters) and checked.
@@ -108,7 +110,12 @@ const CREDENTIAL_REFERENCE = /^(?:op:\/\/|@Microsoft\.KeyVault\(|vault:|infisica
 const isReference = (value: string) => CREDENTIAL_REFERENCE.test(value.trim());
 
 export interface CustomDetector { name: string; pattern: string; replacement: string }
-export function detectSensitive(text: string, custom: CustomDetector[] = []): DataFinding[] {
+// Kinds the current process never reports (e.g. network topology when the policy sets it to "off").
+let defaultSkipKinds: ReadonlySet<string> = new Set();
+export function configureDetectors(options: { skipKinds?: ReadonlySet<string> }): void { defaultSkipKinds = options.skipKinds ?? new Set(); }
+
+export interface DetectOptions { /** Kinds to leave out of this call, e.g. topology in model-facing text under "report" mode. */ skipKinds?: ReadonlySet<string> }
+export function detectSensitive(text: string, custom: CustomDetector[] = [], options: DetectOptions = {}): DataFinding[] {
   const findings: DataFinding[] = [];
   for (const detector of detectors) {
     detector.pattern.lastIndex = 0;
@@ -143,6 +150,8 @@ export function detectSensitive(text: string, custom: CustomDetector[] = []): Da
   // (array order above: PRIVATE_KEY/API_KEY's precise format match wins over SECRET/PASSWORD's
   // generic keyword match), via a stable sort by start -- ties keep their original push order --
   // then a left-to-right sweep that drops anything starting before the last kept finding's end.
+  const skip = (kind: string) => defaultSkipKinds.has(kind) || (options.skipKinds?.has(kind) ?? false);
+  for (let i = findings.length - 1; i >= 0; i--) if (skip(findings[i]!.kind)) findings.splice(i, 1);
   const nonOverlapping: DataFinding[] = [];
   let lastEnd = -1;
   for (const finding of [...findings].sort((a, b) => a.start - b.start)) {
@@ -153,8 +162,8 @@ export function detectSensitive(text: string, custom: CustomDetector[] = []): Da
   return nonOverlapping.sort((a, b) => b.start - a.start);
 }
 
-export function redactSensitive(text: string, custom: CustomDetector[] = []): { text: string; findings: DataFinding[] } {
-  const findings = detectSensitive(text, custom); let result = text;
+export function redactSensitive(text: string, custom: CustomDetector[] = [], options: DetectOptions = {}): { text: string; findings: DataFinding[] } {
+  const findings = detectSensitive(text, custom, options); let result = text;
   for (const finding of findings) result = result.slice(0, finding.start) + finding.replacement + result.slice(finding.end);
   return { text: result, findings };
 }

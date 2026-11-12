@@ -11,6 +11,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { InputGuard, type Inspect } from "./input-guard.js";
 import { promptFindings, redactAndVault, vaultScope } from "./pii-vault.js";
+import { networkMode } from "./network-detectors.js";
 import { summarizeFindings } from "./hook-notice.js";
 import { readPolicy } from "./policy.js";
 import { addWrapperNotice } from "./wrapper-notice.js";
@@ -77,11 +78,12 @@ export async function runClaudeWrapper(args: string[]): Promise<number> {
   const mode = policy?.rules.piiPrompt ?? (process.env.BEAM_PII_PROMPT === "warn" || process.env.BEAM_PII_PROMPT === "off" ? process.env.BEAM_PII_PROMPT : "block");
   if (mode !== "block") return runDirect(args);
 
+  const netMode = networkMode(policy?.rules.networkTopology, process.env.BEAM_NETWORK_TOPOLOGY);
   const wrapperId = randomBytes(6).toString("hex");
   const scope = vaultScope("", { BEAM_WRAPPER_ID: wrapperId });
   const custom = policy?.rules.customDetectors;
   const inspect: Inspect = async (text) => {
-    const found = promptFindings(text, custom);
+    const found = promptFindings(text, custom, netMode === "redact" || netMode === "block");
     if (!found.blocking.length) return null;
     const redacted = await redactAndVault(text, scope, custom);
     const summary = summarizeFindings(found.blocking);

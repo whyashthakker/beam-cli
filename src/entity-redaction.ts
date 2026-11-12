@@ -51,9 +51,9 @@ function hashValue(value: string): string {
  * `home` is the beam data directory (injectable for tests); defaults to the real one.
  */
 export async function redactWithSessionEntities(
-  text: string, sessionId: string, custom: CustomDetector[] = [], home = getDataDirectory(),
+  text: string, sessionId: string, custom: CustomDetector[] = [], home = getDataDirectory(), skipKinds?: ReadonlySet<string>,
 ): Promise<{ text: string; findings: DataFinding[] }> {
-  const findings = detectSensitive(text, custom);
+  const findings = detectSensitive(text, custom, { skipKinds });
   if (findings.length === 0) return { text, findings: [] };
 
   // Locked end-to-end so concurrent tool calls in the same turn -- each spawning its own

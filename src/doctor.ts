@@ -12,6 +12,7 @@ import { getDataDirectory } from "./config.js";
 import { detectSensitive } from "./data-detectors.js";
 import { readPolicy } from "./policy.js";
 import { gitGateMode } from "./git-gate.js";
+import { networkMode } from "./network-detectors.js";
 import { isPrivatePath } from "./secret-use.js";
 
 export type Status = "pass" | "warn" | "fail" | "skip";
@@ -51,13 +52,17 @@ async function policyEnforcement(): Promise<Check[]> {
   const piiCheck: Check = pii === "block"
     ? { id: "pii-prompt", policy: "4.2", title: "Sensitive data in prompts", status: "pass", detail: "Prompts with cards, IDs, PHI or credentials are blocked and vaulted (rewritten automatically under `beam claude`)." }
     : { id: "pii-prompt", policy: "4.2", title: "Sensitive data in prompts", status: pii === "off" ? "fail" : "warn", detail: `piiPrompt is "${pii}": sensitive prompt content reaches the model.`, fix: "Remove `piiPrompt` from policy.json (default is block)." };
+  const net = networkMode(rules?.networkTopology, process.env.BEAM_NETWORK_TOPOLOGY);
+  const netCheck: Check = net === "off"
+    ? { id: "network-topology", policy: "4.2", title: "Network topology protection", status: "warn", detail: "Off: private IPs, CIDR ranges and internal hostnames are not detected.", fix: "Remove `networkTopology: \"off\"` from policy.json." }
+    : { id: "network-topology", policy: "4.2", title: "Network topology protection", status: "pass", detail: net === "report" ? "Report-only: topology is kept out of Beam's logs and summarised each turn; the model still sees it. Public IPs are never touched." : net === "redact" ? "Redact: internal addresses are replaced in prompts (under `beam claude`) and tool output." : "Block: prompts containing internal addresses are blocked; topology is redacted elsewhere." };
   const gate = gitGateMode(rules?.gitGate, process.env.BEAM_GIT_GATE, modeName);
   const gateCheck: Check = gate === "off"
     ? { id: "git-gate", policy: "4.3", title: "Git commit/push gate", status: "fail", detail: "Git gate is off.", fix: "Remove `gitGate: \"off\"` from policy.json." }
     : gate === "warn"
       ? { id: "git-gate", policy: "4.3", title: "Git commit/push gate", status: "warn", detail: "Git gate only warns.", fix: "Set `gitGate` to \"ask\" or \"block\"." }
       : { id: "git-gate", policy: "4.3", title: "Git commit/push gate", status: "pass", detail: `Git gate will ${gate} when a commit, push or add contains sensitive data.` };
-  return [enforcing, piiCheck, gateCheck];
+  return [enforcing, piiCheck, netCheck, gateCheck];
 }
 
 function vaultProtected(ctx: DoctorContext): Check {
