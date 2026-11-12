@@ -189,3 +189,14 @@ describe("data detectors", () => {
     });
   });
 });
+
+describe("API key detector false positives", () => {
+  const kinds = (t: string) => detectSensitive(t).map(f => f.kind);
+  it("does not treat sk- inside a hyphenated word as an OpenAI key", () => {
+    expect(kinds("// /blog/samsung-sk-hynix-memory-prices is not an OpenAI key.")).not.toContain("API_KEY");
+  });
+  it("still detects real sk- keys", () => {
+    expect(kinds("key = sk-" + "proj-abcdefghijklmnop1234")).toContain("API_KEY");
+    expect(kinds("sk-" + "ant-api03-abcdefghijklmnop1234")).toContain("API_KEY");
+  });
+});

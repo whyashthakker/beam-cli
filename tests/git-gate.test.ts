@@ -21,10 +21,11 @@ beforeEach(async () => {
   repo = await fs.mkdtemp(path.join(os.tmpdir(), "beam-git-")); dirs.push(repo);
   git(repo, "init", "-q"); git(repo, "config", "commit.gpgsign", "false");
   await write("README.md", "hello\n"); git(repo, "add", "."); git(repo, "commit", "-qm", "init");
+  process.env.BEAM_AUTO_PRECOMMIT = "0"; // these tests assert exact hook output; auto-install has its own test
   process.env.BEAM_DATA_DIR = await fs.mkdtemp(path.join(os.tmpdir(), "beam-data-")); dirs.push(process.env.BEAM_DATA_DIR);
   resetNotices();
 });
-afterEach(async () => { delete process.env.BEAM_GIT_GATE; await Promise.all(dirs.splice(0).map(d => fs.rm(d, { recursive: true, force: true }))); });
+afterEach(async () => { delete process.env.BEAM_GIT_GATE; delete process.env.BEAM_AUTO_PRECOMMIT; await Promise.all(dirs.splice(0).map(d => fs.rm(d, { recursive: true, force: true }))); });
 
 describe("parseGitCommands", () => {
   it("finds commit, push and add, through chains, -C and global options", () => {

@@ -27,7 +27,9 @@ if (typeof globalThis.gc !== "function") {
 const heapMb = () => { globalThis.gc(); globalThis.gc(); return process.memoryUsage().heapUsed / 1e6; };
 const clock = () => performance.now();
 const round = (n, d = 1) => Math.round(n * 10 ** d) / 10 ** d;
-const TOKEN = "beam_app_stresstest_abcdefghijklmnopqrstuvwxyz0123456789";
+// Dummy value for the stress run (talks only to *.stress.test hosts); override with STRESS_TOKEN. Built from
+// parts so no real-looking key sits in the source.
+const TOKEN = process.env.STRESS_TOKEN ?? ["beam", "app", "stress", "fixture", "token", "not", "a", "real", "key"].join("_");
 const tick = () => new Promise(r => setTimeout(r, 0));
 const checks = [];
 const check = (id, title, passed, summary, measured, limit) => {
