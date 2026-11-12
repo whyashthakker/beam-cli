@@ -179,4 +179,13 @@ describe("data detectors", () => {
       expect(detectSensitive(line)).toEqual([]);
     });
   });
+
+  describe("sk- API key precision", () => {
+    it("still redacts real OpenAI-style, project and Anthropic keys", () => {
+      for (const key of ["sk-Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC2eF4hJ6kL8", "sk-proj-Ab3dE5gH7jK9", "sk-ant-api03-Ab3dE5gH7jK9mN1p"]) expect(redactSensitive(`key ${key}`).text).toBe("key [API_KEY_REDACTED]");
+    });
+    it("leaves hyphenated URL slugs and words alone", () => {
+      for (const line of ["/blog/sk-hynix-hbm-memory-roadmap", "see sk-learn-pipelines-guide", "task-queue-processing-worker"]) expect(redactSensitive(line).text).toBe(line);
+    });
+  });
 });

@@ -4,6 +4,7 @@ import path from "node:path";
 import { Command } from "commander";
 import { startServer } from "./serve.js";
 import { runClaudeWrapper } from "./claude-wrapper.js";
+import { defaultContext, doctorExitCode, formatDoctor, runDoctor } from "./doctor.js";
 import { askApproval, captureHook, extractPreview, extractSave, importEvents, listPendingApprovals, readToken, reloadRemoteRules, resolveApproval, scanFile } from "./client.js";
 import { supportsExtraction } from "./extract.js";
 import { AGENTS } from "./agents.js";
@@ -809,6 +810,16 @@ program.command("claude")
   .action(async () => {
     const at = process.argv.indexOf("claude");
     process.exitCode = await runClaudeWrapper(process.argv.slice(at + 1));
+  });
+
+program.command("doctor")
+  .description("Check this machine and repository against the Claude Code Secure Usage Policy (read-only)")
+  .option("--json", "print the checks as JSON")
+  .option("--cwd <dir>", "repository to check (default: current directory)")
+  .action(async (options: { json?: boolean; cwd?: string }) => {
+    const checks = await runDoctor(defaultContext(options.cwd ? path.resolve(options.cwd) : process.cwd()));
+    console.log(options.json ? JSON.stringify(checks, null, 2) : formatDoctor(checks));
+    process.exitCode = doctorExitCode(checks);
   });
 
 const agent = program.command("agent").description("Discover and configure supported AI agents");

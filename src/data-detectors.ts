@@ -53,7 +53,10 @@ function validNanp(raw: string): boolean {
 
 const detectors: Array<{ kind: DetectorKind; pattern: RegExp; replacement: string; validate?: (match: string) => boolean }> = [
   { kind: "PRIVATE_KEY", pattern: /-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-]*PRIVATE KEY-----|$)/g, replacement: "[PRIVATE_KEY_REDACTED]" },
-  { kind: "API_KEY", pattern: /\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|beam_app_[\w-]{20,})\b/g, replacement: "[API_KEY_REDACTED]" },
+  { kind: "API_KEY", pattern: /\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16}|xox[baprs]-[\w-]{10,}|beam_app_[\w-]{20,})\b/g, replacement: "[API_KEY_REDACTED]",
+    // A bare `sk-` key is long and random; a hyphenated URL slug like "sk-some-article-title" is not. Anthropic
+    // (`sk-ant-`) and project (`sk-proj-`) keys keep their precise prefix match.
+    validate: m => !/^sk-(?!ant-|proj-)/.test(m) || /\d/.test(m) },
   { kind: "EMAIL", pattern: /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, replacement: "[EMAIL_REDACTED]" },
   { kind: "SSN", pattern: /(?<![\w-])\d{3}([- ])\d{2}\1\d{4}(?![\w-])/g, replacement: "[SSN_REDACTED]", validate: validSsn },
   { kind: "CREDIT_CARD", pattern: /(?<![\w-])\d{4}(?:[ -]?\d{4}){2}[ -]?\d{1,7}(?![\w-])|(?<![\w-])3[47]\d{2}[ -]?\d{6}[ -]?\d{5}(?![\w-])/g, replacement: "[CREDIT_CARD_REDACTED]", validate: validCard },

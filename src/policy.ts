@@ -16,7 +16,7 @@ export interface PolicyRule { id: string; title?: string; action: PolicyAction; 
 // `agent` scopes the pause to just that agent (case-insensitive, e.g. "codex") -- other
 // agents keep detecting it normally.
 export interface IgnoredRule { ruleId: string; agent?: string }
-export interface PolicyRules { mode: PolicyMode; blockedTools: string[]; blockedCommandPatterns: string[]; disabledAgents: string[]; rules?: PolicyRule[]; risk?: { askAt?: number; blockAt?: number }; customDetectors?: CustomDetector[]; ignoredRules?: (string | IgnoredRule)[]; piiPrompt?: "block" | "warn" | "off" }
+export interface PolicyRules { mode: PolicyMode; blockedTools: string[]; blockedCommandPatterns: string[]; disabledAgents: string[]; rules?: PolicyRule[]; risk?: { askAt?: number; blockAt?: number }; customDetectors?: CustomDetector[]; ignoredRules?: (string | IgnoredRule)[]; piiPrompt?: "block" | "warn" | "off"; gitGate?: "ask" | "block" | "warn" | "off"; gitGateIgnore?: string[]; approvedExtensions?: string[] }
 export interface PolicyBundle { version: number; rules: PolicyRules; notAfter: string | null; errors?: string[] }
 const EMPTY: PolicyRules = { mode: "observe", blockedTools: [], blockedCommandPatterns: [], disabledAgents: [], rules: [], customDetectors: [], ignoredRules: [] };
 export function policyPath(): string { return join(getDataDirectory(), "policy.json"); }
@@ -45,6 +45,9 @@ export async function readPolicy(): Promise<PolicyBundle | null> {
     if (!parsed.rules || typeof parsed.rules !== "object") throw new Error("missing rules");
     const errors: string[] = []; const source = parsed.rules as Partial<PolicyRules>;
     if (source.customDetectors !== undefined && (!Array.isArray(source.customDetectors) || source.customDetectors.some(d => !d || typeof d.name !== "string" || typeof d.pattern !== "string" || typeof d.replacement !== "string"))) errors.push("customDetectors must contain name, pattern, and replacement strings");
+    if (source.gitGate !== undefined && !["ask", "block", "warn", "off"].includes(source.gitGate)) errors.push("gitGate must be ask, block, warn, or off");
+    if (source.approvedExtensions !== undefined && (!Array.isArray(source.approvedExtensions) || source.approvedExtensions.some(p => typeof p !== "string"))) errors.push("approvedExtensions must be an array of extension ids");
+    if (source.gitGateIgnore !== undefined && (!Array.isArray(source.gitGateIgnore) || source.gitGateIgnore.some(p => typeof p !== "string"))) errors.push("gitGateIgnore must be an array of regex strings");
     if (source.piiPrompt !== undefined && !["block", "warn", "off"].includes(source.piiPrompt)) errors.push("piiPrompt must be block, warn, or off");
     if (source.ignoredRules !== undefined && (!Array.isArray(source.ignoredRules) || source.ignoredRules.some(e => {
       if (typeof e === "string") return !e.trim();

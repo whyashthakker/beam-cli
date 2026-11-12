@@ -16,6 +16,7 @@ import { extractAgent } from "./extract.js";
 import { readIdentity, type Identity } from "./enroll.js";
 import { loadCustomRules } from "./custom-rules.js";
 import { detectSensitive, redactSensitive, type DataFinding } from "./data-detectors.js";
+import { applyGitGate, gitGateMode } from "./git-gate.js";
 import { takeWrapperNotices } from "./wrapper-notice.js";
 import { recordEvent, takeTurnSummary, vaultScope, attachLedgerOutput, commandSendsOverNetwork, maskVaulted, promptFindings, recordSubstitution, redactAndVault, resolvePlaceholders, takeUnreportedLedger } from "./pii-vault.js";
 import { addNotice, flushNotices, resetNotices, summarizeFindings, withNotice } from "./hook-notice.js";
@@ -707,6 +708,16 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
         }
       }
     } catch { addNotice("burst detection failed for this action, so it was not counted toward the anomaly check."); }
+    // Git gate: scan what a `git commit` / `git push` / `git add` would commit, publish or stage.
+    if (eventKind === "pre" && SHELL_TOOL.test(String(data.tool_name ?? ""))) {
+      decision = applyGitGate(decision, {
+        command: evalCommand,
+        cwd: typeof toolInput.workdir === "string" ? toolInput.workdir : String(data.cwd ?? ""),
+        mode: gitGateMode(policyBundle?.rules.gitGate, process.env.BEAM_GIT_GATE, decision.mode),
+        custom: policyBundle?.rules.customDetectors,
+        ignore: policyBundle?.rules.gitGateIgnore,
+      });
+    }
     const policyMode = decision.mode;
     if (decision.action === "allow" && workspace) {
       const escaping = outsideWorkspacePaths(workspace, targetPath, command);
