@@ -77,6 +77,15 @@ describe("governance chain through the hooks", () => {
     expect((await resolvePlaceholders("[CREDIT_CARD_001]", "s1", home)).text).toBe(CARD);
   });
 
+  it("blocks and vaults a prompt holding PHI (labelled record number and diagnosis)", async () => {
+    const { stdout } = await run("claude-code", { hook_event_name: "UserPromptSubmit", prompt: "summarise: MRN: 00481923, diagnosis: type 2 diabetes", session_id: "s1" });
+    const out = JSON.parse(stdout[0]!);
+    expect(out.decision).toBe("block");
+    expect(out.reason).toContain("summarise: MRN: [MRN_001], diagnosis: [PHI_001]");
+    expect(JSON.stringify(out)).not.toContain("00481923");
+    expect(JSON.stringify(out)).not.toContain("diabetes");
+  });
+
   it("does not block low-confidence kinds (a phone number or email), only warns", async () => {
     const { stdout } = await run("claude-code", { hook_event_name: "UserPromptSubmit", prompt: "call me on +1 415 555 2671", session_id: "s1" });
     const out = JSON.parse(stdout[0]!);

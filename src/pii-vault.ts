@@ -195,7 +195,7 @@ export async function takeUnreportedLedger(sessionId: string, home = getDataDire
 }
 
 /** Findings worth blocking a prompt over (high-confidence identity, financial and credential data). */
-const BLOCKING_KINDS = new Set(["SSN", "CREDIT_CARD", "IBAN", "NATIONAL_ID", "PASSPORT", "DRIVER_LICENSE", "DOB", "SECRET", "API_KEY", "PASSWORD", "PRIVATE_KEY"]);
+const BLOCKING_KINDS = new Set(["SSN", "CREDIT_CARD", "IBAN", "NATIONAL_ID", "PASSPORT", "DRIVER_LICENSE", "DOB", "MRN", "HEALTH_PLAN_ID", "MEDICAL_ID", "PHI", "SECRET", "API_KEY", "PASSWORD", "PRIVATE_KEY"]);
 export function promptFindings(text: string, custom: CustomDetector[] = []): { blocking: DataFinding[]; advisory: DataFinding[] } {
   const all = detectSensitive(text, custom);
   return { blocking: all.filter(f => BLOCKING_KINDS.has(f.kind) || f.kind === "CUSTOM"), advisory: all.filter(f => !BLOCKING_KINDS.has(f.kind) && f.kind !== "CUSTOM") };

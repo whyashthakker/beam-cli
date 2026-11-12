@@ -151,4 +151,32 @@ describe("data detectors", () => {
       expect(detectSensitive(line)).toEqual([]);
     });
   });
+
+  describe("PHI detectors", () => {
+    const phi: Array<[string, string]> = [
+      ["MRN: 00481923", "MRN"], ["medical record number: A-482910", "MRN"], ["patient_id = 7781234", "MRN"], ["chart no: 55-102938", "MRN"],
+      ["member id: XQ48201937", "HEALTH_PLAN_ID"], ["Insurance ID: 9988123456", "HEALTH_PLAN_ID"], ["policy number: HP-77120-A", "HEALTH_PLAN_ID"],
+      ["MBI 1EG4-TE5-MK73", "MEDICAL_ID"], ["mbi 1EG4TE5MK73", "MEDICAL_ID"], ["DEA AB1234563", "MEDICAL_ID"], ["NPI: 1234567893", "MEDICAL_ID"],
+      ["ICD-10: E11.9", "PHI"], ["diagnosis code: J45.909", "PHI"], ["Patient: John Smith", "PHI"], ["patient name: Maria Garcia Lopez", "PHI"],
+      ['"diagnosis": "Type 2 diabetes mellitus"', "PHI"], ["medication: metformin 500mg twice daily", "PHI"], ["allergies: penicillin, latex", "PHI"],
+      ["admission date: 2026-03-14", "PHI"], ["Discharge_Date=14/03/2026", "PHI"],
+    ];
+    it.each(phi)("detects %s as %s", (text, kind) => {
+      expect(detectSensitive(text).map(f => f.kind)).toContain(kind);
+    });
+
+    it("redacts only the value and keeps the label", () => {
+      expect(redactSensitive("MRN: 00481923, diagnosis: asthma").text).toBe("MRN: [MRN_REDACTED], diagnosis: [PHI_REDACTED]");
+    });
+
+    // Code and prose that merely mention these words, and numbers that fail their checksums.
+    const clean = [
+      "diagnosis: string", "diagnosis: string;", "condition: ready", "patient_id = 42", "mrn: n/a", "DEA AB1234560", "NPI: 1234567890",
+      "patient care team", "the patient was told", "medication: boolean", "interface Patient { name: string }", "icd10: null",
+      "visit date is tomorrow", "allergies: undefined", "allergy: true", "dx: {", "SELECT patient_id FROM visits", "# patient: see docs",
+    ];
+    it.each(clean)("leaves %s alone", (line) => {
+      expect(detectSensitive(line)).toEqual([]);
+    });
+  });
 });

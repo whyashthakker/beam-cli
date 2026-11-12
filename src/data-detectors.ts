@@ -1,5 +1,6 @@
 import { NATIONAL_ID_DETECTORS } from "./pii-validators.js";
-export type DetectorKind = "EMAIL" | "PHONE" | "SSN" | "CREDIT_CARD" | "IBAN" | "NATIONAL_ID" | "PASSPORT" | "DRIVER_LICENSE" | "ADDRESS" | "DOB" | "SECRET" | "API_KEY" | "PASSWORD" | "PRIVATE_KEY" | "CUSTOM";
+import { PHI_DETECTORS } from "./phi-detectors.js";
+export type DetectorKind = "EMAIL" | "PHONE" | "SSN" | "CREDIT_CARD" | "IBAN" | "NATIONAL_ID" | "PASSPORT" | "DRIVER_LICENSE" | "MRN" | "HEALTH_PLAN_ID" | "MEDICAL_ID" | "PHI" | "ADDRESS" | "DOB" | "SECRET" | "API_KEY" | "PASSWORD" | "PRIVATE_KEY" | "CUSTOM";
 export interface DataFinding { kind: DetectorKind; confidence: number; start: number; end: number; replacement: string }
 
 // Checksum validators keep the PII detectors from flagging arbitrary digit strings (build ids,
@@ -62,6 +63,7 @@ const detectors: Array<{ kind: DetectorKind; pattern: RegExp; replacement: strin
   { kind: "ADDRESS", pattern: /\b\d{1,6} (?:[A-Z][a-z]+\.? ){1,3}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl)\b\.?(?:,? (?:Apt|Suite|Unit|#)\.? ?\w+)?/g, replacement: "[ADDRESS_REDACTED]" },
   { kind: "DOB", pattern: /\b(?:dob|date[ _-]?of[ _-]?birth|birth[ _-]?date|born(?: on)?)\s*[:=]?\s*["']?(?:\d{4}-\d{2}-\d{2}|\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4})/gi, replacement: "[DOB_REDACTED]" },
   ...NATIONAL_ID_DETECTORS,
+  ...PHI_DETECTORS,
   // Phone numbers need real structure. The previous pattern joined ANY run of 9-15 digits across spaces,
   // dots and dashes, so whisper timestamps ("12.34 15.67 0.12"), dates, ids and lists of numbers were all
   // redacted as phones. Each format below is anchored (no adjacent word/dot/dash characters) and checked.
