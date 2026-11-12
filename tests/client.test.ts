@@ -835,6 +835,65 @@ describe("captureHook", () => {
       output.mockRestore();
     });
 
+    describe("user-facing notices (systemMessage)", () => {
+      const run = async (agent: string, payload: Record<string, unknown>) => {
+        withStdin(JSON.stringify(payload));
+        const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+        await captureHook(agent);
+        const writes = output.mock.calls.map(c => String(c[0]));
+        output.mockRestore();
+        return writes;
+      };
+
+      it("tells the user what was redacted in a tool's output, in the same JSON as the rewrite, with kinds and counts but no real values", async () => {
+        const writes = await run("claude-code", {
+          hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "cat customers.txt" },
+          tool_response: { stdout: "ssn 123-45-6789 card 4111 1111 1111 1111\n", stderr: "", interrupted: false },
+        });
+        expect(writes).toHaveLength(1); // a hook must emit exactly one JSON object
+        const out = JSON.parse(writes[0]!);
+        expect(out.systemMessage).toMatch(/^Beam: redacted 2 values \(1× CREDIT_CARD, 1× SSN\) in this tool's output/);
+        expect(out.systemMessage).not.toContain("123-45-6789");
+        expect(out.systemMessage).not.toContain("4111");
+        expect(out.hookSpecificOutput.updatedToolOutput.stdout).not.toContain("123-45-6789");
+      });
+
+      it("warns that a typed prompt containing PII was sent unredacted, without blocking it (piiPrompt=warn)", async () => {
+        process.env.BEAM_PII_PROMPT = "warn";
+        const writes = await run("claude-code", { hook_event_name: "UserPromptSubmit", prompt: "my ssn is 123-45-6789, summarise", session_id: "s1" });
+        expect(writes).toHaveLength(1);
+        const out = JSON.parse(writes[0]!);
+        expect(out.systemMessage).toMatch(/your prompt contains 1 value \(1× SSN\)/);
+        expect(out.systemMessage).toContain("sent to the model as typed");
+        expect(out.hookSpecificOutput?.permissionDecision).not.toBe("deny");
+        expect(out.decision).toBeUndefined();
+        delete process.env.BEAM_PII_PROMPT;
+      });
+
+      it("says nothing for a clean prompt and a clean action", async () => {
+        expect(await run("claude-code", { hook_event_name: "UserPromptSubmit", prompt: "refactor the parser", session_id: "s1" })).toEqual([]);
+        expect(await run("claude-code", { hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, session_id: "s1" })).toEqual([]);
+      });
+
+      it("notes that sensitive values in an allowed action are redacted from Beam's activity log", async () => {
+        const writes = await run("claude-code", { hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "echo 123-45-6789" }, session_id: "s1" });
+        expect(writes).toHaveLength(1);
+        expect(JSON.parse(writes[0]!).systemMessage).toMatch(/1 value \(1× SSN\) in this action will be redacted from Beam's activity log/);
+      });
+
+      it("falls back to stderr for agents without a verified systemMessage field", async () => {
+        process.env.BEAM_PII_PROMPT = "warn";
+        withStdin(JSON.stringify({ hook_event_name: "beforeSubmitPrompt", prompt: "my ssn is 123-45-6789", session_id: "s1" }));
+        const stdout = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+        const stderr = jest.spyOn(process.stderr, "write").mockImplementation(() => true);
+        await captureHook("cursor");
+        const err = stderr.mock.calls.map(c => String(c[0])).join("");
+        stdout.mockRestore(); stderr.mockRestore();
+        delete process.env.BEAM_PII_PROMPT;
+        expect(err).toContain("your prompt contains 1 value (1× SSN)");
+      });
+    });
+
     it("does not touch output that already uses the credential-reference convention", async () => {
       withStdin(JSON.stringify({
         hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "cat .env" },

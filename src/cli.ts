@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
 import { startServer } from "./serve.js";
+import { runClaudeWrapper } from "./claude-wrapper.js";
 import { askApproval, captureHook, extractPreview, extractSave, importEvents, listPendingApprovals, readToken, reloadRemoteRules, resolveApproval, scanFile } from "./client.js";
 import { supportsExtraction } from "./extract.js";
 import { AGENTS } from "./agents.js";
@@ -798,6 +799,17 @@ program.command("hook")
   .argument("[source-agent]", "reporting agent id, e.g. claude-code, codex, cursor, copilot-cli", "claude-code")
   .option("--event <name>", "Native event name supplied by the installed hook")
   .action(async (sourceAgent: string, options: { event?: string }) => captureHook(sourceAgent, undefined, options.event));
+
+program.command("claude")
+  .description("Run Claude Code through Beam's terminal wrapper: sensitive values you type or paste are replaced with vault placeholders before Claude sees them")
+  .allowUnknownOption()
+  .allowExcessArguments()
+  .argument("[args...]", "arguments passed to claude")
+  .helpOption(false)
+  .action(async () => {
+    const at = process.argv.indexOf("claude");
+    process.exitCode = await runClaudeWrapper(process.argv.slice(at + 1));
+  });
 
 const agent = program.command("agent").description("Discover and configure supported AI agents");
 

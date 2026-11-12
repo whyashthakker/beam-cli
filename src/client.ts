@@ -5,6 +5,7 @@ import { classifyActionContext } from "./action-context.js";
 import { environmentRisk } from "./access-risk.js";
 import { mkdir, open, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getApiUrl, getBeamHome, getCollectorUrl, getDataDirectory } from "./config.js";
 import { normalize, scanText, setIgnoredRules, type Event, type Scan } from "./core.js";
@@ -14,7 +15,10 @@ import { evaluate, readPolicy, type Decision } from "./policy.js";
 import { extractAgent } from "./extract.js";
 import { readIdentity, type Identity } from "./enroll.js";
 import { loadCustomRules } from "./custom-rules.js";
-import { redactSensitive } from "./data-detectors.js";
+import { detectSensitive, redactSensitive, type DataFinding } from "./data-detectors.js";
+import { takeWrapperNotices } from "./wrapper-notice.js";
+import { recordEvent, takeTurnSummary, vaultScope, attachLedgerOutput, commandSendsOverNetwork, maskVaulted, promptFindings, recordSubstitution, redactAndVault, resolvePlaceholders, takeUnreportedLedger } from "./pii-vault.js";
+import { addNotice, flushNotices, resetNotices, summarizeFindings, withNotice } from "./hook-notice.js";
 import { redactWithSessionEntities } from "./entity-redaction.js";
 import { recordAndCheckAnomaly } from "./behavioral-anomaly.js";
 import { applyJevHook } from "./jev.js";
@@ -504,6 +508,7 @@ async function readStdin(limitBytes: number): Promise<string> {
 // Never throws: best-effort capture must not suppress configured policy enforcement.
 export async function captureHook(sourceAgent = "claude-code", home = homedir(), suppliedEvent?: string): Promise<void> {
   let canBlock = suppliedEvent === undefined || hookKind(suppliedEvent) === "pre";
+  resetNotices();
   try {
     const input = await readStdin(2_000_000);
     const raw = JSON.parse(input) as Record<string, unknown>;
@@ -519,6 +524,36 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
       data.event_type = "prompt.submit";
       data.tool_name = data.tool_name ?? data.hook_event_name;
       data.command = data.prompt;
+      // A prompt hook can only block or annotate -- the agent cannot rewrite what the user typed,
+      // so sensitive values in it have already been sent to the model. Say so rather than stay quiet.
+      if (process.env.BEAM_WRAPPER_ID) for (const note of await takeWrapperNotices(process.env.BEAM_WRAPPER_ID).catch(() => [])) {
+        addNotice(note.replace(/^Beam's /, ""));
+        await recordEvent(vaultScope(String(data.session_id ?? "")), `your prompt: ${note.replace(/^Beam's terminal wrapper replaced /, "replaced ").replace(/ in your prompt with vault placeholders before it reached Claude\..*$/, " before it reached Claude")}`).catch(() => {});
+      }
+      const promptPolicy = await readPolicy().catch(() => null);
+      const promptMode = promptPolicy?.rules.piiPrompt ?? (["block", "warn", "off"].includes(process.env.BEAM_PII_PROMPT ?? "") ? process.env.BEAM_PII_PROMPT as "block" | "warn" | "off" : "block");
+      const found = promptMode === "off" ? { blocking: [], advisory: [] } : promptFindings(data.prompt, promptPolicy?.rules.customDetectors);
+      const promptSession = vaultScope(String(data.session_id ?? data.sessionId ?? ""));
+      if (promptMode === "block" && promptGate && found.blocking.length && promptSession) {
+        // The agent can't rewrite a typed prompt, so the only way the model never sees these values is
+        // to stop the prompt: vault the real values and hand the user a placeholder version to resend.
+        const vaulted = await redactAndVault(data.prompt, promptSession, promptPolicy?.rules.customDetectors);
+        const copied = copyToClipboard(vaulted.text);
+        const reason = `stored ${summarizeFindings(found.blocking)} in Beam's local vault and blocked this prompt so the model never saw them. ${copied ? "The placeholder version is on your clipboard: paste it (Cmd/Ctrl+V) and press Enter." : "Resend it with the placeholders below."} Beam swaps in the real values only when a shell command runs, and masks them in the output:\n\n${vaulted.text}`;
+        data.policy_decision = { action: "deny", rule: "beam.pii-prompt", reason };
+        await recordEvent(promptSession, `blocked a prompt containing ${summarizeFindings(found.blocking)} (stored in the vault)`).catch(() => {});
+        if (sourceAgent === "claude-code") {
+          // Exit 0 with JSON (not exit 2) so `suppressOriginalPrompt` applies: otherwise Claude Code appends
+          // "Original prompt: <the real value>" to the block message and writes it to the transcript on disk.
+          process.stdout.write(JSON.stringify({ decision: "block", reason: `Beam: ${reason}`, suppressOriginalPrompt: true, hookSpecificOutput: { hookEventName: "UserPromptSubmit", suppressOriginalPrompt: true } }));
+        } else {
+          emitDeny(sourceAgent, reason, String(data.hook_event_name ?? "UserPromptSubmit"));
+        }
+        await captureActivity(data);
+        return;
+      }
+      const promptAll = [...found.blocking, ...found.advisory];
+      if (promptAll.length) addNotice(`your prompt contains ${summarizeFindings(promptAll)}. It was sent to the model as typed (prompts can't be rewritten); Beam redacts it in its own logs.${promptMode === "warn" ? "" : " (Not blocked: this agent cannot block prompts, there is no session id, or the values are low-confidence kinds.)"}`);
       if (sessionTitlesEnabled()) await notePrompt(String(data.session_id ?? ""), data.prompt, String(data.cwd ?? "")).catch(() => {});
     }
     // Completed actions, permission notifications, and lifecycle callbacks are observation only.
@@ -526,9 +561,28 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
     if (!canBlock) {
       if (eventKind === "post" && sourceAgent === "claude-code") {
         const bundle = await readPolicy().catch(() => null);
-        await emitRedactedOutput(sourceAgent, data.tool_response, String(data.session_id ?? ""), bundle?.rules.customDetectors).catch(() => {});
+        // Keep what the command printed (masked) so the end-of-turn summary can show it.
+        try {
+          const toolUseId = typeof data.tool_use_id === "string" ? data.tool_use_id : "";
+          const scope = vaultScope(String(data.session_id ?? ""));
+          const resp = data.tool_response as Record<string, unknown> | string | undefined;
+          const printed = typeof resp === "string" ? resp : typeof resp?.stdout === "string" ? resp.stdout : "";
+          if (toolUseId && printed) await attachLedgerOutput(scope, toolUseId, (await redactAndVault((await maskVaulted(printed, scope)).text, scope, bundle?.rules.customDetectors, undefined, true)).text.trim());
+        } catch { /* the summary just omits the output */ }
+        await emitRedactedOutput(sourceAgent, data.tool_response, vaultScope(String(data.session_id ?? "")), bundle?.rules.customDetectors)
+          .catch(() => addNotice("could not check this tool's output for sensitive data; it may contain unredacted values."));
       }
       await captureActivity(data);
+      if (String(data.hook_event_name ?? "").toLowerCase() === "stop") {
+        const turn = await takeTurnSummary(vaultScope(String(data.session_id ?? ""))).catch(() => ({ events: [], commands: [] }));
+        const clip = (text: string, n: number) => text.length > n ? `${text.slice(0, n)}…` : text;
+        const parts = [
+          ...turn.events,
+          ...turn.commands.map(r => `ran \`${clip(r.command, 100)}\` with ${r.ids.join(", ")} substituted${r.output ? ` → output: \`${clip(r.output, 120)}\`` : ""}`),
+        ];
+        if (parts.length) addNotice(`this turn: ${parts.join(" · ")}. The model only saw placeholders.`);
+      }
+      flushNotices(sourceAgent, String(data.hook_event_name ?? ""));
       if (sourceAgent === "cline") process.stdout.write(JSON.stringify({ cancel: false }));
       if (sourceAgent === "antigravity" && eventKind === "assistant") process.stdout.write(JSON.stringify({ decision: "stop" }));
       return;
@@ -584,13 +638,19 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
     }
     const policyBundle = await readPolicy().catch(() => null);
     setIgnoredRules(policyBundle?.rules.ignoredRules ?? [], sourceAgent);
+    // Vault substitution: a shell command that carries this session's placeholders ([SSN_001]) is
+    // evaluated, and later run, with the real values. The model only ever wrote the placeholder.
+    // `command`/`data` keep the placeholder form so nothing the model or the log sees has the value.
+    const substitution = await resolveVaultedInput(eventKind === "pre" ? data : {}, toolInput);
+    const evalInput = substitution?.input ?? toolInput;
+    const evalCommand = substitution ? String(commandOf({ tool_input: evalInput })) : command;
     let decision = evaluate(policyBundle, {
       agent: sourceAgent,
       eventType: promptGate ? "prompt.submit" : undefined,
-      input: toolInput,
+      input: evalInput,
       tool: String(data.tool_name ?? ""),
-      command,
-      args: Array.isArray(toolInput.args) ? toolInput.args.map(String) : command.split(/\s+/).slice(1),
+      command: evalCommand,
+      args: Array.isArray(evalInput.args) ? evalInput.args.map(String) : evalCommand.split(/\s+/).slice(1),
       path: String(toolInput.file_path ?? toolInput.path ?? data.file_path ?? ""),
       url: String(toolInput.url ?? data.url ?? ""),
       role: typeof data.role === "string" ? data.role : undefined,
@@ -601,10 +661,19 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
       environment: typeof data.environment === "string" ? data.environment : undefined,
       time: typeof data.timestamp === "string" ? data.timestamp : undefined,
     });
+    if (substitution) {
+      // The decision must never echo a real value back to the model or the log.
+      const scrub = async (text?: string) => text === undefined ? text : (await maskVaulted(text, vaultScope(String(data.session_id ?? "")))).text;
+      decision = { ...decision, reason: await scrub(decision.reason), command, args: undefined, riskFactors: await Promise.all(decision.riskFactors.map(f => scrub(f) as Promise<string>)) };
+      if (commandSendsOverNetwork(evalCommand) && decision.action !== "deny") {
+        decision = { ...decision, action: "deny", rule: "beam.vault-egress", reason: `${substitution.ids.length} vaulted value(s) would be substituted into a command that sends data over the network. Beam does not do that: run it yourself, or remove the network step.` };
+      }
+    }
     const readsEnvironment = isEnvironmentAccess(String(data.tool_name ?? ""), command, String(toolInput.file_path ?? toolInput.path ?? data.file_path ?? ""), toolInput);
     if (readsEnvironment && decision.mode === "observe" && decision.action === "allow") {
       // Allow-all still records this sensitive read as a risk, without turning it into an approval gate.
       decision = { ...decision, riskScore: Math.max(decision.riskScore, 35), riskLevel: decision.riskScore >= 70 ? decision.riskLevel : "MEDIUM", riskFactors: [...new Set([...decision.riskFactors, "sensitive environment data"])], reason: "Sensitive environment data access was allowed and flagged for review." };
+      addNotice("this action reads environment data that may hold credentials; allowed and flagged for review (observe mode).");
     } else if (decision.mode !== "observe" && (decision.action === "allow" || decision.action === "warn") && readsEnvironment) {
       // Sensitive data is always promoted to an approval gate in protective policy modes.
       decision = { ...decision, action: "ask", reason: "Reading environment variables or .env files requires approval." };
@@ -632,16 +701,18 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
         const reason = `${anomaly.count} high/critical-severity actions from this session in the last ${anomaly.windowMinutes} minutes.`;
         if (decision.mode === "observe" && decision.action === "allow") {
           decision = { ...decision, riskFactors: [...new Set([...decision.riskFactors, "behavioral anomaly: action burst"])], reason };
+          addNotice(`unusual burst: ${reason} Allowed and flagged for review (observe mode).`);
         } else if (decision.mode !== "observe" && (decision.action === "allow" || decision.action === "warn")) {
           decision = { ...decision, action: "ask", rule: "beam.behavioral-anomaly", reason };
         }
       }
-    } catch { /* best-effort: must never block the agent on anomaly-tracking failure */ }
+    } catch { addNotice("burst detection failed for this action, so it was not counted toward the anomaly check."); }
     const policyMode = decision.mode;
     if (decision.action === "allow" && workspace) {
       const escaping = outsideWorkspacePaths(workspace, targetPath, command);
       if (policyMode === "observe" && escaping.length) {
         decision = { ...decision, riskScore: Math.max(decision.riskScore, 35), riskLevel: decision.riskScore >= 70 ? decision.riskLevel : "MEDIUM", riskFactors: [...new Set([...decision.riskFactors, "access outside the current workspace"])], reason: "Access outside the current workspace was allowed and flagged for review." };
+        addNotice("this action accesses a path outside the current workspace; allowed and flagged for review (observe mode).");
       }
       if (policyMode !== "observe") {
       if (escaping.length) {
@@ -669,17 +740,17 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
         if (skill) {
           decision = { ...decision, riskScore: Math.max(decision.riskScore, skill.scan.score), riskLevel: skill.scan.level, riskFactors: [...decision.riskFactors, ...skill.scan.findings.slice(0, 5).map(f => f.title)] };
           if (skill.action !== "allow" && policyMode !== "observe") decision = { ...decision, action: skill.action, rule: "beam.skill-scan", reason: skill.reason };
-          else if (skill.reason) process.stderr.write(`\n⚠ Beam skill scan: ${skill.reason}\n`);
+          else if (skill.reason) { process.stderr.write(`\n⚠ Beam skill scan: ${skill.reason}\n`); addNotice(`skill scan: ${skill.reason}`); }
         }
-      } catch { /* best-effort: an unreadable skill never blocks the agent by itself */ }
+      } catch { addNotice("the skill scan could not read this skill, so it was not scanned."); }
     }
 
     const jev = await applyJevHook(decision, data);
     decision = jev.decision;
-    if (jev.judgment) process.stderr.write(`Beam Jev: ${JSON.stringify(jev.judgment)}\n`);
+    if (jev.judgment) { process.stderr.write(`Beam Jev: ${JSON.stringify(jev.judgment)}\n`); addNotice(`Jev judged this action: ${noticeJudgment(jev.judgment)}`); }
     const judged = await applyJudgeHook(decision, data);
     decision = judged.decision;
-    if (judged.judgment) process.stderr.write(`Beam judge: ${JSON.stringify(judged.judgment)}\n`);
+    if (judged.judgment) { process.stderr.write(`Beam judge: ${JSON.stringify(judged.judgment)}\n`); addNotice(`judge reviewed this action: ${noticeJudgment(judged.judgment)}`); }
 
     // "warn" only ever comes out of evaluate() when the policy's mode is neither "enforce" nor
     // "advisory" (see policy.ts) -- a manager's explicit ASK/BLOCK rule under either of those
@@ -717,14 +788,28 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
     }
     data.policy_decision = { action: decision.action, rule: decision.rule, reason: decision.reason, risk_score: decision.riskScore, risk_level: decision.riskLevel, risk_factors: decision.riskFactors };
     const hookEvent = String(data.hook_event_name ?? "PreToolUse");
+    // The action itself isn't rewritten (a "redact" decision reports its own notice), but Beam still
+    // strips sensitive values before storing or uploading it. Say so, with kinds and counts only.
+    if (eventKind !== "prompt" && decision.action !== "redact" && decision.action !== "deny") {
+      const actionStrings: string[] = [];
+      const collect = (v: unknown): void => { if (typeof v === "string") actionStrings.push(v); else if (Array.isArray(v)) v.forEach(collect); else if (v && typeof v === "object") Object.values(v).forEach(collect); };
+      collect(toolInput); if (command) actionStrings.push(command);
+      const stored = detectSensitive([...new Set(actionStrings)].join("\n"), policyBundle?.rules.customDetectors);
+      if (stored.length) addNotice(`${summarizeFindings(stored)} in this action will be redacted from Beam's activity log.`);
+    }
     let event = safeNormalize(data);
     if (decision.action === "deny") {
       if (event) event = { ...event, findings: [...event.findings, blockedFinding(decision.reason)] };
       emitDeny(sourceAgent, decision.reason ?? "Blocked by workspace policy.", hookEvent);
     } else if (decision.action === "ask") {
       emitAsk(sourceAgent, decision.reason ?? "This action requires approval.", hookEvent);
+    } else if (substitution && ["allow", "warn", "audit", "redact"].includes(decision.action)) {
+      addNotice(`ran this command with ${substitution.ids.length} vaulted value${substitution.ids.length === 1 ? "" : "s"} substituted (${substitution.ids.join(", ")}). The model only sees the placeholders, and the output is masked again.`);
+      await recordSubstitution(vaultScope(String(data.session_id ?? "")), { tool: String(data.tool_name ?? ""), command: command.slice(0, 300), ids: substitution.ids, toolUseId: typeof data.tool_use_id === "string" ? data.tool_use_id : undefined }).catch(() => addNotice("could not record this substitution for the end-of-turn summary."));
+      emitRedacted(sourceAgent, { tool_input: substitution.input }, `Substituted ${substitution.ids.join(", ")} from Beam's vault.`, hookEvent);
     } else if (decision.action === "redact") {
       const transformed = await redactPayload(data, decision, String(data.session_id ?? data.sessionId ?? ""));
+      if (transformed.changed) addNotice(`redacted ${summarizeFindings(transformed.findings)} from this action before it ran.`);
       if (!transformed.changed) {
         emitAllow(sourceAgent, decision.reason, hookEvent);
       } else {
@@ -736,12 +821,14 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
       // fail open with a visible warning rather than blocking a hook that has nowhere to
       // prompt.
       process.stderr.write(`\n⚠ Beam policy (advisory): ${decision.reason}\n`);
+      addNotice(`policy (advisory): ${decision.reason}`);
     }
 
     if (["cline", "antigravity"].includes(sourceAgent) && ["allow", "audit", "warn"].includes(decision.action)) emitAllow(sourceAgent, decision.reason, hookEvent);
 
     // Capture every lifecycle event, including allowed prompts and tool completions.
     await captureActivity(data);
+    flushNotices(sourceAgent, hookEvent);
 
     // 3. A policy-blocked action carries a finding the collector's own normalize() can't
     //    reconstruct (it only knows about *this* process's policy decision) -- forward it to the
@@ -764,6 +851,43 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
   }
 }
 
+// Puts the placeholder version of a blocked prompt on the clipboard so resending is paste + Enter.
+// Placeholders only, never a real value. Skipped under test, on unsupported platforms, or with BEAM_NO_CLIPBOARD=1.
+function copyToClipboard(text: string): boolean {
+  if (process.env.JEST_WORKER_ID || process.env.BEAM_NO_CLIPBOARD) return false;
+  const tool = process.platform === "darwin" ? ["pbcopy"] : process.platform === "win32" ? ["clip"] : process.platform === "linux" ? ["xclip", "-selection", "clipboard"] : null;
+  if (!tool) return false;
+  try { return spawnSync(tool[0]!, tool.slice(1), { input: text, timeout: 2000 }).status === 0; } catch { return false; }
+}
+
+const SHELL_TOOL = /^(?:bash|shell|powershell|exec_command|run_shell_command|execute_bash|run_command|local_shell)$/i;
+// Resolves this session's vault placeholders in every string of a shell tool's input. Null when the
+// event isn't a shell call, has no session, or contains no known placeholder.
+async function resolveVaultedInput(data: Record<string, unknown>, toolInput: Record<string, unknown>): Promise<{ input: Record<string, unknown>; ids: string[] } | null> {
+  if (!SHELL_TOOL.test(String(data.tool_name ?? ""))) return null;
+  const sessionId = vaultScope(String(data.session_id ?? data.sessionId ?? ""));
+  if (!sessionId) return null;
+  const ids: string[] = [];
+  const walk = async (value: unknown): Promise<unknown> => {
+    if (typeof value === "string") { const r = await resolvePlaceholders(value, sessionId); for (const id of r.ids) if (!ids.includes(id)) ids.push(id); return r.text; }
+    if (Array.isArray(value)) return Promise.all(value.map(walk));
+    if (value && typeof value === "object") return Object.fromEntries(await Promise.all(Object.entries(value).map(async ([k, v]) => [k, await walk(v)])));
+    return value;
+  };
+  try {
+    const input = await walk(toolInput) as Record<string, unknown>;
+    return ids.length ? { input, ids } : null;
+  } catch { return null; }
+}
+
+// Short, secret-free one-liner for a Jev/judge result shown in a user-facing notice.
+function noticeJudgment(judgment: unknown): string {
+  const j = judgment as Record<string, unknown> | null;
+  const verdict = typeof j?.verdict === "string" ? j.verdict : typeof j?.decision === "string" ? j.decision : "see Beam dashboard";
+  const reason = typeof j?.reason === "string" ? `, ${j.reason.slice(0, 120)}` : "";
+  return `${verdict}${reason}`;
+}
+
 async function captureActivity(data: Record<string, unknown>): Promise<void> {
   try {
     const policy = await readPolicy().catch(() => null);
@@ -784,7 +908,10 @@ async function captureActivity(data: Record<string, unknown>): Promise<void> {
     projected.capture_truncated = a.truncated;
     try { await send("/ingest", JSON.stringify(projected)); }
     catch { await spoolHookEvent(projected); }
-  } catch (e) { process.stderr.write(`Beam activity capture failed: ${e instanceof Error ? e.message : String(e)}\n`); }
+  } catch (e) {
+    process.stderr.write(`Beam activity capture failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    addNotice("could not record this action in Beam's activity log.");
+  }
 }
 
 function safeNormalize(data: Record<string, unknown>): Event | null {
@@ -889,16 +1016,16 @@ function blockedFinding(reason = "Blocked by workspace policy."): Event["finding
   return { id: "policy.blocked", title: "Blocked by workspace policy", severity: "high", explanation: reason, evidence: "" };
 }
 
-async function redactPayload(data: Record<string, unknown>, decision: { customDetectors?: Array<{ name: string; pattern: string; replacement: string }> }, sessionId: string): Promise<{ data: Record<string, unknown>; changed: boolean }> {
-  const copy = structuredClone(data); let changed = false;
+async function redactPayload(data: Record<string, unknown>, decision: { customDetectors?: Array<{ name: string; pattern: string; replacement: string }> }, sessionId: string): Promise<{ data: Record<string, unknown>; changed: boolean; findings: DataFinding[] }> {
+  const copy = structuredClone(data); let changed = false; const findings: DataFinding[] = [];
   const redactValue = async (value: unknown): Promise<unknown> => {
-    if (typeof value === "string") { const result = await redactWithSessionEntities(value, sessionId, decision.customDetectors); changed ||= result.text !== value; return result.text; }
+    if (typeof value === "string") { const result = await redactWithSessionEntities(value, sessionId, decision.customDetectors); changed ||= result.text !== value; findings.push(...result.findings); return result.text; }
     if (Array.isArray(value)) return Promise.all(value.map(redactValue));
     if (value && typeof value === "object") return Object.fromEntries(await Promise.all(Object.entries(value).map(async ([k, v]) => [k, await redactValue(v)])));
     return value;
   };
   const redacted = await redactValue(copy) as Record<string, unknown>;
-  return { data: redacted, changed };
+  return { data: redacted, changed, findings };
 }
 
 // Claude Code and Codex use the same hookSpecificOutput.permissionDecision contract for every
@@ -919,20 +1046,29 @@ function claudeStyleHookEventName(event: string): string {
 // silently do nothing while looking like protection.
 async function emitRedactedOutput(agent: string, toolResponse: unknown, sessionId: string, customDetectors?: Array<{ name: string; pattern: string; replacement: string }>): Promise<void> {
   if (agent !== "claude-code" || toolResponse === null || toolResponse === undefined) return;
+  const outputFindings: DataFinding[] = []; const vaultedIds: string[] = [];
   const redactValue = async (value: unknown): Promise<unknown> => {
-    if (typeof value === "string") return (await redactWithSessionEntities(value, sessionId, customDetectors)).text;
+    if (typeof value === "string") {
+      const masked = await maskVaulted(value, sessionId);
+      for (const id of masked.ids) if (!vaultedIds.includes(id)) vaultedIds.push(id);
+      const result = await redactAndVault(masked.text, sessionId, customDetectors, undefined, true);
+      outputFindings.push(...result.findings); return result.text;
+    }
     if (Array.isArray(value)) return Promise.all(value.map(redactValue));
     if (value && typeof value === "object") return Object.fromEntries(await Promise.all(Object.entries(value).map(async ([k, v]) => [k, await redactValue(v)])));
     return value;
   };
   const redacted = await redactValue(toolResponse);
   if (JSON.stringify(redacted) === JSON.stringify(toolResponse)) return; // nothing to rewrite
-  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: redacted } }));
+  const parts = [outputFindings.length ? `redacted ${summarizeFindings(outputFindings)}` : "", vaultedIds.length ? `masked ${vaultedIds.length} vaulted value${vaultedIds.length === 1 ? "" : "s"} back to ${vaultedIds.join(", ")}` : ""].filter(Boolean);
+  addNotice(`${parts.join(" and ")} in this tool's output before the model saw it.`);
+  await recordEvent(sessionId, `tool output: ${parts.join(" and ")}`).catch(() => {});
+  process.stdout.write(JSON.stringify(withNotice(agent, { hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: redacted } })));
 }
 
 function emitAsk(agent: string, reason: string, event = "PreToolUse"): void {
   if (agent === "claude-code" || agent === "codex") {
-    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: claudeStyleHookEventName(event), permissionDecision: "ask", permissionDecisionReason: `Beam: ${reason}` } }));
+    process.stdout.write(JSON.stringify(withNotice(agent, { hookSpecificOutput: { hookEventName: claudeStyleHookEventName(event), permissionDecision: "ask", permissionDecisionReason: `Beam: ${reason}` } })));
   } else if (agent === "cursor" || agent === "copilot-cli") {
     // These hook contracts do not provide a reliable interactive approval channel in Beam's
     // command-hook path. Fail closed rather than silently allowing an ASK decision.
@@ -946,7 +1082,7 @@ function emitAsk(agent: string, reason: string, event = "PreToolUse"): void {
 
 function emitRedacted(agent: string, data: Record<string, unknown>, reason?: string, event = "PreToolUse"): void {
   const input = data.tool_input;
-  if (agent === "claude-code" || agent === "codex") process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: claudeStyleHookEventName(event), permissionDecision: "allow", permissionDecisionReason: `Beam: ${reason ?? "Sensitive data redacted."}`, updatedInput: input } }));
+  if (agent === "claude-code" || agent === "codex") process.stdout.write(JSON.stringify(withNotice(agent, { hookSpecificOutput: { hookEventName: claudeStyleHookEventName(event), permissionDecision: "allow", permissionDecisionReason: `Beam: ${reason ?? "Sensitive data redacted."}`, updatedInput: input } })));
   else if (agent === "cursor") process.stdout.write(JSON.stringify({ permission: "allow", updated_input: input }));
   else if (agent === "copilot-cli") process.stdout.write(JSON.stringify({ permissionDecision: "allow", updatedInput: input }));
   else emitDeny(agent, "Beam cannot safely return transformed input through this hook contract.", event);
@@ -956,7 +1092,7 @@ function emitAllow(agent: string, reason?: string, event = "PreToolUse"): void {
   if (agent === "cline") { process.stdout.write(JSON.stringify({ cancel: false })); return; }
   if (agent === "antigravity") { process.stdout.write(JSON.stringify({ decision: "ask" })); return; }
 
-  if (agent === "claude-code" || agent === "codex") process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: claudeStyleHookEventName(event), permissionDecision: "allow", permissionDecisionReason: reason } }));
+  if (agent === "claude-code" || agent === "codex") process.stdout.write(JSON.stringify(withNotice(agent, { hookSpecificOutput: { hookEventName: claudeStyleHookEventName(event), permissionDecision: "allow", permissionDecisionReason: reason } })));
   else if (agent === "cursor" && event === "beforeSubmitPrompt") process.stdout.write(JSON.stringify({ continue: true }));
   else if (agent === "cursor") process.stdout.write(JSON.stringify({ permission: "allow" }));
   else if (agent === "copilot-cli") process.stdout.write(JSON.stringify({ permissionDecision: "allow", permissionDecisionReason: reason }));
@@ -976,13 +1112,13 @@ const EXIT_2_FAILS_CLOSED = new Set(["claude-code", "codex", "cursor", "copilot-
 // where noted below.
 function emitDeny(agent: string, reason: string, event = "PreToolUse"): void {
   if (["claude-code", "codex", "muse", "vscode", "factory"].includes(agent)) {
-    process.stdout.write(JSON.stringify({
+    process.stdout.write(JSON.stringify(withNotice(agent, {
       hookSpecificOutput: {
         hookEventName: claudeStyleHookEventName(event),
         permissionDecision: "deny",
         permissionDecisionReason: `Beam: ${reason}`,
       },
-    }));
+    })));
   } else if (agent === "cursor" && event === "beforeSubmitPrompt") {
     // beforeSubmitPrompt's block contract is {continue: false, user_message} -- unlike
     // preToolUse/beforeShellExecution's {permission: "deny", ...} (verified against
