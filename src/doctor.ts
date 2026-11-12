@@ -14,6 +14,8 @@ import { readPolicy } from "./policy.js";
 import { gitGateMode } from "./git-gate.js";
 import { networkMode } from "./network-detectors.js";
 import { isPrivatePath } from "./secret-use.js";
+import { scanHistory } from "./history-scan.js";
+import { rotationAdvice, GENERIC_ROTATION } from "./secret-guidance.js";
 
 export type Status = "pass" | "warn" | "fail" | "skip";
 export interface Check { id: string; policy: string; title: string; status: Status; detail: string; fix?: string }
@@ -164,10 +166,41 @@ function repoChecks(ctx: DoctorContext, ignore: RegExp[]): Check[] {
   const real = [...hits.keys()].filter(f => !testLike(f));
   const list = (files: string[]) => files.slice(0, 6).map(f => `${f} (${[...hits.get(f)!].join(", ")})`).join(", ");
   checks.push(real.length
-    ? { id: "hardcoded-keys", policy: "6.1", title: "No hard-coded API keys in tracked files", status: "fail", detail: `Found in: ${list(real)}.`, fix: "Move them to environment variables or a secrets manager, rotate them, and clean history." }
+    ? { id: "hardcoded-keys", policy: "6.1", title: "No hard-coded API keys in tracked files", status: "fail", detail: `Found in: ${list(real)}.`, fix: `Move them to environment variables or a secrets manager. ${GENERIC_ROTATION}` }
     : hits.size
       ? { id: "hardcoded-keys", policy: "6.1", title: "No hard-coded API keys in tracked files", status: "warn", detail: `Only in test/doc files (probably fixtures): ${list([...hits.keys()])}.`, fix: "Confirm they are fake; add them to `gitGateIgnore` if so." }
       : { id: "hardcoded-keys", policy: "6.1", title: "No hard-coded API keys in tracked files", status: "pass", detail: `Scanned ${scanned} tracked files; none contain an API key or private key.` });
+
+  const history = scanHistory(root, { ignore });
+  const fixtureDir = /(?:^|\/)(?:tests?|__tests__|fixtures?|spec|docs?|examples?|samples?|scenarios?|testdata|mocks?|[\w-]*bench[\w-]*)\//i;
+  if (history.skipped) checks.push({ id: "history-secrets", policy: "6.2", title: "No secrets in commit history", status: "skip", detail: `History not scanned: ${history.skipped}.` });
+  else {
+    const real = history.hits.filter(h => !fixtureDir.test(h.file) && !(h.kind !== "CREDENTIAL_FILE" && testLike(h.file)));
+    const fmt = (hs: typeof history.hits) => hs.slice(0, 6).map(h => `${h.file} @ ${h.commit} (${h.kind === "CREDENTIAL_FILE" ? "credential file" : h.provider ? h.provider.name + " key" : h.kind})`).join(", ") + (hs.length > 6 ? `, +${hs.length - 6} more` : "");
+    const scope = `${history.commits} commits${history.truncated ? " (most recent only)" : ""}`;
+    checks.push(real.length
+      ? { id: "history-secrets", policy: "6.2", title: "No secrets in commit history", status: "fail", detail: `Found in ${scope}: ${fmt(real)}.`, fix: rotationAdvice(real.map(h => h.provider)) }
+      : history.hits.length
+        ? { id: "history-secrets", policy: "6.2", title: "No secrets in commit history", status: "warn", detail: `Only in test/doc files of ${scope} (probably fixtures): ${fmt(history.hits)}.`, fix: "Confirm they are fake; add the path to `gitGateIgnore` to silence this." }
+        : { id: "history-secrets", policy: "6.2", title: "No secrets in commit history", status: "pass", detail: `Scanned ${scope}; no API keys, private keys or credential files were ever added.` });
+  }
+
+  // 6.2: engagement code must not be on a public repository. Uses the GitHub CLI when it is installed and
+  // signed in; nothing else touches the network, and hosts we can't query are reported, not guessed.
+  const remote = String(run(ctx, "git", ["remote", "get-url", "origin"]).stdout).trim();
+  const vis = { id: "repo-visibility", policy: "6.2", title: "Repository is not public" };
+  const gh = /github\.com[:/]+([^/\s]+\/[^/\s]+?)(?:\.git)?\/?$/i.exec(remote);
+  if (!remote) checks.push({ ...vis, status: "pass", detail: "No remote configured; nothing is hosted." });
+  else if (!gh) checks.push({ ...vis, status: "skip", detail: "The origin remote is not on GitHub, so its visibility can't be checked from here.", fix: "Confirm in your host's settings that the repository is private." });
+  else {
+    const r = run(ctx, "gh", ["repo", "view", gh[1]!, "--json", "visibility", "-q", ".visibility"]);
+    const v = String(r.stdout).trim().toUpperCase();
+    checks.push(r.status !== 0 || !v
+      ? { ...vis, status: "skip", detail: `Could not read ${gh[1]}'s visibility (GitHub CLI missing or not signed in).`, fix: "Install and sign in with `gh auth login`, or confirm in GitHub settings that the repository is private." }
+      : v === "PUBLIC"
+        ? { ...vis, status: "fail", detail: `${gh[1]} is PUBLIC. Public hosting of engagement codebases is prohibited unless approved.`, fix: "Make it private (Settings > Danger zone), or get written approval from the security lead. Assume anything already pushed was read." }
+        : { ...vis, status: "pass", detail: `${gh[1]} is ${v.toLowerCase()}.` });
+  }
   return checks;
 }
 
@@ -189,7 +222,7 @@ function apiKeyStorage(ctx: DoctorContext): Check {
   const keyRe = /(?:ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)["']?\s*[:=]\s*["']?(?:sk-ant-|[A-Za-z0-9_-]{20,})/;
   const files = [join(ctx.cwd, ".claude", "settings.local.json"), join(ctx.cwd, ".claude", "settings.json"), join(ctx.home, ".claude", "settings.json"), join(ctx.cwd, ".env"), join(ctx.cwd, ".env.local")];
   const inFiles = files.filter(f => { try { return keyRe.test(readFileSync(f, "utf8")); } catch { return false; } });
-  if (inFiles.length) return { ...base, status: "fail", detail: `API key stored in a file: ${inFiles.join(", ")}.`, fix: "Remove it, rotate the key, and export ANTHROPIC_API_KEY from the OS environment or use `apiKeyHelper` with a secrets manager (1Password, Credential Manager, Key Vault)." };
+  if (inFiles.length) return { ...base, status: "fail", detail: `API key stored in a file: ${inFiles.join(", ")}.`, fix: "Remove it, rotate the key with Anthropic (Console > Settings > API keys), and export ANTHROPIC_API_KEY from the OS environment or use `apiKeyHelper` with a secrets manager (1Password, Credential Manager, Key Vault)." };
   const helper = [join(ctx.cwd, ".claude", "settings.local.json"), join(ctx.cwd, ".claude", "settings.json"), join(ctx.home, ".claude", "settings.json")].some(f => typeof readJson(f)?.apiKeyHelper === "string");
   if (helper) return { ...base, status: "pass", detail: "Key is provided by apiKeyHelper (a secrets manager command); no key found in files." };
   if (ctx.env.ANTHROPIC_API_KEY) return { ...base, status: "pass", detail: "Key comes from the ANTHROPIC_API_KEY environment variable; no key found in settings or .env files." };

@@ -157,3 +157,35 @@ describe("auto pre-commit on first touch of a git workspace", () => {
     expect(ensurePrecommit(os.tmpdir(), { env: {} })).toBeNull(); // not a repo
   });
 });
+
+describe("beam doctor: history, visibility and rotation guidance", () => {
+  const AKIA = "AKIA" + "ABCDEFGHIJKLMNOP";
+  it("finds a key that was committed and later deleted, names the provider and commit, never the value", async () => {
+    expect(by(await runDoctor(ctx()), "history-secrets").status).toBe("pass");
+    await fs.writeFile(path.join(repo, "config.ts"), `export const k = "${AKIA}";\n`); git("add", "."); git("commit", "-qm", "oops");
+    await fs.writeFile(path.join(repo, "config.ts"), "export const k = process.env.K;\n"); git("add", "."); git("commit", "-qm", "fix");
+    const c = by(await runDoctor(ctx()), "history-secrets");
+    expect(c.status).toBe("fail");
+    expect(c.detail).toContain("config.ts @ "); expect(c.detail).toContain("AWS key");
+    expect(c.fix).toContain("IAM"); // rotation guidance for the right provider
+    expect(JSON.stringify(c)).not.toContain(AKIA);
+  });
+
+  it("only warns when the key is in a test fixture, and flags a committed .env file", async () => {
+    await fs.mkdir(path.join(repo, "tests")); await fs.writeFile(path.join(repo, "tests", "a.ts"), `const k = "${AKIA}";\n`); git("add", "."); git("commit", "-qm", "fixture");
+    expect(by(await runDoctor(ctx()), "history-secrets").status).toBe("warn");
+    await fs.writeFile(path.join(repo, ".env"), "X=1\n"); git("add", "-f", ".env"); git("commit", "-qm", "env"); git("rm", "-q", "--cached", ".env"); git("commit", "-qm", "untrack");
+    const c = by(await runDoctor(ctx()), "history-secrets");
+    expect(c.status).toBe("fail"); expect(c.detail).toContain("credential file");
+  });
+
+  it("fails on a public GitHub remote, passes on private, skips when gh can't answer or host is unknown", async () => {
+    git("remote", "add", "origin", "git@github.com:acme/app.git");
+    const withGh = (out: string, status = 0): DoctorContext => ({ ...ctx(), spawn: ((cmd: string, args: string[], o: any) => cmd === "gh" ? { status, stdout: out, stderr: "" } : spawnSync(cmd, args, o)) as any });
+    expect(by(await runDoctor(withGh("PUBLIC\n")), "repo-visibility").status).toBe("fail");
+    expect(by(await runDoctor(withGh("PRIVATE\n")), "repo-visibility").status).toBe("pass");
+    expect(by(await runDoctor(withGh("", 1)), "repo-visibility").status).toBe("skip");
+    git("remote", "set-url", "origin", "git@gitlab.com:acme/app.git");
+    expect(by(await runDoctor(ctx()), "repo-visibility").status).toBe("skip");
+  });
+});
