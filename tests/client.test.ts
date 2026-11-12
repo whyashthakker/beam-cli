@@ -580,6 +580,25 @@ describe("captureHook", () => {
     expect(written.join("").includes("reads environment data")).toBe(flagged);
   });
 
+  it("drafts a policy 8.2 incident when a sensitive prompt reaches the model (warn mode), once", async () => {
+    process.env.BEAM_TOKEN = "beam_app_stre…";
+    process.env.BEAM_AUTO_PRECOMMIT = "0";
+    process.env.BEAM_DATA_DIR = await tempDir("beam-inc-");
+    process.env.BEAM_PII_PROMPT = "warn";
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const output = jest.spyOn(process.stdout, "write").mockImplementation(() => true);
+    for (let n = 0; n < 2; n++) {
+      withStdin(JSON.stringify({ hook_event_name: "UserPromptSubmit", prompt: "my card is 4111 1111 1111 1111 and ssn 123-45-6789", session_id: "s1", cwd: process.cwd() }));
+      await captureHook();
+    }
+    output.mockRestore();
+    const { listIncidents } = await import("../src/incidents.js");
+    const all = listIncidents();
+    expect(all).toHaveLength(1);
+    expect(all[0]!.source).toBe("auto"); expect(all[0]!.type).toBe("pii-disclosure");
+    expect(JSON.stringify(all[0])).not.toContain("4111"); expect(JSON.stringify(all[0])).not.toContain("123-45-6789");
+  });
+
   it("a workspace-wide Bash block still lets 'beam policy ask' through, but not an ordinary command", async () => {
     process.env.BEAM_TOKEN = "[SECRET_002]";
     const policyDir = process.env.BEAM_DATA_DIR!;

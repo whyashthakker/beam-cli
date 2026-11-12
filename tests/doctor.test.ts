@@ -189,3 +189,16 @@ describe("beam doctor: history, visibility and rotation guidance", () => {
     expect(by(await runDoctor(ctx()), "repo-visibility").status).toBe("skip");
   });
 });
+
+describe("beam doctor: incidents (8.2)", () => {
+  it("passes with none, warns while open, fails past the deadline, passes again once reported", async () => {
+    const { createIncident, markReported } = await import("../src/incidents.js");
+    expect(by(await runDoctor(ctx()), "incidents").status).toBe("pass");
+    const fresh = createIncident({ type: "other", summary: "s", dir: data }).incident;
+    expect(by(await runDoctor(ctx()), "incidents").status).toBe("warn");
+    createIncident({ type: "other", summary: "old", at: new Date(Date.now() - 5 * 3600_000), dir: data });
+    expect(by(await runDoctor(ctx()), "incidents").status).toBe("fail");
+    for (const i of (await import("../src/incidents.js")).listIncidents(data)) markReported(i.id, "lead", data);
+    expect(by(await runDoctor(ctx()), "incidents").status).toBe("pass"); void fresh;
+  });
+});

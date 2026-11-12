@@ -4,6 +4,7 @@ import path from "node:path";
 import { Command } from "commander";
 import { startServer } from "./serve.js";
 import { runClaudeWrapper } from "./claude-wrapper.js";
+import { INCIDENT_TYPES, createIncident, findIncident, formatReport, listIncidents, markReported, timeLeft, urgency, type IncidentType } from "./incidents.js";
 import { installPrecommit, scanStaged } from "./precommit.js";
 import { defaultContext, doctorExitCode, formatDoctor, runDoctor } from "./doctor.js";
 import { askApproval, captureHook, extractPreview, extractSave, importEvents, listPendingApprovals, readToken, reloadRemoteRules, resolveApproval, scanFile } from "./client.js";
@@ -832,6 +833,36 @@ program.command("doctor")
     console.log(options.json ? JSON.stringify(checks, null, 2) : formatDoctor(checks));
     process.exitCode = doctorExitCode(checks);
   });
+
+const incident = program.command("incident").description("Policy 8.2 incident records: report to the security lead within 4 hours");
+incident.command("new")
+  .description("Record an incident only you know about (e.g. a lost laptop, an accidental paste)")
+  .requiredOption("--type <type>", `one of: ${INCIDENT_TYPES.join(", ")}`)
+  .requiredOption("--summary <text>", "what happened, in a sentence; never include the secret or data itself")
+  .option("--detail <text...>", "extra facts (repeatable)")
+  .option("--json", "print JSON")
+  .action((o: { type: string; summary: string; detail?: string[]; json?: boolean }) => {
+    if (!(INCIDENT_TYPES as readonly string[]).includes(o.type)) { console.error(`Unknown type "${o.type}". Use one of: ${INCIDENT_TYPES.join(", ")}`); process.exitCode = 2; return; }
+    const { incident: i } = createIncident({ type: o.type as IncidentType, summary: o.summary, details: o.detail, source: "manual" });
+    console.log(o.json ? JSON.stringify(i, null, 2) : `${formatReport(i)}\n\nSaved as ${i.id}. Send the text above to your security lead, then run: beam incident report ${i.id} --to "<name>"`);
+  });
+incident.command("list")
+  .description("List incidents (open first); reported ones with --all")
+  .option("--all", "include incidents already reported")
+  .option("--json", "print JSON")
+  .action((o: { all?: boolean; json?: boolean }) => {
+    const rows = listIncidents().filter(i => o.all || i.status === "open");
+    if (o.json) { console.log(JSON.stringify(rows, null, 2)); return; }
+    if (!rows.length) { console.log("No open incidents."); return; }
+    for (const i of rows) console.log(`${i.id}  ${urgency(i).padEnd(8)}  ${i.status === "open" ? timeLeft(i).padEnd(14) : "reported      "}  ${i.type}  ${i.summary}`);
+  });
+incident.command("show <id>")
+  .description("Print the report for an incident, ready to send to the security lead")
+  .action((id: string) => { const i = findIncident(id); if (!i) { console.error(`No single incident matches "${id}".`); process.exitCode = 1; return; } console.log(formatReport(i)); });
+incident.command("report <id>")
+  .description("Mark an incident as sent to the security lead")
+  .requiredOption("--to <who>", "who you reported it to")
+  .action((id: string, o: { to: string }) => { const i = markReported(id, o.to); if (!i) { console.error(`No single incident matches "${id}".`); process.exitCode = 1; return; } console.log(`${i.id} marked reported to ${o.to} at ${i.reportedAt}.`); });
 
 const agent = program.command("agent").description("Discover and configure supported AI agents");
 

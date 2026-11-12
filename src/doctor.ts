@@ -14,6 +14,7 @@ import { readPolicy } from "./policy.js";
 import { gitGateMode } from "./git-gate.js";
 import { networkMode } from "./network-detectors.js";
 import { isPrivatePath } from "./secret-use.js";
+import { listIncidents, timeLeft, urgency } from "./incidents.js";
 import { scanHistory } from "./history-scan.js";
 import { rotationAdvice, GENERIC_ROTATION } from "./secret-guidance.js";
 
@@ -263,6 +264,17 @@ function workspaceIsolation(ctx: DoctorContext): Check {
   return { ...base, status: pii.size ? "fail" : "warn", detail: `Possible customer data in the workspace: ${list}${flagged.length > 6 ? ", …" : ""}.`, fix: "Move it out of this directory, or scrub it, before using Claude Code here (policy 4.3 Workspace Isolation)." };
 }
 
+// 8.2: incidents must reach the security lead within four hours. Reads Beam's own records only.
+function incidentsCheck(ctx: DoctorContext): Check {
+  const base = { id: "incidents", policy: "8.2", title: "Incidents reported within 4 hours" };
+  const open = listIncidents(ctx.dataDir).filter(i => i.status === "open");
+  const overdue = open.filter(i => urgency(i) === "overdue");
+  const label = (i: (typeof open)[number]) => `${i.id} (${i.type}, ${timeLeft(i)})`;
+  if (overdue.length) return { ...base, status: "fail", detail: `Past the 4-hour deadline: ${overdue.map(label).join(", ")}.`, fix: "Send each to the security lead now (`beam incident show <id>`), then `beam incident report <id> --to <name>`. Policy 8.2 also treats a late report as a violation to log." };
+  if (open.length) return { ...base, status: "warn", detail: `Not yet reported: ${open.map(label).join(", ")}.`, fix: "Review with `beam incident show <id>`, send it, then `beam incident report <id> --to <name>`." };
+  return { ...base, status: "pass", detail: "No open incidents." };
+}
+
 const unverifiable = (): Check[] => [
   { id: "api-tier", policy: "5.6", title: "Commercial API tier", status: "skip", detail: "Cannot be verified from this machine.", fix: "Confirm in the Anthropic Console that the key belongs to a commercial/API account." },
   { id: "workstation", policy: "6.3", title: "Workstation baseline (disk encryption, patching, screen lock)", status: "skip", detail: "Out of scope for Beam; verify with your endpoint management.", fix: "FileVault/BitLocker on, auto-update on, screen lock <= 5 minutes." },
@@ -273,7 +285,7 @@ export async function runDoctor(ctx: DoctorContext = defaultContext()): Promise<
   const ignore = (policy?.rules.gitGateIgnore ?? []).flatMap(p => { try { return [new RegExp(p)]; } catch { return []; } });
   const checks: Array<Check | Check[] | Promise<Check | Check[]>> = [
     hooksInstalled(ctx), policyEnforcement(), vaultProtected(ctx), memoryDisabled(ctx), networkEnv(ctx), claudeClient(ctx),
-    wrapperAvailable(ctx), repoChecks(ctx, ignore), extensionCheck(ctx), apiKeyStorage(ctx), workspaceIsolation(ctx), unverifiable(),
+    wrapperAvailable(ctx), repoChecks(ctx, ignore), extensionCheck(ctx), apiKeyStorage(ctx), workspaceIsolation(ctx), incidentsCheck(ctx), unverifiable(),
   ];
   const out: Check[] = [];
   for (const entry of checks) {

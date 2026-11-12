@@ -17,6 +17,7 @@ import { readIdentity, type Identity } from "./enroll.js";
 import { loadCustomRules } from "./custom-rules.js";
 import { configureDetectors, detectSensitive, redactSensitive, type DataFinding } from "./data-detectors.js";
 import { countNetwork, networkMode, TOPOLOGY_KINDS } from "./network-detectors.js";
+import { createIncident } from "./incidents.js";
 import { ensurePrecommit } from "./precommit.js";
 import { applyGitGate, gitGateMode } from "./git-gate.js";
 import { takeWrapperNotices } from "./wrapper-notice.js";
@@ -545,6 +546,17 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
       const found = promptMode === "off" ? { blocking: [], advisory: [] } : promptFindings(data.prompt, promptPolicy?.rules.customDetectors, netMode === "block");
       const promptSession = vaultScope(String(data.session_id ?? data.sessionId ?? ""));
       if (netMode !== "off") await recordNetwork(promptSession, "your prompt", countNetwork(data.prompt)).catch(() => {});
+      // A disclosure Beam could not prevent (warn mode, or an agent whose prompt can't be blocked) is an
+      // incident under policy 8.2. A blocked-and-vaulted prompt is not: the model never saw it.
+      if (promptMode !== "off" && found.blocking.length && !(promptMode === "block" && promptGate && promptSession)) {
+        try {
+          const hasSecret = found.blocking.some(f => ["API_KEY", "PRIVATE_KEY", "SECRET", "PASSWORD"].includes(f.kind));
+          createIncident({ type: hasSecret ? "secret-disclosure" : "pii-disclosure", source: "auto", key: `prompt:${sourceAgent}:${hasSecret ? "secret" : "pii"}`,
+            summary: `A prompt to ${sourceAgent} containing sensitive data reached the model (${promptMode === "warn" ? "prompt blocking is in warn mode" : "this agent's prompts can't be blocked"}).`,
+            details: [summarizeFindings(found.blocking), `session ${String(data.session_id ?? "unknown")}`] });
+          addNotice("recorded a policy 8.2 incident draft for this disclosure. Review it with `beam incident list`; it must be reported within 4 hours.");
+        } catch { /* recording must never break the hook */ }
+      }
       if (promptMode === "block" && promptGate && found.blocking.length && promptSession) {
         // The agent can't rewrite a typed prompt, so the only way the model never sees these values is
         // to stop the prompt: vault the real values and hand the user a placeholder version to resend.
@@ -731,6 +743,12 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
         custom: policyBundle?.rules.customDetectors,
         ignore: policyBundle?.rules.gitGateIgnore,
       });
+    }
+    if (eventKind === "pre" && decision.riskFactors.includes("git push: sensitive content") && (decision.action === "allow" || decision.action === "warn")) {
+      try {
+        createIncident({ type: "secret-disclosure", source: "auto", key: `git-push:${String(data.cwd ?? "")}`, summary: "An agent ran `git push` and Beam's git gate found sensitive data in the commits being published; the push was not stopped.", details: [`repository ${String(data.cwd ?? "unknown")}`, "see the git gate notice for file and line (values are never recorded)"] });
+        addNotice("recorded a policy 8.2 incident draft for this push. Review it with `beam incident list`.");
+      } catch { /* never break the hook */ }
     }
     const policyMode = decision.mode;
     if (decision.action === "allow" && workspace) {
