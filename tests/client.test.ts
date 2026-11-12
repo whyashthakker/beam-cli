@@ -565,6 +565,21 @@ describe("captureHook", () => {
     output.mockRestore();
   });
 
+  it.each([
+    ["the word env only in the Bash description", { command: "npm test", description: "Show env" }, false],
+    ["a real environment dump in the command", { command: "printenv", description: "Run tests" }, true],
+  ])("environment-data notice: %s", async (_name, toolInput, flagged) => {
+    process.env.BEAM_TOKEN = "[SECRET_009]";
+    process.env.BEAM_AUTO_PRECOMMIT = "0";
+    withStdin(JSON.stringify({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: toolInput, session_id: "s1", cwd: process.cwd() }));
+    global.fetch = jest.fn(async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    const written: string[] = [];
+    const output = jest.spyOn(process.stdout, "write").mockImplementation((chunk) => { written.push(String(chunk)); return true; });
+    await captureHook();
+    output.mockRestore();
+    expect(written.join("").includes("reads environment data")).toBe(flagged);
+  });
+
   it("a workspace-wide Bash block still lets 'beam policy ask' through, but not an ordinary command", async () => {
     process.env.BEAM_TOKEN = "[SECRET_002]";
     const policyDir = process.env.BEAM_DATA_DIR!;

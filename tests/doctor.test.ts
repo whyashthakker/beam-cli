@@ -111,3 +111,49 @@ describe("beam doctor", () => {
     expect(doctorExitCode([{ id: "x", policy: "1", title: "t", status: "warn", detail: "d" }])).toBe(0);
   });
 });
+
+describe("beam doctor: completed partial checks", () => {
+  it("fails when an API key is stored in a file, passes with env var or apiKeyHelper", async () => {
+    expect(by(await runDoctor(ctx({ ANTHROPIC_API_KEY: "x" })), "api-key-storage").status).toBe("pass");
+    await fs.writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({ env: { ANTHROPIC_API_KEY: "sk-ant-api03-abcdefghijklmnopqrstuvwxyz" } }));
+    expect(by(await runDoctor(ctx()), "api-key-storage").status).toBe("fail");
+    await fs.writeFile(path.join(home, ".claude", "settings.json"), JSON.stringify({ apiKeyHelper: "op read x" }));
+    expect(by(await runDoctor(ctx()), "api-key-storage").status).toBe("pass");
+  });
+
+  it("flags customer-data files in the workspace and ignores fixtures", async () => {
+    expect(by(await runDoctor(ctx()), "workspace-isolation").status).toBe("pass");
+    await fs.mkdir(path.join(repo, "tests")); await fs.writeFile(path.join(repo, "tests", "customers.csv"), "a");
+    expect(by(await runDoctor(ctx()), "workspace-isolation").status).toBe("pass");
+    await fs.writeFile(path.join(repo, "customers.csv"), "name\nx\n");
+    expect(by(await runDoctor(ctx()), "workspace-isolation").status).toBe("warn");
+  });
+
+  it("installs a pre-commit hook that blocks a staged secret and is idempotent", async () => {
+    const { installPrecommit, scanStaged } = await import("../src/precommit.js");
+    expect(installPrecommit(repo).changed).toBe(true);
+    expect(installPrecommit(repo).changed).toBe(false);
+    expect(by(await runDoctor(ctx()), "precommit").status).toBe("pass");
+    expect(scanStaged(repo, { env: { CLAUDECODE: "1" } }).code).toBe(0);
+    await fs.writeFile(path.join(repo, "k.ts"), 'const k = "-----BEGIN RSA PRIVATE KEY-----\\nabc\\n-----END RSA PRIVATE KEY-----";\n');
+    git("add", "k.ts");
+    expect(scanStaged(repo, { env: {} })).toEqual({ code: 0, report: "" }); // a human commit is never blocked
+    const r = scanStaged(repo, { env: { CLAUDECODE: "1" } }); expect(r.code).toBe(1); expect(r.report).not.toContain("abc");
+    expect(scanStaged(repo, { env: {}, everyone: true }).code).toBe(1); // opt-in for humans
+  });
+});
+
+describe("auto pre-commit on first touch of a git workspace", () => {
+  it("installs once, respects removal, opt-out, and existing scanners", async () => {
+    const { ensurePrecommit } = await import("../src/precommit.js");
+    const hook = path.join(repo, ".git", "hooks", "pre-commit");
+    expect(ensurePrecommit(repo, { env: {}, policyValue: "off" })).toBeNull();
+    expect(ensurePrecommit(repo, { env: { BEAM_AUTO_PRECOMMIT: "0" } })).toBeNull();
+    expect(ensurePrecommit(repo, { env: {} })?.changed).toBe(true);
+    expect(await fs.readFile(hook, "utf8")).toContain("beam git-scan");
+    await fs.rm(hook);
+    expect(ensurePrecommit(repo, { env: {} })).toBeNull(); // already handled: not put back
+    expect(await fs.stat(hook).catch(() => null)).toBeNull();
+    expect(ensurePrecommit(os.tmpdir(), { env: {} })).toBeNull(); // not a repo
+  });
+});

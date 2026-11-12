@@ -4,6 +4,7 @@ import path from "node:path";
 import { Command } from "commander";
 import { startServer } from "./serve.js";
 import { runClaudeWrapper } from "./claude-wrapper.js";
+import { installPrecommit, scanStaged } from "./precommit.js";
 import { defaultContext, doctorExitCode, formatDoctor, runDoctor } from "./doctor.js";
 import { askApproval, captureHook, extractPreview, extractSave, importEvents, listPendingApprovals, readToken, reloadRemoteRules, resolveApproval, scanFile } from "./client.js";
 import { supportsExtraction } from "./extract.js";
@@ -812,11 +813,21 @@ program.command("claude")
     process.exitCode = await runClaudeWrapper(process.argv.slice(at + 1));
   });
 
+program.command("git-scan")
+  .description("Scan staged changes for secrets and PII (used by the pre-commit hook); exits 1 on findings. Agent commits only unless --everyone")
+  .option("--everyone", "scan human commits too, not only commits made by an agent")
+  .action((options: { everyone?: boolean }) => { const r = scanStaged(process.cwd(), { everyone: options.everyone }); if (r.report) console.error(r.report); process.exitCode = r.code; });
+
 program.command("doctor")
   .description("Check this machine and repository against the Claude Code Secure Usage Policy (read-only)")
   .option("--json", "print the checks as JSON")
   .option("--cwd <dir>", "repository to check (default: current directory)")
-  .action(async (options: { json?: boolean; cwd?: string }) => {
+  .option("--install-precommit", "install a git pre-commit hook that scans staged changes for secrets, then check")
+  .action(async (options: { json?: boolean; cwd?: string; installPrecommit?: boolean }) => {
+    if (options.installPrecommit) {
+      const r = installPrecommit(options.cwd ? path.resolve(options.cwd) : process.cwd());
+      console.error(r.changed ? `Installed Beam pre-commit hook: ${r.path}` : `Beam pre-commit hook already installed: ${r.path}`);
+    }
     const checks = await runDoctor(defaultContext(options.cwd ? path.resolve(options.cwd) : process.cwd()));
     console.log(options.json ? JSON.stringify(checks, null, 2) : formatDoctor(checks));
     process.exitCode = doctorExitCode(checks);

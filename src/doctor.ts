@@ -177,10 +177,57 @@ async function extensionCheck(ctx: DoctorContext): Promise<Check> {
   const approved = (policy?.rules as { approvedExtensions?: string[] } | undefined)?.approvedExtensions;
   const list = run(ctx, "code", ["--list-extensions"]);
   if (list.status !== 0) return { ...base, status: "skip", detail: "The `code` command is not available, so installed extensions can't be listed." };
-  if (!approved) return { ...base, status: "skip", detail: "No `approvedExtensions` allowlist in policy.json, so there is nothing to compare against. Policy 3 bans extensions that relay code or prompts unless approved.", fix: "Add `approvedExtensions: [\"publisher.name\", ...]` to policy.json." };
+  if (!approved) return { ...base, status: "warn", detail: "No `approvedExtensions` allowlist in policy.json, so there is nothing to compare against. Policy 3 bans extensions that relay code or prompts unless approved.", fix: "Add `approvedExtensions: [\"publisher.name\", ...]` to policy.json." };
   const allowed = new Set(approved.map(s => s.toLowerCase()));
   const extra = String(list.stdout).split("\n").map(s => s.trim()).filter(Boolean).filter(id => !allowed.has(id.toLowerCase()));
   return extra.length ? { ...base, status: "warn", detail: `Not on the allowlist: ${extra.slice(0, 10).join(", ")}${extra.length > 10 ? ", …" : ""}.`, fix: "Review them for code/prompt relaying, then approve or remove." } : { ...base, status: "pass", detail: "All installed extensions are on the allowlist." };
+}
+
+// 6.1: the key must live in an OS env var or secrets manager, never in a file. Reports paths only.
+function apiKeyStorage(ctx: DoctorContext): Check {
+  const base = { id: "api-key-storage", policy: "6.1", title: "Anthropic API key storage" };
+  const keyRe = /(?:ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)["']?\s*[:=]\s*["']?(?:sk-ant-|[A-Za-z0-9_-]{20,})/;
+  const files = [join(ctx.cwd, ".claude", "settings.local.json"), join(ctx.cwd, ".claude", "settings.json"), join(ctx.home, ".claude", "settings.json"), join(ctx.cwd, ".env"), join(ctx.cwd, ".env.local")];
+  const inFiles = files.filter(f => { try { return keyRe.test(readFileSync(f, "utf8")); } catch { return false; } });
+  if (inFiles.length) return { ...base, status: "fail", detail: `API key stored in a file: ${inFiles.join(", ")}.`, fix: "Remove it, rotate the key, and export ANTHROPIC_API_KEY from the OS environment or use `apiKeyHelper` with a secrets manager (1Password, Credential Manager, Key Vault)." };
+  const helper = [join(ctx.cwd, ".claude", "settings.local.json"), join(ctx.cwd, ".claude", "settings.json"), join(ctx.home, ".claude", "settings.json")].some(f => typeof readJson(f)?.apiKeyHelper === "string");
+  if (helper) return { ...base, status: "pass", detail: "Key is provided by apiKeyHelper (a secrets manager command); no key found in files." };
+  if (ctx.env.ANTHROPIC_API_KEY) return { ...base, status: "pass", detail: "Key comes from the ANTHROPIC_API_KEY environment variable; no key found in settings or .env files." };
+  return { ...base, status: "skip", detail: "No API key in the environment or helper (the session may use another login). Nothing hard-coded was found." };
+}
+
+// 4.3 workspace isolation: customer data must not sit in the workspace Claude Code is running in.
+// Heuristic: customer-data-looking file names, plus PII in a sample of data files. Never prints values.
+function workspaceIsolation(ctx: DoctorContext): Check {
+  const base = { id: "workspace-isolation", policy: "4.3", title: "No customer data in this workspace" };
+  const nameRe = /(?:customers?|clients?|patients?|users?|members?|employees?|subscribers?|prod(?:uction)?[-_]?(?:dump|data|export|backup)|pii|phi)[\w.-]*\.(?:csv|tsv|sql|json|jsonl|ndjson|xlsx?|parquet|dump|bak)$|\.(?:dump|bak|sqlite3?|db)$/i;
+  const skip = new Set([".git", "node_modules", "dist", "build", ".next", "coverage", "venv", ".venv", "__pycache__", "target"]);
+  const testy = /(?:^|\/)(?:tests?|__tests__|fixtures?|mocks?|examples?|samples?|testdata|docs?)(?:\/|$)/i;
+  const named: string[] = [], pii = new Map<string, Set<string>>();
+  let seen = 0;
+  const walk = (dir: string, rel: string, depth: number) => {
+    if (depth > 4 || seen > 3000) return;
+    let entries; try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) { if (!skip.has(e.name)) walk(join(dir, e.name), r, depth + 1); continue; }
+      if (!e.isFile() || testy.test(r)) continue;
+      seen++;
+      if (nameRe.test(e.name)) named.push(r);
+      if (/\.(?:csv|tsv|sql|jsonl|ndjson|json)$/i.test(e.name) && pii.size < 10) {
+        try {
+          const full = join(dir, e.name); if (statSync(full).size > 2_000_000) continue;
+          const kinds = new Set(detectSensitive(readFileSync(full, "utf8").slice(0, 200_000)).filter(f => ["EMAIL", "PHONE", "SSN", "CREDIT_CARD", "IBAN", "NATIONAL_ID", "PASSPORT", "MRN", "HEALTH_PLAN_ID", "MEDICAL_ID", "PHI"].includes(f.kind) && f.confidence >= 0.8).map(f => f.kind));
+          if (kinds.size >= 2 && /\.(?:csv|tsv|sql|jsonl|ndjson)$/i.test(e.name) || kinds.size >= 3) pii.set(r, kinds);
+        } catch { /* unreadable */ }
+      }
+    }
+  };
+  walk(ctx.cwd, "", 0);
+  const flagged = [...new Set([...named, ...pii.keys()])];
+  if (!flagged.length) return { ...base, status: "pass", detail: `Scanned ${seen} files; no customer-data-looking files found.` };
+  const list = flagged.slice(0, 6).map(f => pii.has(f) ? `${f} (${[...pii.get(f)!].join(", ")})` : f).join(", ");
+  return { ...base, status: pii.size ? "fail" : "warn", detail: `Possible customer data in the workspace: ${list}${flagged.length > 6 ? ", …" : ""}.`, fix: "Move it out of this directory, or scrub it, before using Claude Code here (policy 4.3 Workspace Isolation)." };
 }
 
 const unverifiable = (): Check[] => [
@@ -193,7 +240,7 @@ export async function runDoctor(ctx: DoctorContext = defaultContext()): Promise<
   const ignore = (policy?.rules.gitGateIgnore ?? []).flatMap(p => { try { return [new RegExp(p)]; } catch { return []; } });
   const checks: Array<Check | Check[] | Promise<Check | Check[]>> = [
     hooksInstalled(ctx), policyEnforcement(), vaultProtected(ctx), memoryDisabled(ctx), networkEnv(ctx), claudeClient(ctx),
-    wrapperAvailable(ctx), repoChecks(ctx, ignore), extensionCheck(ctx), unverifiable(),
+    wrapperAvailable(ctx), repoChecks(ctx, ignore), extensionCheck(ctx), apiKeyStorage(ctx), workspaceIsolation(ctx), unverifiable(),
   ];
   const out: Check[] = [];
   for (const entry of checks) {

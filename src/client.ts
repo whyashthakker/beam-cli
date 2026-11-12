@@ -17,6 +17,7 @@ import { readIdentity, type Identity } from "./enroll.js";
 import { loadCustomRules } from "./custom-rules.js";
 import { configureDetectors, detectSensitive, redactSensitive, type DataFinding } from "./data-detectors.js";
 import { countNetwork, networkMode, TOPOLOGY_KINDS } from "./network-detectors.js";
+import { ensurePrecommit } from "./precommit.js";
 import { applyGitGate, gitGateMode } from "./git-gate.js";
 import { takeWrapperNotices } from "./wrapper-notice.js";
 import { recordNetwork, recordEvent, takeTurnSummary, vaultScope, attachLedgerOutput, commandSendsOverNetwork, maskVaulted, promptFindings, recordSubstitution, redactAndVault, resolvePlaceholders, takeUnreportedLedger } from "./pii-vault.js";
@@ -526,6 +527,7 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
     const modelSkip = netMode === "redact" || netMode === "block" || netMode === "off" ? undefined : TOPOLOGY_KINDS;
 
     const eventKind = hookKind(String(data.hook_event_name ?? ""));
+    try { if (eventKind === "prompt" || eventKind === "pre") ensurePrecommit(String(data.cwd ?? ""), { policyValue: startPolicy?.rules.autoPrecommit }); } catch { /* never block a hook on setup */ }
     const promptGate = eventKind === "prompt" && ["claude-code", "codex", "cursor", "gemini"].includes(sourceAgent);
     canBlock = eventKind === "pre" || promptGate;
     if (eventKind === "prompt" && typeof data.prompt === "string") {
@@ -969,8 +971,10 @@ async function resolveWarnInteractively(decision: Decision, targetPath: string, 
   return decision;
 }
 
+// Free-text fields that describe an action to the user (e.g. Bash `description`) but are never executed or read.
+const PROSE_INPUT_FIELDS = new Set(["description", "activeForm"]);
 function isEnvironmentAccess(tool: string, command: string, path: string, input: Record<string, unknown>): boolean {
-  const text = `${tool} ${command} ${path} ${Object.values(input).filter(value => typeof value === "string").join(" ")}`;
+  const text = `${tool} ${command} ${path} ${Object.entries(input).filter(([key, value]) => typeof value === "string" && !PROSE_INPUT_FIELDS.has(key)).map(([, value]) => value).join(" ")}`;
   const context=classifyActionContext(tool,{...input,file_path:path},"",command,v=>v,false);
   const scoped=environmentRisk(context);
   if(context.actions.length && context.actions.every(a=>a.operation==="source-search"))return false;
