@@ -662,7 +662,7 @@ export async function captureHook(sourceAgent = "claude-code", home = homedir(),
       if (["cline", "antigravity"].includes(sourceAgent)) emitAllow(sourceAgent, undefined, String(data.hook_event_name ?? "PreToolUse"));
       return;
     }
-    const policyBundle = await readPolicy().catch(() => null);
+    const policyBundle = await readPolicy(typeof data.cwd === "string" ? data.cwd : process.cwd()).catch(() => null);
     setIgnoredRules(policyBundle?.rules.ignoredRules ?? [], sourceAgent);
     // Vault substitution: a shell command that carries this session's placeholders ([SSN_001]) is
     // evaluated, and later run, with the real values. The model only ever wrote the placeholder.

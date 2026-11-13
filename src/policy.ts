@@ -1,9 +1,15 @@
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { applyReviewConfig, type ReviewRequirements } from "./review-config.js";
+import { parseGitCommands } from "./git-gate.js";
+import { workspaceRoot } from "./workspace-config.js";
 import { activityType } from "./activity.js";
 import { classifyActionContext } from "./action-context.js";
 import { environmentRisk } from "./access-risk.js";
 import { builtinRulesById } from "./rule-catalog.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { workspacePolicyPath } from "./workspace-config.js";
 import { getDataDirectory } from "./config.js";
 import type { CustomDetector } from "./data-detectors.js";
 import type { ApprovalPolicy } from "./approvals.js";
@@ -16,7 +22,7 @@ export interface PolicyRule { id: string; title?: string; action: PolicyAction; 
 // `agent` scopes the pause to just that agent (case-insensitive, e.g. "codex") -- other
 // agents keep detecting it normally.
 export interface IgnoredRule { ruleId: string; agent?: string }
-export interface PolicyRules { mode: PolicyMode; blockedTools: string[]; blockedCommandPatterns: string[]; disabledAgents: string[]; rules?: PolicyRule[]; risk?: { askAt?: number; blockAt?: number }; customDetectors?: CustomDetector[]; ignoredRules?: (string | IgnoredRule)[]; piiPrompt?: "block" | "warn" | "off"; autoPrecommit?: "on" | "off"; gitGate?: "ask" | "block" | "warn" | "off"; gitGateIgnore?: string[]; approvedExtensions?: string[]; networkTopology?: "report" | "redact" | "block" | "off" }
+export interface PolicyRules { review?: ReviewRequirements; mode: PolicyMode; blockedTools: string[]; blockedCommandPatterns: string[]; disabledAgents: string[]; rules?: PolicyRule[]; risk?: { askAt?: number; blockAt?: number }; customDetectors?: CustomDetector[]; ignoredRules?: (string | IgnoredRule)[]; piiPrompt?: "block" | "warn" | "off"; autoPrecommit?: "on" | "off"; gitGate?: "ask" | "block" | "warn" | "off"; gitGateIgnore?: string[]; approvedExtensions?: string[]; networkTopology?: "report" | "redact" | "block" | "off" }
 export interface PolicyBundle { version: number; rules: PolicyRules; notAfter: string | null; errors?: string[] }
 const EMPTY: PolicyRules = { mode: "observe", blockedTools: [], blockedCommandPatterns: [], disabledAgents: [], rules: [], customDetectors: [], ignoredRules: [] };
 export function policyPath(): string { return join(getDataDirectory(), "policy.json"); }
@@ -39,11 +45,11 @@ function validRule(v: unknown, index: number, errors: string[]): PolicyRule | un
   if (r.risk !== undefined && (typeof r.risk !== "number" || r.risk < 0 || r.risk > 100)) { errors.push(`rules[${index}] (${r.id}).risk must be 0-100`); return undefined; }
   return { ...r, action: String(r.action).toUpperCase() as PolicyAction } as PolicyRule;
 }
-export async function readPolicy(): Promise<PolicyBundle | null> {
-  const read = async (path: string): Promise<PolicyBundle> => {
+export async function readPolicy(cwd = process.cwd()): Promise<PolicyBundle | null> {
+  const read = async (path: string, defaults?: PolicyBundle | null): Promise<PolicyBundle> => {
     const parsed = JSON.parse(await readFile(path, "utf8")) as Partial<PolicyBundle>;
     if (!parsed.rules || typeof parsed.rules !== "object") throw new Error("missing rules");
-    const errors: string[] = []; const source = parsed.rules as Partial<PolicyRules>;
+    const errors: string[] = [...(defaults?.errors ?? [])]; const source = { ...defaults?.rules, ...parsed.rules } as Partial<PolicyRules>;
     if (source.customDetectors !== undefined && (!Array.isArray(source.customDetectors) || source.customDetectors.some(d => !d || typeof d.name !== "string" || typeof d.pattern !== "string" || typeof d.replacement !== "string"))) errors.push("customDetectors must contain name, pattern, and replacement strings");
     if (source.autoPrecommit !== undefined && !["on", "off"].includes(source.autoPrecommit)) errors.push("autoPrecommit must be on or off");
     if (source.gitGate !== undefined && !["ask", "block", "warn", "off"].includes(source.gitGate)) errors.push("gitGate must be ask, block, warn, or off");
@@ -62,14 +68,22 @@ export async function readPolicy(): Promise<PolicyBundle | null> {
     if (source.rules !== undefined && !Array.isArray(source.rules)) errors.push("rules must be an array");
     return { version: typeof parsed.version === "number" ? parsed.version : 0, notAfter: typeof parsed.notAfter === "string" ? parsed.notAfter : null, rules: { ...EMPTY, ...source, rules }, errors };
   };
-  try {
-    return await read(policyPath());
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    try { return await read(lastGoodPolicyPath()); } catch {
-      // A present but malformed policy with no last-known-good copy fails closed.
-      return { version: 0, notAfter: null, errors: ["Policy file is malformed or unreadable; no last-known-good policy is available."], rules: { ...EMPTY, mode: "enforce" } };
+  let global: PolicyBundle | null = null;
+  try { global = await read(policyPath()); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      try { global = await read(lastGoodPolicyPath()); }
+      catch { global = { version: 0, notAfter: null, errors: ["Global policy is malformed or unreadable."], rules: { ...EMPTY, mode: "enforce" } }; }
     }
+  }
+  const local = workspacePolicyPath(cwd);
+  if (!local) return applyReviewConfig(global, cwd);
+  try {
+    const workspace = await read(local, global);
+    return applyReviewConfig({ ...workspace, version: global?.version ?? workspace.version, notAfter: global?.notAfter ?? workspace.notAfter }, cwd);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return applyReviewConfig(global, cwd);
+    return { version: global?.version ?? 0, notAfter: global?.notAfter ?? null, errors: [...(global?.errors ?? []), `Workspace policy is malformed or unreadable: ${local}`], rules: { ...(global?.rules ?? EMPTY), mode: "enforce" } };
   }
 }
 
@@ -115,12 +129,24 @@ export function evaluate(bundle: PolicyBundle | null, ctx: ActionContext): Decis
   const info = riskInfo(ctx); const score = info.score; const base = { mode: bundle?.rules.mode ?? "observe", policyVersion: bundle?.version ?? 0, riskScore: score, riskLevel: info.level, riskFactors: info.factors, customDetectors: bundle?.rules.customDetectors ?? [], actor: ctx.user, role: ctx.role, agent: ctx.agent, tool: ctx.tool, command: ctx.command, args: ctx.args, resource: ctx.path ?? ctx.url, errors: bundle?.errors };
   if (!bundle) return { action: "allow", ...base };
   if (bundle.errors?.length) return { action: "deny", ...base, reason: `Security policy rejected: ${bundle.errors.join("; ")}`, rule: "policy.invalid" };
-  if (bundle.notAfter && Date.parse(bundle.notAfter) < Date.now()) return { action: "allow", ...base };
+  if (!bundle.rules.review && bundle.notAfter && Date.parse(bundle.notAfter) < Date.now()) return { action: "allow", ...base };
   const pathTargets = bundle.rules.rules?.some((r) => r.path) ? policyPathTargets(ctx) : undefined;
   // A manager can enforce a narrow mitigation without enabling unrelated policy
   // rules or risk thresholds for this member's other tools and agents.
   const mandatory = (bundle.rules.rules ?? []).filter((r) => r.enforce === true && r.action === "BLOCK" && matches(r, { ...ctx, riskScore: score, pathTargets })).sort((a, b) => specificity(b) - specificity(a))[0];
   if (mandatory) return { ...base, mode: "enforce", action: "deny", reason: mandatory.reason, policy: "local policy", rule: mandatory.id };
+  const review = bundle.rules.review;
+  if (review) {
+    if (bundle.rules.disabledAgents.some(a => a.toLowerCase() === ctx.agent.toLowerCase()) || bundle.rules.blockedTools.some(tool => matches({ id: "blocked", tool, action: "BLOCK" }, { ...ctx, riskScore: score })) || bundle.rules.rules?.some(r => r.action === "BLOCK" && matches(r, { ...ctx, riskScore: score, pathTargets })) || bundle.rules.blockedCommandPatterns.some(p => { try { return new RegExp(p, "i").test(ctx.command); } catch { return false; } })) return { ...base, mode: "enforce", action: "deny", rule: "review.existing-block", reason: "An existing policy block takes precedence over review approval." };
+    const root = workspaceRoot(ctx.cwd ?? process.cwd());
+    const isolated = root && review.isolatedPaths?.some(p => existsSync(resolve(root, p)));
+    if (isolated) return { ...base, mode: "enforce", action: "deny", rule: "review.workspace-isolation", reason: "Customer-data paths exist in this workspace. Move or scrub the data and obtain an approved configuration change before using the agent." };
+    const write = ctx.eventType === "file.write";
+    const security = write && review.securityPaths?.some(p => matches({ id: "security", action: "ASK", path: resolve(root ?? ctx.cwd ?? process.cwd(), p) }, { ...ctx, riskScore: score }));
+    if ((review.edits && write) || security || (review.commands && ctx.eventType === "command.exec") || (review.commits && parseGitCommands(ctx.command).some(c => c.kind === "commit" || c.kind === "push"))) {
+      return { ...base, mode: "enforce", action: "ask", rule: "review.required", reason: security ? "Security-sensitive code requires human review before this action." : "Repository policy requires explicit human review before this action." };
+    }
+  }
   const observe = bundle.rules.mode === "observe";
   // A disabled agent is a suspension, so a more specific command ALLOW must not re-enable it.
   // User-scoped bundles limit this suspension to their recipient. This is an explicit block, same

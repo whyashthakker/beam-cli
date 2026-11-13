@@ -252,3 +252,19 @@ describe("agent action type rules", () => {
     expect(evaluate({ ...policy, rules: { ...policy.rules, mode: "observe" } }, { agent: "claude-code", tool: "Read", command: "" }).action).toBe("allow");
   });
 });
+
+describe("repository review requirements", () => {
+  it("requires command review even in observe mode", () => {
+    const decision = evaluate(bundle({ mode: "observe", review: { commands: true } }), { ...ctx, command: "echo hello", eventType: "command.exec" });
+    expect(decision.action).toBe("ask");
+    expect(decision.mode).toBe("enforce");
+  });
+  it("does not turn an explicit deny into an approval", () => {
+    expect(evaluate(bundle({ blockedTools: ["Bash"], review: { commands: true } }), { ...ctx, eventType: "command.exec" }).action).toBe("deny");
+  });
+  it("gates clean commits and permits reads", () => {
+    const policy = bundle({ mode: "observe", review: { commits: true, edits: true } });
+    expect(evaluate(policy, { ...ctx, command: "git commit -m reviewed" }).action).toBe("ask");
+    expect(evaluate(policy, { ...ctx, tool: "Read", command: "", eventType: "file.read" }).action).toBe("allow");
+  });
+});

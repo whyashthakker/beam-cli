@@ -44,8 +44,8 @@ function hooksInstalled(ctx: DoctorContext): Check {
     : { ...base, status: "pass", detail: `All ${wanted.length} hooks are registered.` };
 }
 
-async function policyEnforcement(): Promise<Check[]> {
-  const bundle = await readPolicy().catch(() => null);
+async function policyEnforcement(ctx: DoctorContext): Promise<Check[]> {
+  const bundle = await readPolicy(ctx.cwd).catch(() => null);
   const rules = bundle?.rules;
   const modeName = rules?.mode ?? "observe";
   const enforcing: Check = modeName === "observe"
@@ -207,7 +207,7 @@ function repoChecks(ctx: DoctorContext, ignore: RegExp[]): Check[] {
 
 async function extensionCheck(ctx: DoctorContext): Promise<Check> {
   const base = { id: "extensions", policy: "3", title: "VS Code extensions are approved" };
-  const policy = await readPolicy().catch(() => null);
+  const policy = await readPolicy(ctx.cwd).catch(() => null);
   const approved = (policy?.rules as { approvedExtensions?: string[] } | undefined)?.approvedExtensions;
   const list = run(ctx, "code", ["--list-extensions"]);
   if (list.status !== 0) return { ...base, status: "skip", detail: "The `code` command is not available, so installed extensions can't be listed." };
@@ -281,10 +281,10 @@ const unverifiable = (): Check[] => [
 ];
 
 export async function runDoctor(ctx: DoctorContext = defaultContext()): Promise<Check[]> {
-  const policy = await readPolicy().catch(() => null);
+  const policy = await readPolicy(ctx.cwd).catch(() => null);
   const ignore = (policy?.rules.gitGateIgnore ?? []).flatMap(p => { try { return [new RegExp(p)]; } catch { return []; } });
   const checks: Array<Check | Check[] | Promise<Check | Check[]>> = [
-    hooksInstalled(ctx), policyEnforcement(), vaultProtected(ctx), memoryDisabled(ctx), networkEnv(ctx), claudeClient(ctx),
+    hooksInstalled(ctx), policyEnforcement(ctx), vaultProtected(ctx), memoryDisabled(ctx), networkEnv(ctx), claudeClient(ctx),
     wrapperAvailable(ctx), repoChecks(ctx, ignore), extensionCheck(ctx), apiKeyStorage(ctx), workspaceIsolation(ctx), incidentsCheck(ctx), unverifiable(),
   ];
   const out: Check[] = [];

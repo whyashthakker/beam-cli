@@ -38,7 +38,14 @@ export function installPrecommit(cwd: string, beamCommand = "beam"): InstallResu
   if (!root) throw new Error("Not inside a git repository.");
   const dir = resolve(cwd, git("rev-parse", "--git-path", "hooks"));
   const file = join(dir, "pre-commit");
-  const block = `${BEGIN}\nif command -v ${beamCommand} >/dev/null 2>&1; then ${beamCommand} git-scan || exit 1; fi\n${END}\n`;
+  // Git hooks run in a small, non-interactive environment and often do not inherit npm's
+  // global-bin PATH. Prefer the exact Beam CLI used to install this hook (and its Node runtime),
+  // while still allowing an explicit command override for integrations and tests.
+  const shellQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+  const command = beamCommand === "beam"
+    ? `${shellQuote(process.execPath)} ${shellQuote(resolve(process.argv[1] ?? ""))}`
+    : beamCommand;
+  const block = `${BEGIN}\n${command} git-scan || exit 1\n${END}\n`;
   let existing = existsSync(file) ? readFileSync(file, "utf8") : "";
   let next: string;
   if (existing.includes(BEGIN)) next = existing.replace(new RegExp(`${BEGIN}[\\s\\S]*?${END}\\n?`), block);

@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { getDataDirectory } from "./config.js";
 import { redact } from "./core.js";
+import { workspaceRoot } from "./workspace-config.js";
 
 // A session's title is decided once, on the device, and never recomputed per event:
 //   1. the first prompt of a session, trimmed and redacted, becomes the title straight away;
@@ -143,7 +144,9 @@ export async function notePrompt(sessionId: string, prompt: string, cwd = ""): P
     state[sessionId] = { title: topic, source: "prompt", attempts: 0, ts: Date.now(), turn: 1, topic, shift: false, cwd, recent: [topic] };
   } else {
     const substantive = words(topic).length >= MIN_TOPIC_WORDS - 1;
-    const cwdChanged = Boolean(cwd && entry.cwd && cwd !== entry.cwd);
+    const previousRoot = entry.cwd ? workspaceRoot(entry.cwd) : undefined;
+    const currentRoot = cwd ? workspaceRoot(cwd) : undefined;
+    const cwdChanged = Boolean(cwd && entry.cwd && (previousRoot && currentRoot ? previousRoot !== currentRoot : cwd !== entry.cwd));
     entry.turn = (entry.turn ?? 1) + 1;
     entry.ts = Date.now();
     entry.shift = cwdChanged || (substantive && isTopicShift(topic, entry.recent ?? []));

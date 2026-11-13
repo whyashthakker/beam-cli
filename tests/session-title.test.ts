@@ -71,6 +71,15 @@ describe("turns and topic shift", () => {
     await notePrompt("t2", "continue with the export", "/repo/b");
     expect((await sessionContextFor("cursor", "t2", { home: dir }))?.shift).toBe(true);
   });
+  it("does not flag moving into a subdirectory of the same Git workspace", async () => {
+    const repo = join(dir, "snapyaiv2");
+    await mkdir(join(repo, ".git"), { recursive: true });
+    await mkdir(join(repo, "packages"), { recursive: true });
+    await notePrompt("same-repo", "inspect the package build configuration", join(repo));
+    await notePrompt("same-repo", "continue the package build configuration", join(repo, "packages"));
+    expect((await sessionContextFor("cursor", "same-repo", { home: dir }))?.shift).toBe(false);
+  });
+
 });
 
 describe("event and adapter wiring", () => {

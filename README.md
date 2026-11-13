@@ -478,3 +478,49 @@ To turn on automatic npm publishing:
 ## License
 
 AGPL-3.0-only — see [LICENSE](./LICENSE).
+
+### Repository policy settings
+
+Beam automatically looks for `.beam/policy.json` at the closest Git repository root, including when invoked from a subdirectory. It supports Git worktrees (`.git` files). Missing workspace configuration uses the global policy in the Beam data directory. On command execution or repository policy loading, Beam creates `.beam/.config` if missing. Existing files are preserved.
+
+The file uses the same policy bundle format as the global policy. Omitted settings inherit global values; supplied settings override them, and arrays replace their global counterparts. Keep this file under review because it can change enforcement settings. Global version and expiration remain authoritative. An unreadable or malformed workspace policy produces policy errors rather than silently accepting it.
+
+```json
+{
+  "rules": {
+    "approvedExtensions": ["anthropic.claude-code"],
+    "piiPrompt": "block",
+    "gitGate": "ask",
+    "autoPrecommit": "on",
+    "networkTopology": "redact",
+    "gitGateIgnore": ["^fixtures/"],
+    "customDetectors": [
+      { "name": "Internal customer ID", "pattern": "CUSTOMER-[0-9]{8}", "replacement": "[CUSTOMER_ID]" }
+    ]
+  }
+}
+```
+
+Use existing policy `rules` for path and agent restrictions. `approvedExtensions` is an allowlist for doctor checks; it does not authenticate extension packages or establish which extension launched a session. Do not store credentials, customer data, or runtime logs in the repository configuration. Metadata and scanner-specific options outside the existing policy schema are not supported. `beam doctor --cwd <repository>` reads that repository's policy; the main pre-tool gate uses the hook's supplied working directory. Other policy readers use their process working directory.
+
+### Repository review configuration (policy 4.3)
+
+`.beam/.config` is JSON and is generated automatically at the closest Git root, including from subdirectories. New files contain `{ "review": {} }`, which inherits global and organization requirements without adding local restrictions. Outside Git, no folder is created. Configuration creation failures are reported; hook policy loading treats them as policy errors. Its `review` object supports `edits`, `commits`, and `commands` booleans, `securityPaths` (repository-relative policy path patterns), and `isolatedPaths` (literal repository-relative paths). These gates apply to observed agent tool calls, including in observe mode. Edits require approval before application; commits/pushes require approval even when secret scanning finds nothing. Commands require approval before execution. Security paths require approval for writes. Existing isolation paths block agent actions until data is moved/scrubbed and configuration approved. This does not prevent VS Code from opening files or prove human comprehension, provide SAST, or intercept actions outside installed hooks.
+
+Administrators can provision `<Beam home>/.config` (normally `~/.beam/.config`) with global review defaults and repository-specific requirements:
+
+```json
+{
+  "review": { "commits": true },
+  "repositories": {
+    "github.com/whyashthakker/beam-cli": {
+      "edits": true,
+      "commands": true,
+      "securityPaths": ["src/auth/**", "src/crypto/**"],
+      "isolatedPaths": ["customer-data", "production-data"]
+    }
+  }
+}
+```
+
+Beam reads `origin` from the nearest Git root using local Git, including worktrees. HTTPS and SSH remotes normalize to `host/owner/repo` without credentials or `.git`; the local clone path does not affect selection. No remote means no repository-specific organization entry matches. True requirements accumulate and path lists combine, so repository files cannot disable organization review requirements. Invalid configuration denies policy evaluation. Organization configuration must be provisioned and protected by the organization; this CLI file reader does not add a dashboard editor or prevent its owner from changing Git remotes/config files. Existing approval routing remains in effect (workspace administrators for enrolled devices).

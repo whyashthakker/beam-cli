@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { ensureWorkspaceConfig } from "./workspace-config.js";
 import fs from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
@@ -820,7 +821,7 @@ program.command("git-scan")
   .action((options: { everyone?: boolean }) => { const r = scanStaged(process.cwd(), { everyone: options.everyone }); if (r.report) console.error(r.report); process.exitCode = r.code; });
 
 program.command("doctor")
-  .description("Check this machine and repository against the Claude Code Secure Usage Policy (read-only)")
+  .description("Check this machine and repository against the Claude Code Secure Usage Policy")
   .option("--json", "print the checks as JSON")
   .option("--cwd <dir>", "repository to check (default: current directory)")
   .option("--install-precommit", "install a git pre-commit hook that scans staged changes for secrets, then check")
@@ -1090,6 +1091,8 @@ if (autoUpdateAllowed(argv[0])) {
   const notice = await autoUpdateTick(packageJson.version);
   if (notice) console.error(cyan(notice));
 }
+
+program.hook("preAction", () => { ensureWorkspaceConfig(); });
 
 try {
   await program.parseAsync();

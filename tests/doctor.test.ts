@@ -150,7 +150,9 @@ describe("auto pre-commit on first touch of a git workspace", () => {
     expect(ensurePrecommit(repo, { env: {}, policyValue: "off" })).toBeNull();
     expect(ensurePrecommit(repo, { env: { BEAM_AUTO_PRECOMMIT: "0" } })).toBeNull();
     expect(ensurePrecommit(repo, { env: {} })?.changed).toBe(true);
-    expect(await fs.readFile(hook, "utf8")).toContain("beam git-scan");
+    const installed = await fs.readFile(hook, "utf8");
+    expect(installed).toContain(process.execPath);
+    expect(installed).toContain("git-scan");
     await fs.rm(hook);
     expect(ensurePrecommit(repo, { env: {} })).toBeNull(); // already handled: not put back
     expect(await fs.stat(hook).catch(() => null)).toBeNull();
