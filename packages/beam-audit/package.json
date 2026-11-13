@@ -1,0 +1,50 @@
+{
+  "name": "beam-audit",
+  "version": "0.1.0",
+  "description": "Free standalone scanner: checks whether your machine already lets secrets, PII, PHI or other data Claude Code should never see reach a prompt. No beam-cli install required. Run before you decide whether you need beam.",
+  "keywords": [
+    "ai agent security",
+    "claude code",
+    "data loss prevention",
+    "secret scanning",
+    "pii detection",
+    "security audit",
+    "cli"
+  ],
+  "homepage": "https://agentbeam.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/whyashthakker/beam-cli.git",
+    "directory": "packages/beam-audit"
+  },
+  "bugs": {
+    "url": "https://github.com/whyashthakker/beam-cli/issues"
+  },
+  "author": "Yash Thakker",
+  "license": "AGPL-3.0-only",
+  "preferGlobal": true,
+  "type": "module",
+  "bin": {
+    "beam-audit": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.17.0"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
