@@ -77,6 +77,16 @@ function looksLikeFormPlaceholder(text: string, index: number): boolean {
   return PLACEHOLDER_CONTEXT.test(text.slice(Math.max(0, index - 60), index));
 }
 
+// Any value explicitly labeled synthetic nearby (this package's own SYNTHETIC_PAYLOAD constants
+// used for live testing are the canonical case) is test data, not a leak -- regardless of which
+// file it happens to live in, so this doesn't need a path-based exclusion.
+const SYNTHETIC_LABEL = /SYNTHETIC/;
+function looksLikeSyntheticTestValue(text: string, index: number): boolean {
+  // Wide enough to cover the whole SYNTHETIC_PAYLOAD object literal, not just the matched line --
+  // the label sits on one field (apiKey) while the others (ssn, email, ...) are nearby sibling lines.
+  return SYNTHETIC_LABEL.test(text.slice(Math.max(0, index - 400), index + 400));
+}
+
 export function detect(text: string): Hit[] {
   const hits: Hit[] = [];
   for (const { kind, re } of PATTERNS) {
@@ -85,6 +95,7 @@ export function detect(text: string): Hit[] {
       const index = m.index ?? 0;
       if ((kind === "INTERNAL_IP" || kind === "NETWORK_RANGE") && (looksLikePatternDefinition(text, index) || isWellKnownRange(text, index))) continue;
       if (kind === "EMAIL" && looksLikeFormPlaceholder(text, index)) continue;
+      if (looksLikeSyntheticTestValue(text, index)) continue;
       hits.push({ kind, index });
     }
   }

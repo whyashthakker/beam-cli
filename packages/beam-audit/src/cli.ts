@@ -14,6 +14,13 @@ import { vscodeExtensionCheck, workspaceAutoIncludeTest } from "./checks/vscode-
 import { runPiiMatrix } from "./checks/matrix-test.js";
 import { runReviewMatrix } from "./checks/review-matrix.js";
 import { securityReviewCheck, workspaceIsolationLiveCheck } from "./checks/code-review.js";
+import { unofficialClientCheck } from "./checks/unofficial-client.js";
+import { tlsVerificationCheck, apiEndpointCheck } from "./checks/network-transport.js";
+import { apiKeyStorageCheck } from "./checks/api-key-storage.js";
+import { precommitHookCheck, publicRepoVisibilityCheck } from "./checks/repo-hygiene.js";
+import { workstationChecks } from "./checks/workstation.js";
+import { promptInjectionScan } from "./checks/prompt-injection.js";
+import { manualItems } from "./checks/manual-items.js";
 import { formatReport, exitCode, type NamedMatrix } from "./report.js";
 import { renderHtmlReport } from "./report-html.js";
 import type { AuditContext, Check } from "./types.js";
@@ -63,6 +70,16 @@ async function main(): Promise<void> {
   log("checking for static analysis tooling (policy 4.3 Security Review)");
   checks.push(securityReviewCheck(ctx));
   checks.push(workspaceIsolationLiveCheck(ctx));
+  log("checking for unofficial clients, TLS/endpoint config, API key storage, repo hygiene, and workstation security");
+  checks.push(unofficialClientCheck(ctx));
+  checks.push(tlsVerificationCheck(ctx));
+  checks.push(apiEndpointCheck());
+  checks.push(apiKeyStorageCheck(ctx));
+  checks.push(precommitHookCheck(ctx));
+  checks.push(publicRepoVisibilityCheck(ctx));
+  checks.push(...workstationChecks(ctx));
+  checks.push(promptInjectionScan(ctx));
+  checks.push(...manualItems());
 
   const matrices: NamedMatrix[] = [];
   if (!skipLive) {

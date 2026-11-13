@@ -32,6 +32,9 @@
   "license": "AGPL-3.0-only",
   "preferGlobal": true,
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "bin": {
     "beam": "dist/cli.js"
   },
@@ -57,6 +60,7 @@
     "build:watch": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "build:binaries": "npm run build && node scripts/build-binaries.mjs",
     "dev": "tsx src/cli.ts",
+    "audit": "npm run build --workspace beam-audit && node packages/beam-audit/dist/cli.js",
     "test": "node --no-warnings --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
     "test:watch": "node --no-warnings --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit",
