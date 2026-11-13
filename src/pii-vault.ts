@@ -207,7 +207,7 @@ export async function takeUnreportedLedger(sessionId: string, home = getDataDire
 }
 
 /** Findings worth blocking a prompt over (high-confidence identity, financial and credential data). */
-const BLOCKING_KINDS = new Set(["SSN", "CREDIT_CARD", "IBAN", "NATIONAL_ID", "PASSPORT", "DRIVER_LICENSE", "DOB", "MRN", "HEALTH_PLAN_ID", "MEDICAL_ID", "PHI", "SECRET", "API_KEY", "PASSWORD", "PRIVATE_KEY"]);
+const BLOCKING_KINDS = new Set(["SSN", "CREDIT_CARD", "IBAN", "NATIONAL_ID", "PASSPORT", "DRIVER_LICENSE", "DOB", "MRN", "HEALTH_PLAN_ID", "MEDICAL_ID", "PHI", "SECRET", "API_KEY", "PASSWORD", "PRIVATE_KEY", "EMAIL", "PHONE"]);
 export function promptFindings(text: string, custom: CustomDetector[] = [], topologyBlocking = false): { blocking: DataFinding[]; advisory: DataFinding[] } {
   const all = detectSensitive(text, custom);
   // Network topology is report-only unless the policy says to block/redact it.

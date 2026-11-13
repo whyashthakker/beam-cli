@@ -86,11 +86,11 @@ describe("governance chain through the hooks", () => {
     expect(JSON.stringify(out)).not.toContain("diabetes");
   });
 
-  it("does not block low-confidence kinds (a phone number or email), only warns", async () => {
+  it("blocks and vaults a prompt holding a phone number", async () => {
     const { stdout } = await run("claude-code", { hook_event_name: "UserPromptSubmit", prompt: "call me on +1 415 555 2671", session_id: "s1" });
     const out = JSON.parse(stdout[0]!);
-    expect(out.hookSpecificOutput?.permissionDecision).not.toBe("deny");
-    expect(out.systemMessage).toContain("PHONE");
+    expect(out.decision).toBe("block");
+    expect(out.reason).toContain("1× PHONE");
     expect(process.exitCode).not.toBe(2);
   });
 
@@ -195,13 +195,14 @@ describe("under `beam claude` (BEAM_WRAPPER_ID shared scope)", () => {
 });
 
 describe("vault storage discipline", () => {
-  it("vaults only high-confidence kinds from tool output, not phone-shaped numbers", async () => {
+  it("vaults high-confidence kinds, including phone, from tool output; timestamps are not mistaken for phones", async () => {
     const out = await redactAndVault(`call +1 415 555 2671 card ${CARD} ts 1731412345678`, "s1", [], home, true);
     expect(out.text).toContain("[CREDIT_CARD_001]");
+    expect(out.text).toContain("[PHONE_001]");
     expect(out.text).not.toContain("415 555 2671"); // still redacted from what the model sees...
     expect(out.text).toContain("1731412345678"); // ...while a timestamp is no longer mistaken for a phone number
     const stored = JSON.parse(await fs.readFile(path.join(home, "vault.json"), "utf8")).s1.values;
-    expect(Object.keys(stored)).toEqual(["CREDIT_CARD_001"]); // ...but not stored
+    expect(Object.keys(stored).sort()).toEqual(["CREDIT_CARD_001", "PHONE_001"]); // both stored now
   });
 });
 
