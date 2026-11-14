@@ -31,9 +31,10 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "build": "tsc -p tsconfig.json && node -e \"require('node:fs').chmodSync('dist/cli.js', 0o755)\"",
     "dev": "tsx src/cli.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts"
   },
   "publishConfig": {
     "access": "public"
@@ -41,7 +42,12 @@
   "engines": {
     "node": ">=20.17.0"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@iarna/toml": "^2.2.5",
+    "jsonc-parser": "^3.3.1",
+    "playwright-core": "^1.65.0",
+    "yaml": "^2.9.1"
+  },
   "devDependencies": {
     "@types/node": "^22.20.2",
     "tsx": "^4.19.2",

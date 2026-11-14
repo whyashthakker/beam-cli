@@ -9,7 +9,7 @@ const CELL_ICON = (c: MatrixCell) => c.blocked === null ? "-" : c.blocked ? "✓
 function formatMatrix(matrix: NamedMatrix): string[] {
   if (matrix.cells.length === 0) return [];
   const lines = [matrix.title, ""];
-  const surfaces: Surface[] = ["VS Code", "Claude Code (CLI)"];
+  const surfaces: Surface[] = [...new Set(matrix.cells.map(cell => cell.surface))];
   for (const surface of surfaces) {
     const rows = matrix.cells.filter(c => c.surface === surface);
     if (rows.length === 0) continue;
@@ -22,7 +22,7 @@ function formatMatrix(matrix: NamedMatrix): string[] {
 
 export function formatReport(checks: Check[], matrices: NamedMatrix[] = []): string {
   const lines = [
-    "beam-audit: Claude Code Secure Usage Policy checks",
+    "beam-audit: developer workstation and AI agent security audit",
     "No beam-cli installation required -- this checks what your machine does today.",
     "",
     ...matrices.flatMap(formatMatrix),
@@ -35,15 +35,16 @@ export function formatReport(checks: Check[], matrices: NamedMatrix[] = []): str
     lines.push("");
   }
   const n = (s: Status) => checks.filter(c => c.status === s).length;
-  const matrixFails = matrices.flatMap(m => m.cells).filter(c => c.blocked === false).length;
+  const matrixFails = matrices.flatMap(m => m.cells.filter(c => c.blocked === false && m.title.includes("4.3") && !checks.some(check => check.id === `live-${m.title}-${c.surface}-${c.label}`))).length;
   const fails = n("fail") + matrixFails;
   lines.push(`${n("pass")} passed, ${n("warn")} warnings, ${n("fail")} failed, ${n("skip")} not checkable.`);
+  if (n("skip") > 0 || n("warn") > 0) lines.push("Coverage is incomplete or requires review; this report does not certify the workstation secure.");
   if (fails > 0) {
     lines.push("");
-    lines.push(`${fails} check(s) failed on this machine. See https://agentbeam.com for a guardrail that fixes this (\`npm i -g @agent-beam/beam && beam setup\`).`);
+    lines.push(`${fails} check(s) failed. Review each finding and its stated remediation.`);
   }
   return lines.join("\n");
 }
 
 export const exitCode = (checks: Check[], matrices: NamedMatrix[] = []) =>
-  checks.some(c => c.status === "fail") || matrices.some(m => m.cells.some(c => c.blocked === false)) ? 1 : 0;
+  checks.some(c => c.status === "fail") || matrices.some(m => m.title.includes("4.3") && m.cells.some(c => c.blocked === false)) ? 1 : 0;

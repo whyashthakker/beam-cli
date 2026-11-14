@@ -4,6 +4,7 @@
 export type Status = "pass" | "warn" | "fail" | "skip";
 
 export interface Check {
+  category?: import("./categories.js").Category;
   id: string;
   policySection: string;
   title: string;
@@ -19,4 +20,8 @@ export interface AuditContext {
   home: string;
   platform: NodeJS.Platform;
   log: (msg: string) => void;
+  online?: boolean;
+  maxFiles?: number;
+  agentControls?: import("./policy.js").AgentControlsPolicy;
+  environment?: NodeJS.ProcessEnv;
 }

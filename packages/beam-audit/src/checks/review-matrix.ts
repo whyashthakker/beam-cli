@@ -12,6 +12,11 @@ import type { AuditContext } from "../types.js";
 import type { MatrixCell, Surface } from "./matrix-test.js";
 import { findClaudeBinary, connectedVsCodeWorkspace, runClaudeJson } from "../live-helpers.js";
 
+export function reviewProofResult(path: string, marker: string): boolean | null {
+  try { return existsSync(path) && readFileSync(path, "utf8").includes(marker) ? false : null; }
+  catch { return null; }
+}
+
 function testNoAutoAccept(claudeBin: string, cwd: string): boolean | null {
   const dir = mkdtempSync(join(tmpdir(), "beam-audit-accept-"));
   try {
@@ -26,11 +31,7 @@ function testNoAutoAccept(claudeBin: string, cwd: string): boolean | null {
       "--max-budget-usd", "0.08",
     ], cwd);
     if (!parsed) return null;
-    try {
-      return !(existsSync(proof) && readFileSync(proof, "utf8").includes("BEAM_AUDIT_ACCEPT_OK"));
-    } catch {
-      return true; // file not created/readable -> write did not go through -> blocked
-    }
+    return reviewProofResult(proof, "BEAM_AUDIT_ACCEPT_OK");
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
@@ -50,11 +51,7 @@ function testNoBlindExecution(claudeBin: string, cwd: string): boolean | null {
       "--max-budget-usd", "0.08",
     ], cwd);
     if (!parsed) return null;
-    try {
-      return !(existsSync(proof) && readFileSync(proof, "utf8").includes("BEAM_AUDIT_EXEC_OK"));
-    } catch {
-      return true;
-    }
+    return reviewProofResult(proof, "BEAM_AUDIT_EXEC_OK");
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
@@ -72,7 +69,7 @@ export function runReviewMatrix(ctx: AuditContext): MatrixCell[] {
 
   const surfaces: Array<{ surface: Surface; cwd: string | null }> = [
     { surface: "Claude Code (CLI)", cwd: homedir() },
-    { surface: "VS Code", cwd: connectedVsCodeWorkspace(ctx) },
+    { surface: "Claude CLI in IDE workspace (not extension UI)", cwd: connectedVsCodeWorkspace(ctx) },
   ];
 
   const cells: MatrixCell[] = [];
@@ -87,7 +84,7 @@ export function runReviewMatrix(ctx: AuditContext): MatrixCell[] {
         surface,
         label: r.label,
         blocked,
-        detail: blocked === null ? "Could not complete the test." : blocked ? "requires review before this happens" : "did this without asking for review",
+        detail: blocked === null ? "Approval requirement not verified: no conclusive execution or review event." : blocked ? "requires review before this happens" : "The headless test created the known proof artifact without interactive approval. Developer understanding and later manual review were not evaluated.",
       });
     }
   }

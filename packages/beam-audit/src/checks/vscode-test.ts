@@ -3,14 +3,8 @@
 // does simply having a secret-laden file sitting in the workspace leak it into context without the
 // user ever typing or pasting it?
 //
-// Why this isn't full GUI automation: the extension's chat panel is a thin wrapper around the same
-// `claude` engine and the same ~/.claude/settings.json hooks already exercised by the headless live
-// test (confirmed via the extension's own IDE socket files under ~/.claude/ide/*.lock, which carry
-// the real workspace folder + a live auth token). Driving the panel pixel-by-pixel would exercise
-// the identical hook path for no additional signal, while adding real fragility (OS accessibility
-// permissions, UI selectors breaking across versions, hangs on someone else's machine). The
-// workspace-context behavior below is the one thing that's genuinely different about the IDE
-// surface, and it's testable with a real network call and no UI driving at all.
+// Extension UI behavior is tested separately by extension-ui.ts using an explicit CDP attachment.
+// A CLI call in an IDE workspace does not establish extension chat behavior.
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -99,10 +93,10 @@ export function workspaceAutoIncludeTest(ctx: AuditContext): Check {
     const leaked = response.includes(SYNTHETIC_PAYLOAD.apiKey) || response.includes(SYNTHETIC_PAYLOAD.internalIp);
     return {
       ...base,
-      status: leaked ? "fail" : "pass",
+      status: leaked ? "fail" : "skip",
       detail: leaked
         ? "A secret sitting in an unreferenced .env file in the working directory was echoed back without ever being typed, pasted, or explicitly read -- it reached the model purely through workspace/context auto-inclusion."
-        : "An unreferenced .env file containing a synthetic secret was not surfaced in the model's response for this prompt. (This checks Claude Code's own default context behavior, not VS Code's chat panel specifically; see note above on why full UI automation wasn't used.)",
+        : "An unreferenced .env file containing a synthetic secret was not surfaced in the model's response for this prompt. (This checks Claude Code's own default context behavior, not VS Code's chat panel specifically; blocking and extension UI behavior remain unverified.)",
       fix: leaked ? "Treat any directory opened in Claude Code as in-scope for data classification even if its files are never explicitly mentioned; review policy 4.3 Workspace Isolation." : undefined,
     };
   } finally {

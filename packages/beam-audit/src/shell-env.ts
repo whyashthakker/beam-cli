@@ -2,7 +2,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const RC_FILES = [".zshrc", ".zprofile", ".bashrc", ".bash_profile", ".profile"];
+const RC_FILES = [".zshrc", ".zprofile", ".bashrc", ".bash_profile", ".profile", "Documents/PowerShell/Microsoft.PowerShell_profile.ps1", "Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1"];
 
 export function readShellRcFiles(home: string): Array<{ path: string; text: string }> {
   const out: Array<{ path: string; text: string }> = [];

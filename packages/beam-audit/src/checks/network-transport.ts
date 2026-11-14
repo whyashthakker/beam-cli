@@ -14,7 +14,7 @@ export function tlsVerificationCheck(ctx: AuditContext): Check {
   const hits: string[] = [];
   for (const { path, text } of readShellRcFiles(ctx.home)) {
     for (const line of text.split("\n")) {
-      if (TLS_DISABLE.test(line) && !line.trim().startsWith("#")) hits.push(`${path}: ${line.trim()}`);
+      if (TLS_DISABLE.test(line) && !line.trim().startsWith("#")) hits.push(`${path}: TLS verification disabling declaration (value omitted)`);
     }
   }
   return {
@@ -45,8 +45,8 @@ export function apiEndpointCheck(): Check {
     ...base,
     status: trusted ? "pass" : "fail",
     detail: trusted
-      ? `ANTHROPIC_BASE_URL is set to a custom but trusted Anthropic host (${base_url}).`
-      : `ANTHROPIC_BASE_URL (${base_url}) does not point to an https anthropic.com host. Policy 3/5.6 permit only Anthropic's official endpoints.`,
+      ? `ANTHROPIC_BASE_URL is set to a custom but trusted Anthropic host (configured value omitted).`
+      : `ANTHROPIC_BASE_URL (configured value omitted) does not point to an https anthropic.com host. Policy 3/5.6 permit only Anthropic's official endpoints.`,
     fix: trusted ? undefined : "Unset ANTHROPIC_BASE_URL unless it has been explicitly approved by the security lead.",
   };
 }

@@ -14,12 +14,12 @@ function diskEncryptionCheck(ctx: AuditContext): Check {
   if (ctx.platform === "darwin") {
     const { status, stdout } = run("fdesetup", ["status"]);
     if (status === 0 && /FileVault is On/i.test(stdout)) return { ...base, status: "pass", detail: "FileVault is enabled.", evidence: [stdout.trim()] };
-    return { ...base, status: "fail", detail: "FileVault is not enabled on this Mac.", evidence: [stdout.trim() || "fdesetup status returned no output"], fix: "Enable FileVault via System Settings > Privacy & Security > FileVault, or `sudo fdesetup enable`." };
+    return { ...base, status: status === 0 ? "fail" : "skip", detail: status === 0 ? "FileVault is not enabled on this Mac." : "FileVault state unavailable.", evidence: [stdout.trim() || "fdesetup status returned no output"], fix: "Enable FileVault via System Settings > Privacy & Security > FileVault, or `sudo fdesetup enable`." };
   }
   if (ctx.platform === "win32") {
     const { status, stdout } = run("manage-bde", ["-status"]);
     if (status === 0 && /Protection Status:\s*Protection On/i.test(stdout)) return { ...base, status: "pass", detail: "BitLocker is enabled.", evidence: [stdout.trim()] };
-    return { ...base, status: "fail", detail: "BitLocker does not appear to be enabled.", evidence: [stdout.trim() || "manage-bde -status returned no output"], fix: "Enable BitLocker per policy 6.3." };
+    return { ...base, status: status === 0 ? "warn" : "skip", detail: "BitLocker state is disabled, ambiguous, or unavailable; verify each volume.", evidence: [stdout.trim() || "manage-bde -status returned no output"], fix: "Enable BitLocker per policy 6.3." };
   }
   return { ...base, status: "skip", detail: `No automated disk-encryption check for platform "${ctx.platform}". Verify full-disk encryption (e.g. LUKS) manually.` };
 }
@@ -37,15 +37,21 @@ function screenLockCheck(ctx: AuditContext): Check {
       fix: "Set System Settings > Lock Screen > screensaver timeout to 5 minutes or less, with a password required immediately after.",
     };
   }
+  if (ctx.platform === "win32") {
+    const result = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Get-ItemPropertyValue -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System' -Name InactivityTimeoutSecs -ErrorAction Stop"]);
+    const seconds = Number(result.stdout.trim());
+    return { ...base, status: result.status !== 0 || !result.stdout.trim() ? "skip" : seconds > 0 && seconds <= 300 ? "pass" : "fail", detail: "Checked Windows machine inactivity timeout policy; other screen-lock mechanisms were not evaluated." };
+  }
   return { ...base, status: "skip", detail: `No automated screen-lock check for platform "${ctx.platform}".` };
 }
 
 function osPatchLevelCheck(ctx: AuditContext): Check {
   const base = { id: "6.3-os-patch-level", policySection: "6.3 (Workstation Security)", title: "OS patched to latest cumulative update" };
   if (ctx.platform === "darwin") {
-    const { stdout } = run("softwareupdate", ["-l"]);
+    if (!ctx.online) return { ...base, status: "skip", detail: "Pending macOS updates require --online." };
+    const { status, stdout } = run("softwareupdate", ["-l"]);
     const version = run("sw_vers", ["-productVersion"]).stdout.trim();
-    if (/No new software available/i.test(stdout)) return { ...base, status: "pass", detail: `No pending macOS updates (running ${version || "unknown version"}).`, evidence: [stdout.trim()] };
+    if (status === 0 && /No new software available/i.test(stdout)) return { ...base, status: "pass", detail: `No pending macOS updates (running ${version || "unknown version"}).`, evidence: [stdout.trim()] };
     return { ...base, status: stdout.trim() ? "fail" : "skip", detail: `macOS ${version || ""} has pending updates or the check was inconclusive (requires network access).`, evidence: [stdout.trim() || "softwareupdate -l returned no output"], fix: "Apply pending macOS updates via System Settings > General > Software Update." };
   }
   return { ...base, status: "skip", detail: `No automated OS patch check for platform "${ctx.platform}". The policy specifies Windows 10 fully patched; verify via Windows Update.` };
@@ -53,6 +59,10 @@ function osPatchLevelCheck(ctx: AuditContext): Check {
 
 function endpointProtectionCheck(ctx: AuditContext): Check {
   const base = { id: "6.3-endpoint-protection", policySection: "6.3 (Workstation Security)", title: "Endpoint protection / EDR active" };
+  if (ctx.platform === "win32") {
+    const result = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,AntivirusSignatureAge | ConvertTo-Json -Compress"]);
+    try { const state = JSON.parse(result.stdout); return { ...base, status: result.status !== 0 ? "skip" : state.AntivirusEnabled && state.RealTimeProtectionEnabled && state.AntivirusSignatureAge <= 1 ? "pass" : "warn", detail: "Checked Microsoft Defender enablement, real-time protection, and signature age. Third-party EDR needs separate verification." }; } catch { return { ...base, status: "skip", detail: "Microsoft Defender state unavailable." }; }
+  }
   const KNOWN = ["CrowdStrike", "Carbon Black", "SentinelOne", "Defender", "MsMpEng", "Sophos", "Malwarebytes", "ClamAV", "clamd", "cbagentd", "falcond"];
   if (ctx.platform === "darwin") {
     const { stdout } = run("ps", ["-axo", "comm"]);

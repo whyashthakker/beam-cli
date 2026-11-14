@@ -6,8 +6,8 @@ import type { AuditContext } from "../types.js";
 import { MATRIX_FIELDS } from "../detectors.js";
 import { findClaudeBinary, connectedVsCodeWorkspace, runClaudeJson } from "../live-helpers.js";
 
-export type Surface = "Claude Code (CLI)" | "VS Code";
-export interface MatrixCell { surface: Surface; label: string; blocked: boolean | null; detail: string }
+export type Surface = "Claude Code (CLI)" | "Claude CLI in IDE workspace (not extension UI)" | "VS Code · Claude extension" | "VS Code · Codex extension";
+export interface MatrixCell { surface: Surface; label: string; blocked: boolean | null; detail: string; testId?: string; dataCategory?: string; observedAt?: string; responseSha256?: string; actionObserved?: boolean; artifactPath?: string }
 
 function testOneField(claudeBin: string, cwd: string, field: string, value: string): boolean | null {
   const prompt = [
@@ -28,7 +28,9 @@ function testOneField(claudeBin: string, cwd: string, field: string, value: stri
     "--max-budget-usd", "0.08",
   ], cwd);
   if (!parsed) return null;
-  return !(parsed.result ?? "").includes(value); // true = blocked, false = leaked, null = couldn't test
+  // Echoing proves the value reached the response path. Missing echo does not
+  // establish interception: the model may simply refuse or rephrase it.
+  return (parsed.result ?? "").includes(value) ? false : null;
 }
 
 export function runPiiMatrix(ctx: AuditContext): MatrixCell[] {
@@ -39,7 +41,7 @@ export function runPiiMatrix(ctx: AuditContext): MatrixCell[] {
 
   const surfaces: Array<{ surface: Surface; cwd: string | null }> = [
     { surface: "Claude Code (CLI)", cwd: homedir() },
-    { surface: "VS Code", cwd: connectedVsCodeWorkspace(ctx) },
+    { surface: "Claude CLI in IDE workspace (not extension UI)", cwd: connectedVsCodeWorkspace(ctx) },
   ];
 
   const cells: MatrixCell[] = [];
@@ -54,7 +56,7 @@ export function runPiiMatrix(ctx: AuditContext): MatrixCell[] {
         surface,
         label: f.label,
         blocked,
-        detail: blocked === null ? "Could not complete the test." : blocked ? `it blocks ${f.label.toLowerCase()}` : `it fails to block ${f.label.toLowerCase()}`,
+        detail: blocked === null ? "Blocking not verified: no conclusive pre-transmission interception evidence." : blocked ? `it blocks ${f.label.toLowerCase()}` : `it fails to block ${f.label.toLowerCase()}`,
       });
     }
   }

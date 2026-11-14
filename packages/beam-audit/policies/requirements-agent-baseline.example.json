@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "validUntil": "2026-09-30T23:59:59+05:30",
+  "allowedPlatforms": ["win32"],
+  "allowedAgents": ["Claude Code"],
+  "requiredChecks": [
+    "6.2-precommit-hook",
+    "agent-required-prompt-hooks-Claude Code-user",
+    "agent-memory-config-Claude Code-user"
+  ],
+  "agentControls": {
+    "requireManualApproval": true,
+    "requireSandbox": true,
+    "forbidPersistentMemory": true,
+    "requirePromptHooks": true,
+    "requirePinnedMcpPackages": true,
+    "allowedEndpointOrigins": ["https://api.anthropic.com"],
+    "allowedMcpServers": [],
+    "allowedPlugins": [],
+    "allowedExtensions": ["anthropic.claude-code"]
+  }
+}

@@ -36,8 +36,8 @@ export function globalConfigCheck(ctx: AuditContext): Check[] {
       id: "global-no-settings",
       policySection: "4.2",
       title: "Global Claude Code configuration",
-      status: "fail",
-      detail: "No ~/.claude/settings.json found. Claude Code is running with no hook of any kind, so nothing on this machine inspects a prompt before it reaches the model.",
+      status: "warn",
+      detail: "No global Claude settings file found. Global prompt/tool hook protection could not be verified; project or managed controls may exist.",
       fix: "Install a guardrail (e.g. `npm i -g @agent-beam/beam && beam setup`) so prompts and tool calls are scanned before they leave the machine.",
       evidence: [globalSettingsPath],
     });
@@ -47,10 +47,10 @@ export function globalConfigCheck(ctx: AuditContext): Check[] {
       id: "global-hook-present",
       policySection: "4.2",
       title: "Global Claude Code configuration",
-      status: hooked ? "pass" : "fail",
+      status: hooked ? "pass" : "warn",
       detail: hooked
         ? `~/.claude/settings.json has a hook on ${hooksEvents(globalSettings).join(", ")}.`
-        : `~/.claude/settings.json exists but has no PreToolUse or UserPromptSubmit hook, so nothing inspects prompt content or tool calls before they run.`,
+        : `~/.claude/settings.json exists but has no PreToolUse or UserPromptSubmit hook, in this file. Other policy layers were not evaluated.`,
       fix: hooked ? undefined : "Add a PreToolUse/UserPromptSubmit hook (e.g. via `beam setup`) that scans for credentials, PII, PHI and internal network info before a prompt or tool call reaches the model.",
       evidence: [globalSettingsPath],
     });
@@ -71,11 +71,11 @@ export function globalConfigCheck(ctx: AuditContext): Check[] {
     checks.push({
       id: "repo-settings-override-no-hook",
       policySection: "4.2",
-      title: "Per-repository Claude Code configuration overrides protection",
-      status: "fail",
+      title: "Per-repository Claude Code hook declarations",
+      status: "warn",
       detail: `${repoNoHook.length} repositories have a .claude/settings.json that does NOT include a PreToolUse/UserPromptSubmit hook. If the global config has one, Claude Code's settings merge rules may still mean the repo-level file adds no extra protection -- but nothing in that repo's own config does.`,
       evidence: repoNoHook.slice(0, 50),
-      fix: "Either remove the repo-level settings.json so it falls back to a protected global config, or add the same hook at the repo level.",
+      fix: "Review effective merged global, project, local, and managed settings; verify the required hook actually runs.",
     });
   }
 
