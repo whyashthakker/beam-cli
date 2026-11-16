@@ -16,6 +16,7 @@ import { checkSkillsIfDue } from "./skill-watch.js";
 import { drainSkillInventoryOutbox } from "./skill-sync.js";
 import { runSkillActions } from "./skill-remote.js";
 import { runRemoteUpdate, supervised } from "./remote-update.js";
+import { runRemoteAudit } from "./remote-audit.js";
 import { checkForTampering, recordExpectedHooks } from "./tamper.js";
 
 function toWebRequest(req: IncomingMessage): Promise<Request> {
@@ -144,6 +145,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
       void (async () => {
         const update = await runRemoteUpdate().catch(() => null);
         await runSkillActions().catch(() => {});
+        await runRemoteAudit().catch(() => null);
         if (update?.status === "updated" && supervised()) process.exit(0);
       })().finally(() => { skillActionsBusy = false; });
     };
