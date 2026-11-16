@@ -207,6 +207,30 @@ export async function forwardScan(scan: Scan): Promise<void> {
   }
 }
 
+/** Same shape beam-audit's own runAudit() resolves with -- kept local so forward.ts doesn't need
+ * beam-audit as a hard import-time dependency just for a type. */
+export type AuditReportToForward = { generatedAt: string; platform?: string; checks: unknown[]; matrices?: unknown[] };
+
+// Fire-and-forget, same pattern as forwardScan: a `beam audit` run (self-triggered, or an admin's
+// queued request answered by remote-audit.ts) always tries to land in the dashboard, but never
+// blocks or fails the run itself -- an unenrolled or offline device just keeps the local report.
+// `requestedBy` is set only by remote-audit.ts, for a run that answered a queued dashboard request.
+export async function forwardAuditReport(report: AuditReportToForward, requestedBy?: string): Promise<{ sent: boolean; reason?: string }> {
+  const identity = await readIdentity();
+  if (!identity) return { sent: false, reason: "not enrolled" };
+  try {
+    const response = await fetch(`${identity.apiBase}/v1/audit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${identity.deviceSecret}`, ...versionHeaders() },
+      body: JSON.stringify({ id: randomUUID(), generatedAt: report.generatedAt, platform: report.platform, checks: report.checks, matrices: report.matrices, requestedBy }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    return response.ok ? { sent: true } : { sent: false, reason: `collector returned ${response.status}` };
+  } catch (error) {
+    return { sent: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 // Fire-and-forget: forwarding a review toggle must never block or fail the caller.
 export async function forwardReview(id: string, reviewed: boolean): Promise<void> {
   const identity = await readIdentity();

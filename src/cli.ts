@@ -20,7 +20,7 @@ import { PlanLimitError, startConnect } from "./connect.js";
 import { runSetup, promptYesNo } from "./setup.js";
 import { installEnterprisePackage } from "./enterprise-install.js";
 import { fetchAccount, revokeDevice } from "./account.js";
-import { syncPolicy } from "./forward.js";
+import { forwardAuditReport, syncPolicy } from "./forward.js";
 import { openBrowser } from "./open-browser.js";
 import { ruleCatalog } from "./core.js";
 import { loadCustomRules } from "./custom-rules.js";
@@ -851,7 +851,16 @@ program.command("audit")
   .action(async () => {
     const { runAudit } = await import("beam-audit");
     const at = process.argv.indexOf("audit");
-    await runAudit(process.argv.slice(at + 1));
+    const args = process.argv.slice(at + 1);
+    const report = await runAudit(args);
+    // A --category run only returns a narrowed slice of the checks, not the whole audit -- never
+    // forward that as if it were the device's full report (it would misrepresent the dashboard's
+    // counts). A full run always tries to forward, enrolled or not; forwardAuditReport no-ops
+    // quietly when there's no identity or the collector can't be reached.
+    if (!args.includes("--category")) {
+      const forwarded = await forwardAuditReport(report).catch(() => ({ sent: false, reason: "forwarding failed" }));
+      if (forwarded.sent) console.error("Sent to your workspace dashboard.");
+    }
   });
 
 const incident = program.command("incident").description("Policy 8.2 incident records: report to the security lead within 4 hours");

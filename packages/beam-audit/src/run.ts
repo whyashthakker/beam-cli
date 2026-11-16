@@ -47,7 +47,9 @@ import { formatReport, exitCode, type NamedMatrix } from "./report.js";
 import { renderHtmlReport, matchesAgentDiscoveryQuestion } from "./report-html.js";
 import type { AuditContext, Check } from "./types.js";
 
-export async function runAudit(argv: string[]): Promise<void> {
+export interface AuditRunResult { generatedAt: string; platform: string; checks: Check[]; matrices: NamedMatrix[] }
+
+export async function runAudit(argv: string[]): Promise<AuditRunResult> {
   const { roots, maxRepos, json, html, open, skipLive, policy: policyPath, online, maxDepth, maxFiles, wholePc, vscodeCdp: requestedCdp, uiAdapters, extensionsOnly, launchVscode, extensionAgent, category } = parseArgs(argv);
   const vscodeCdp = requestedCdp ? validateCdpEndpoint(requestedCdp) : undefined;
   if (launchVscode && requestedCdp) throw new Error("Choose --launch-vscode or --vscode-cdp, not both");
@@ -161,4 +163,5 @@ export async function runAudit(argv: string[]): Promise<void> {
   }
 
   process.exitCode = exitCode(checks, matrices);
+  return { generatedAt, platform: process.platform, checks, matrices };
 }
