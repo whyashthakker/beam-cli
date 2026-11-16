@@ -835,6 +835,18 @@ program.command("doctor")
     process.exitCode = doctorExitCode(checks);
   });
 
+program.command("audit")
+  .description("Run the beam-audit scanner: agent discovery, credential exposure, supply chain, and workstation checks (see beam-audit --help for its own flags)")
+  .allowUnknownOption()
+  .allowExcessArguments()
+  .argument("[args...]", "arguments passed to beam-audit")
+  .helpOption(false)
+  .action(async () => {
+    const { runAudit } = await import("beam-audit");
+    const at = process.argv.indexOf("audit");
+    await runAudit(process.argv.slice(at + 1));
+  });
+
 const incident = program.command("incident").description("Policy 8.2 incident records: report to the security lead within 4 hours");
 incident.command("new")
   .description("Record an incident only you know about (e.g. a lost laptop, an accidental paste)")

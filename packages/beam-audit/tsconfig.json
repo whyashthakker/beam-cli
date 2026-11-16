@@ -10,7 +10,7 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
     "isolatedModules": true,
-    "declaration": false,
+    "declaration": true,
     "sourceMap": true,
     "types": ["node"]
   },

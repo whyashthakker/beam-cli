@@ -27,6 +27,13 @@
   "bin": {
     "beam-audit": "dist/cli.js"
   },
+  "exports": {
+    ".": {
+      "types": "./dist/run.d.ts",
+      "default": "./dist/run.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
     "dist"
   ],

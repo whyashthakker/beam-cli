@@ -80,6 +80,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.2.0",
+    "beam-audit": "^0.1.0",
     "commander": "^13.0.0",
     "jsonc-parser": "^3.3.1",
     "smol-toml": "^1.9.1",
