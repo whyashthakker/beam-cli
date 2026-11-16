@@ -22,6 +22,8 @@ const bypassKey = /(?:^|\.)(?:defaultMode|permissionMode|initialPermissionMode|a
 const memoryKeys = new Set(['autoMemoryEnabled', 'memories.generate_memories', 'memories.use_memories', 'features.memory_tool']);
 const endpointKey = /(?:^|\.)(?:base_url|baseURL|apiEndpoint|openai_base_url|chatgpt_base_url|ANTHROPIC_BASE_URL|OPENAI_BASE_URL|GOOGLE_GEMINI_BASE_URL|url|httpUrl)$/i;
 const approvalValue = (v: unknown) => v === true || typeof v === 'string' && ['never','bypassPermissions','auto','yolo','acceptEdits','always'].includes(v);
+const NETWORK_TOOL = /\b(?:curl|wget|Invoke-WebRequest|iwr|ncat|nc)\b|fetch\(|https?\.request\(/i;
+const URL_PATTERN = /https?:\/\/[^\s'"<>]+/g;
 
 export function agentControlChecks(ctx: AuditContext): Check[] {
   const checks: Check[] = [];
@@ -51,6 +53,14 @@ export function agentControlChecks(ctx: AuditContext): Check[] {
         const events = hooks && typeof hooks === 'object' ? Object.keys(hooks).filter(k => ['PreToolUse','UserPromptSubmit'].includes(k)) : [];
         const nonempty = events.filter(k => Array.isArray(hooks[k]) && hooks[k].some((group: any) => Array.isArray(group?.hooks) && group.hooks.some((h: any) => h && typeof h.command === 'string' && h.command.trim())));
         add(`agent-prompt-hooks-${file}`, 'Agent permissions and bypasses', `${agent.name}: prompt/tool hook declarations`, hooksDisabled ? 'warn' : nonempty.length ? 'pass' : 'skip', `${nonempty.length} supported events contain nonempty hook commands. Commands are not executed; empty hook arrays do not establish protection. Actual hook effect, load errors, and managed precedence require execution evidence.`, [file]);
+        const commands: string[] = [];
+        if (hooks && typeof hooks === 'object') for (const groups of Object.values(hooks)) if (Array.isArray(groups)) for (const group of groups) if (Array.isArray((group as any)?.hooks)) for (const h of (group as any).hooks) if (h && typeof h.command === 'string' && h.command.trim()) commands.push(h.command);
+        const egressCommands = commands.filter(c => NETWORK_TOOL.test(c));
+        if (egressCommands.length) {
+          const urls = egressCommands.flatMap(c => [...c.matchAll(URL_PATTERN)].map(m => m[0]));
+          const unapproved = urls.filter(u => { try { const origin = new URL(u).origin; return !controls.allowedEndpointOrigins?.some(o => new URL(o).origin === origin); } catch { return true; } });
+          add(`agent-hook-network-${file}`, 'Network and data destinations', `${agent.name}: hook commands with network egress`, unapproved.length || !urls.length ? 'fail' : 'pass', `${egressCommands.length} hook command(s) invoke a network tool (curl/wget/Invoke-WebRequest/fetch/http.request). ${urls.length ? `${unapproved.length} of ${urls.length} extracted destination(s) are outside the organization endpoint allowlist.` : 'No literal destination URL could be extracted from the command text; the destination may be dynamic or piped in.'} Hooks run on every matching tool call or prompt and can exfiltrate tool output or prompt content; commands were not executed and full text is omitted.`, [file]);
+        }
       }
       const literals = entries.filter(e => credentialKey.test(e.path) && literalCredential(e.value));
       if (literals.length) add(`agent-literal-credentials-${file}`, 'Sensitive data exposure', `${agent.name}: literal credential settings`, 'warn', `${literals.length} credential fields contain literal-looking values rather than recognized secret references. Confirm whether they are real, rotate exposed credentials, and move them to approved storage. Values and field paths are omitted.`, [file]);

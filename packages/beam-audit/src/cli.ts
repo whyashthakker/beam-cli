@@ -6,7 +6,7 @@ import { agentProcessChecks } from "./checks/agent-processes.js";
 import { agentMemoryAndPluginChecks } from "./checks/agent-memory-plugins.js";
 import { agentControlChecks } from "./checks/agent-controls.js";
 import { resolvedSettingsChecks } from "./checks/resolved-settings.js";
-import { extensionInventoryChecks, subagentChecks, agentInstructionChecks } from "./checks/agent-assets.js";
+import { extensionInventoryChecks, subagentChecks, agentInstructionChecks, skillChecks } from "./checks/agent-assets.js";
 import { agentAuthenticationChecks } from "./checks/agent-auth.js";
 import { parseArgs } from "./args.js";
 import { runExtensionStage } from "./extension-stage.js";
@@ -19,9 +19,10 @@ import { remoteEnforcementChecks } from "./checks/remote-enforcement.js";
 import { platformSecurityChecks } from "./checks/platform-security.js";
 import { looseFileChecks } from "./checks/loose-files.js";
 import { mcpChecks } from "./checks/mcp.js";
+import { mcpToolIntrospectionChecks } from "./checks/mcp-introspect.js";
 import { loadPolicy, evaluatePolicy } from "./policy.js";
 import { repositoryEnforcementChecks } from "./checks/repository-enforcement.js";
-import { homedir } from "node:os";
+import { homedir, hostname, userInfo } from "node:os";
 import { writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { discoverReposDetailed } from "./discover-repos.js";
@@ -32,7 +33,7 @@ import { runPiiMatrix } from "./checks/matrix-test.js";
 import { runReviewMatrix } from "./checks/review-matrix.js";
 import { securityReviewCheck, workspaceIsolationLiveCheck } from "./checks/code-review.js";
 import { unofficialClientCheck } from "./checks/unofficial-client.js";
-import { tlsVerificationCheck, apiEndpointCheck } from "./checks/network-transport.js";
+import { tlsVerificationCheck, apiEndpointCheck, hostsFileCheck } from "./checks/network-transport.js";
 import { apiKeyStorageCheck } from "./checks/api-key-storage.js";
 import { precommitHookCheck, publicRepoVisibilityCheck } from "./checks/repo-hygiene.js";
 import { workstationChecks } from "./checks/workstation.js";
@@ -40,12 +41,12 @@ import { promptInjectionScan } from "./checks/prompt-injection.js";
 import { agentPostureChecks } from "./checks/agent-posture.js";
 import { manualItems } from "./checks/manual-items.js";
 import { formatReport, exitCode, type NamedMatrix } from "./report.js";
-import { renderHtmlReport } from "./report-html.js";
+import { renderHtmlReport, matchesAgentDiscoveryQuestion } from "./report-html.js";
 import type { AuditContext, Check } from "./types.js";
 
 
 async function main(): Promise<void> {
-  const { roots, maxRepos, json, html, open, skipLive, policy: policyPath, online, maxDepth, maxFiles, wholePc, vscodeCdp: requestedCdp, uiAdapters, extensionsOnly, launchVscode, extensionAgent } = parseArgs(process.argv.slice(2));
+  const { roots, maxRepos, json, html, open, skipLive, policy: policyPath, online, maxDepth, maxFiles, wholePc, vscodeCdp: requestedCdp, uiAdapters, extensionsOnly, launchVscode, extensionAgent, category } = parseArgs(process.argv.slice(2));
   const vscodeCdp = requestedCdp ? validateCdpEndpoint(requestedCdp) : undefined;
   if (launchVscode && requestedCdp) throw new Error("Choose --launch-vscode or --vscode-cdp, not both");
   const adapters = loadExtensionAdapters(uiAdapters).filter(a => extensionAgent === "all" || a.agent.toLowerCase() === extensionAgent);
@@ -79,6 +80,7 @@ async function main(): Promise<void> {
   checks.push(unofficialClientCheck(ctx));
   checks.push(tlsVerificationCheck(ctx));
   checks.push(apiEndpointCheck());
+  checks.push(hostsFileCheck(ctx));
   checks.push(apiKeyStorageCheck(ctx));
   checks.push(precommitHookCheck(ctx));
   if (online) checks.push(publicRepoVisibilityCheck(ctx));
@@ -88,10 +90,11 @@ async function main(): Promise<void> {
   checks.push(...manualItems());
   checks.push(...agentPostureChecks(ctx));
   log("checking agent controls, per-project settings, auth caches, extensions, sub-agents and instruction files");
-  checks.push(...agentControlChecks(ctx), ...resolvedSettingsChecks(ctx), ...agentAuthenticationChecks(ctx), ...extensionInventoryChecks(ctx), ...subagentChecks(ctx), ...agentInstructionChecks(ctx), ...agentMemoryAndPluginChecks(ctx));
+  checks.push(...agentControlChecks(ctx), ...resolvedSettingsChecks(ctx), ...agentAuthenticationChecks(ctx), ...extensionInventoryChecks(ctx), ...subagentChecks(ctx), ...agentInstructionChecks(ctx), ...agentMemoryAndPluginChecks(ctx), ...await skillChecks(ctx));
   log("checking current-user running agent argument signals (values omitted)");
   checks.push(...agentProcessChecks(ctx));
   checks.push(...mcpChecks(ctx));
+  checks.push(...await mcpToolIntrospectionChecks(ctx));
   checks.push(...repositoryEnforcementChecks(ctx));
   checks.push(...loggingChecks(ctx), ...supplyChainChecks(ctx), ...platformSecurityChecks(ctx), ...remoteEnforcementChecks(ctx));
   log("scanning non-repository credential patterns within roots");
@@ -130,6 +133,12 @@ async function main(): Promise<void> {
   });
   checks.push(...evaluatePolicy(checks, policy));
   for (const check of checks) check.category = categoryFor(check);
+  if (category) {
+    log(`filtering report to category: ${category} (the full scan still ran; this only narrows what's reported)`);
+    const filtered = checks.filter(c => categoryFor(c) === category || (category === "AI agent discovery and configuration" && matchesAgentDiscoveryQuestion(c)));
+    checks.length = 0; checks.push(...filtered);
+    matrices.length = 0;
+  }
   const generatedAt = new Date().toISOString();
   const report = formatReport(checks, matrices);
   console.log(report);
@@ -140,7 +149,7 @@ async function main(): Promise<void> {
   }
 
   if (html) {
-    const page = renderHtmlReport(checks, matrices, { roots, repoCount: repos.length, generatedAt, liveTestsRun: !skipLive || launchVscode || Boolean(vscodeCdp) });
+    const page = renderHtmlReport(checks, matrices, { roots, repoCount: repos.length, generatedAt, liveTestsRun: !skipLive || launchVscode || Boolean(vscodeCdp), hostname: hostname(), username: userInfo().username, platform: process.platform, home });
     writeFileSync(html, page, "utf8");
     log(`wrote HTML report to ${html}`);
     if (open) {

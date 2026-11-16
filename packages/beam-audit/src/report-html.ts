@@ -8,6 +8,27 @@ const STATUS_LABEL: Record<Status, string> = { fail: "FAIL", pass: "PASS", warn:
 const STATUS_COLOR: Record<Status, string> = { fail: "#b91c1c", pass: "#15803d", warn: "#a16207", skip: "#6b7280" };
 const STATUS_ORDER: Record<Status, number> = { fail: 0, warn: 1, skip: 2, pass: 3 };
 
+// A 0-100 security score per check (higher = safer), shown alongside the pass/fail badge so a
+// question's items can be ranked and averaged the same way the skill-risk engine already scores
+// skills. Checks that embed their own finer-grained "risk score NN/100 (LEVEL)" (skills, MCP tool
+// introspection) are inverted into a security score instead of collapsing to a flat per-status
+// value, so a skill at 2/100 safety reads very differently from one at 95/100 even though both
+// might be a plain "warn". Checks with no finer signal fall back to a flat per-status score. `skip`
+// has no score (nothing was verified) and is excluded from question averages rather than counted
+// as a bad or neutral result.
+function securityScore(c: Check): number | null {
+  const m = /risk score (\d+)\/100/i.exec(c.detail);
+  if (m) return Math.max(0, Math.min(100, 100 - Number(m[1])));
+  if (c.status === "skip") return null;
+  return { fail: 10, warn: 55, pass: 95 }[c.status];
+}
+function scoreLabel(score: number): string {
+  return score >= 80 ? "Secure" : score >= 40 ? "Review" : "Not secure";
+}
+function scoreColor(score: number): string {
+  return score >= 80 ? "#15803d" : score >= 40 ? "#a16207" : "#b91c1c";
+}
+
 function esc(s: string): string {
   return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
 }
@@ -46,25 +67,88 @@ function matrixSection(matrix: NamedMatrix): string {
   </section>`;
 }
 
-function card(c: Check): string {
+// Question-based drill-down, scoped to "AI agent discovery and configuration" first. Each question
+// pulls matching checks by id pattern from the FULL check list (not just this category's checkFor()
+// bucket), since the user's real questions ("how many MCP tools", "are Skills consistent") cut across
+// categories as currently defined. Checks are claimed by the first matching question so counts don't
+// double up within this view; the normal flat category-by-category rendering below is unaffected and
+// still shows every check under its categoryFor() home.
+export interface AgentQuestion { id: string; question: string; match: (c: Check) => boolean; }
+export const AGENT_DISCOVERY_QUESTIONS: AgentQuestion[] = [
+  { id: "q-agents-detected", question: "Which AI agents were detected, and where (CLI config vs. editor extension)?", match: c => /^(inventory-|editor-configuration-|extension-inventory-)/.test(c.id) },
+  { id: "q-official-client", question: "Are the detected agents official, or could they be unofficial/forked clients?", match: c => c.id.startsWith("3.5-unofficial-client") },
+  { id: "q-mcp-count-safety", question: "How many MCP servers are configured, and are they structurally safe (pinned, approved origin, no auto-trust)?", match: c => c.id.startsWith("mcp-") && !c.id.startsWith("mcp-tools-") && c.id !== "mcp-tool-introspection" },
+  { id: "q-mcp-tools", question: "What tools does each MCP server expose -- how many are write-mode, and could any read tool reach customer/PII data?", match: c => c.id.startsWith("mcp-tools-") || c.id === "mcp-tool-introspection" },
+  { id: "q-skills", question: "How many Skills exist per agent, are same-named Skills consistent across agents, and is there prompt-injection-shaped content?", match: c => c.id.startsWith("skill-") },
+  // Explicit allowlist: a substring match on "approval" also caught "9-approval-signoff" (an
+  // unrelated manual paperwork item for policy 9's human sign-off) and would have caught
+  // "agent-auth-permissions-*"/"log-permissions-*" (credential-cache ACL / logging checks) too.
+  { id: "q-auto-approve", question: "Is auto-edit / automatic approval (bypassing manual review) enabled anywhere?", match: c => c.id.startsWith("agent-approval-") || c.id.startsWith("agent-file-resolution-") || c.id.startsWith("permissions-") || c.id === "codex-managed-constraints" },
+  // Explicit allowlist, not /hook/i: that regex also matched git pre-commit hook checks
+  // (6.2-precommit-hook, effective-hook-*, hook-bypass-environment) -- an unrelated repo-hygiene
+  // feature that happens to share the word "hook" with Claude Code's own PreToolUse/UserPromptSubmit
+  // agent hooks. Mixing them in dragged this question's score down for the wrong reason entirely.
+  { id: "q-hooks", question: "Are there config-level hooks that monitor or enforce actions, and do any call out to the network?", match: c => c.id.startsWith("agent-required-prompt-hooks-") || c.id.startsWith("agent-hooks-disabled-") || c.id.startsWith("agent-prompt-hooks-") || c.id.startsWith("agent-hook-network-") || c.id === "global-hook-present" || c.id === "repo-settings-override-no-hook" },
+  { id: "q-memory", question: "Is persistent cross-session memory on or off, and does its content contain anything sensitive?", match: c => /memory/i.test(c.id) },
+  { id: "q-sandbox", question: 'Can the agent run unrestricted ("mindless") shell/network commands -- sandbox disabled, wildcard tool grants, network access allowed?', match: c => /sandbox|extra-roots|network-environment/i.test(c.id) },
+];
+
+export function matchesAgentDiscoveryQuestion(c: Check): boolean {
+  return AGENT_DISCOVERY_QUESTIONS.some(q => q.match(c));
+}
+
+function questionBlock(q: AgentQuestion, items: Check[], meta: ReportMeta): string {
+  const counts = { pass: 0, fail: 0, warn: 0, skip: 0 };
+  for (const c of items) counts[c.status]++;
+  const scores = items.map(securityScore).filter((s): s is number => s !== null);
+  const avg = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+  const avgBadge = avg !== null ? `<span class="q-score" style="color:${scoreColor(avg)}">${avg}/100 avg &middot; ${scoreLabel(avg)}</span>` : `<span class="q-score" style="color:#6b7280">no score (all not checked)</span>`;
+  const overview = items.length ? `${items.length} checks &middot; ${counts.fail} fail &middot; ${counts.warn} review &middot; ${counts.pass} pass &middot; ${counts.skip} not checked` : "No matching checks run.";
+  const state = counts.fail ? "tile-fail" : counts.warn ? "tile-warn" : counts.skip || !items.length ? "tile-skip" : "tile-pass";
+  return `
+  <details class="question-block ${state}">
+    <summary><strong>${esc(q.question)}</strong>${avgBadge}<span class="q-overview">${overview}</span></summary>
+    <div class="question-detail">
+      <p class="device-meta">Host: ${esc(meta.hostname ?? "unknown")} &middot; User: ${esc(meta.username ?? "unknown")} &middot; Platform: ${esc(meta.platform ?? "unknown")} &middot; Home: ${esc(meta.home ?? "unknown")}</p>
+      ${items.length ? items.map(c => card(c, { showScore: true })).join("") : `<p class="detail">No checks in this scan matched this question's evidence pattern.</p>`}
+    </div>
+  </details>`;
+}
+
+function agentDiscoveryQuestionSection(allChecks: Check[], meta: ReportMeta): string {
+  const claimed = new Set<Check>();
+  const blocks = AGENT_DISCOVERY_QUESTIONS.map(q => {
+    const items = allChecks.filter(c => !claimed.has(c) && q.match(c));
+    for (const c of items) claimed.add(c);
+    return questionBlock(q, items, meta);
+  }).join("");
+  return `<div class="question-list">${blocks}</div>`;
+}
+
+function card(c: Check, options: { showScore?: boolean } = {}): string {
   const evidence = c.evidence?.length
     ? `<ul class="evidence">${c.evidence.slice(0, 50).map(e => `<li>${esc(e)}</li>`).join("")}</ul>`
     : "";
   const fix = c.fix ? `<p class="fix"><strong>Fix:</strong> ${esc(c.fix)}</p>` : "";
+  const score = options.showScore ? securityScore(c) : null;
+  const scoreBadge = score !== null ? `<span class="badge" style="background:${scoreColor(score)}">${score}/100 &middot; ${scoreLabel(score)}</span>` : "";
+  const why = options.showScore
+    ? `<details class="check-why"><summary>Check why</summary><p class="detail">${esc(c.detail)}</p>${evidence}${fix}</details>`
+    : `<p class="detail">${esc(c.detail)}</p>${evidence}${fix}`;
   return `
   <div class="card status-${c.status}">
     <div class="card-head">
       <span class="badge" style="background:${STATUS_COLOR[c.status]}">${STATUS_LABEL[c.status]}</span>
+      ${scoreBadge}
       <span class="policy">policy ${esc(c.policySection)}</span>
       <h3>${esc(c.title)}</h3>
     </div>
-    <p class="detail">${esc(c.detail)}</p>
-    ${evidence}
-    ${fix}
+    ${why}
   </div>`;
 }
 
-export function renderHtmlReport(checks: Check[], matrices: NamedMatrix[], meta: { roots: string[]; repoCount: number; generatedAt: string; liveTestsRun: boolean }): string {
+export interface ReportMeta { roots: string[]; repoCount: number; generatedAt: string; liveTestsRun: boolean; hostname?: string; username?: string; platform?: string; home?: string; }
+export function renderHtmlReport(checks: Check[], matrices: NamedMatrix[], meta: ReportMeta): string {
   const sorted = [...checks].sort((a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status]);
   const counts = { fail: 0, pass: 0, warn: 0, skip: 0 };
   for (const c of checks) counts[c.status]++;
@@ -80,7 +164,12 @@ export function renderHtmlReport(checks: Check[], matrices: NamedMatrix[], meta:
     const state = failed ? "FAIL" : warnings ? "REVIEW" : skipped || !items.length ? "PARTIAL" : "PASS";
     return `<a class="category-tile ${failed ? "tile-fail" : warnings ? "tile-warn" : skipped ? "tile-skip" : "tile-pass"}" href="#${categoryId(name)}"><strong>${esc(name)}</strong><span>${state} · ${failed} fail · ${warnings} review · ${passing} pass · ${skipped} not checked</span></a>`;
   }).join("");
-  const categorySections = [...categories].map(([name, items]) => `<section class="category-section" id="${categoryId(name)}"><div class="category-heading"><div><p class="eyebrow">AUDIT CATEGORY</p><h2>${esc(name)}</h2></div><span class="category-count">${items.length} checks</span></div>${items.map(card).join("")}</section>`).join("");
+  const categorySections = [...categories].map(([name, items]) => {
+    const questionSection = name === "AI agent discovery and configuration"
+      ? `<p class="eyebrow" style="margin-top:18px">BREAKDOWN BY QUESTION</p>${agentDiscoveryQuestionSection(checks, meta)}<p class="eyebrow" style="margin-top:26px">ALL CHECKS IN THIS CATEGORY BUCKET</p>`
+      : "";
+    return `<section class="category-section" id="${categoryId(name)}"><div class="category-heading"><div><p class="eyebrow">AUDIT CATEGORY</p><h2>${esc(name)}</h2></div><span class="category-count">${items.length} checks</span></div>${questionSection}${items.map(c => card(c)).join("")}</section>`;
+  }).join("");
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -152,6 +241,21 @@ export function renderHtmlReport(checks: Check[], matrices: NamedMatrix[], meta:
   .m-detail { color: #9aa1ab; }
   .outcome { color: #d5dce6; font-size: .72rem; }
   .data-group th { padding:16px 0 7px; text-align:left; color:#e6e8eb; font-size:.9rem; border-bottom:1px solid #30394a; }
+  .question-list { display:flex; flex-direction:column; gap:8px; margin:10px 0 6px; }
+  .question-block { background:#141821; border:1px solid #262c38; border-radius:10px; padding:4px 2px; }
+  .question-block.tile-fail { border-left:4px solid #b91c1c; } .question-block.tile-warn { border-left:4px solid #a16207; } .question-block.tile-skip { border-left:4px solid #4b5563; } .question-block.tile-pass { border-left:4px solid #15803d; }
+  .question-block summary { cursor:pointer; padding:12px 16px; display:flex; flex-direction:column; gap:4px; list-style:none; }
+  .question-block summary::-webkit-details-marker { display:none; }
+  .question-block summary strong { font-size:.94rem; }
+  .question-block summary .q-overview { font-size:.78rem; color:#9aa1ab; }
+  .question-block[open] summary { border-bottom:1px solid #262c38; }
+  .question-detail { padding:4px 16px 12px; }
+  .device-meta { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.74rem; color:#8b929c; background:#0b0d12; border-radius:8px; padding:8px 12px; margin:6px 0 12px; }
+  .question-block summary .q-score { font-size:.85rem; font-weight:700; }
+  .check-why { margin-top:8px; }
+  .check-why summary { cursor:pointer; color:#93c5fd; font-size:.82rem; list-style:none; }
+  .check-why summary::-webkit-details-marker { display:none; }
+  .check-why[open] summary { margin-bottom:6px; }
 </style>
 </head>
 <body>

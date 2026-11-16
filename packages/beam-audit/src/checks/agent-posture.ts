@@ -10,7 +10,7 @@ export function agentPostureChecks(ctx: AuditContext): Check[] {
   const add = (id: string, category: string, title: string, status: Check["status"], detail: string, evidence: string[] = []) => checks.push({ id, policySection: category, title, status, detail, evidence });
   for (const agent of agents) {
     const files = agent.paths.filter(existsSync);
-    const commands: Record<string, string[]> = { "Claude Code": ["claude"], "Codex": ["codex"], "Cursor": ["cursor"], "Gemini CLI": ["gemini"], "GitHub Copilot CLI": ["copilot"], "OpenCode": ["opencode"], "VS Code / Copilot / Cline / Roo": ["code"] };
+    const commands: Record<string, string[]> = { "Claude Code": ["claude"], "Codex": ["codex"], "Cursor": ["cursor"], "Gemini CLI": ["gemini"], "GitHub Copilot CLI": ["copilot"], "OpenCode": ["opencode"], "VS Code / Copilot / Cline / Roo": ["code"], "Aider": ["aider"], "Amazon Q Developer CLI": ["q"], "Zed": ["zed"] };
     const executable = (commands[agent.name] ?? []).some(command => (process.env.PATH ?? "").split(delimiter).some(dir => (ctx.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""]).some(ext => existsSync(join(dir, command + ext)))));
     add(`${agent.name === "VS Code / Copilot / Cline / Roo" ? "editor-configuration" : "inventory"}-${agent.name}`, "3 / Agent inventory", `${agent.name}: configuration discovery`, files.length || executable ? "warn" : "skip", files.length || executable ? `Discovery signals: ${files.length} configuration files; executable-name candidate on PATH: ${executable}. Binary identity, account ownership, and running state require separate verification.` : "No known configuration or executable-name candidate found; this does not prove the agent is absent.", files);
     for (const file of files) {

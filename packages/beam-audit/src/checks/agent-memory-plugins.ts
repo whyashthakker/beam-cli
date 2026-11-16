@@ -7,7 +7,7 @@ export function agentMemoryAndPluginChecks(ctx:AuditContext):Check[]{
  const checks:Check[]=[];const env=ctx.environment??process.env;
  const claude=env.CLAUDE_CONFIG_DIR?resolve(env.CLAUDE_CONFIG_DIR):join(ctx.home,'.claude');
  const codex=env.CODEX_HOME?resolve(env.CODEX_HOME):join(ctx.home,'.codex');
- const memoryRoots=[join(codex,'memories')];
+ const memoryRoots=[join(codex,'memories'),join(ctx.home,'.codeium/windsurf/memories')];
  const projects=join(claude,'projects');
  try{const dirs=readdirSync(projects);for(const dir of dirs.slice(0,200))memoryRoots.push(join(projects,dir,'memory'));if(dirs.length>200)checks.push({id:'agent-memory-project-cap',category:'Scan coverage and evidence',policySection:'Scope',title:'Claude memory project cap',status:'warn',detail:'Only the first 200 project directory entries were considered for memory inspection.'});}catch{}
  const started=Date.now();
@@ -16,7 +16,7 @@ export function agentMemoryAndPluginChecks(ctx:AuditContext):Check[]{
   for(const file of files.slice(0,100)){if(inspected>=500||Date.now()-started>10000){excluded++;break;}const path=join(root,file);try{const st=lstatSync(path);if(!st.isFile()||st.isSymbolicLink()||st.size>262144||! /\.(?:md|txt|json|jsonl)$/i.test(file)){excluded++;continue;}const text=readFileSync(path,'utf8');inspected++;const kinds=[...new Set(confidentHits(text).map(h=>h.kind))];if(kinds.length||phiHits(text).length||CONFIDENTIAL_MARKER.test(text))evidence.push(`${path}: sensitive-shaped content or explicit confidentiality marker`);}catch{unreadable++;}}
   if(files.length>100)excluded+=files.length-100;
  }
- checks.push({id:'agent-memory-content',category:'Sensitive data exposure',policySection:'4.2 / 5.5',title:'Persistent memory content inspection',status:evidence.length||excluded||unreadable?'warn':inspected?'pass':'skip',detail:`${inspected} supported first-level memory files inspected (500-file / 10-second inspection budget); ${excluded} exclusions; ${unreadable} unreadable files. Sensitive content detection is heuristic. File existence does not prove memory is enabled. Clinical narrative, personal names, nested stores and other agents' memories are not exhaustively classified. Values omitted.`,evidence:evidence.slice(0,50)});
+ checks.push({id:'agent-memory-content',category:'Sensitive data exposure',policySection:'4.2 / 5.5',title:'Persistent memory content inspection',status:evidence.length||excluded||unreadable?'warn':inspected?'pass':'skip',detail:`${inspected} supported first-level memory files inspected across Claude Code, Codex and Windsurf memory stores (500-file / 10-second inspection budget); ${excluded} exclusions; ${unreadable} unreadable files. Sensitive content detection is heuristic. File existence does not prove memory is enabled. Other agents with a persistent-memory feature (e.g. Cursor, Gemini CLI) are not yet covered by this check pending a confirmed on-disk memory-store location for each. Clinical narrative, personal names, nested stores and other agents' memories are not exhaustively classified. Values omitted.`,evidence:evidence.slice(0,50)});
  const receipt=join(claude,'plugins/installed_plugins.json');
  if(existsSync(receipt))try{const data=readConfiguration(receipt);let count=0;for(const [name,value] of Object.entries(data.plugins??{}).slice(0,500)){
   if(!/^[\w.-]+(?:@[\w.-]+)?$/.test(name))continue;

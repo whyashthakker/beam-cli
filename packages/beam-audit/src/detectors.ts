@@ -172,6 +172,7 @@ export const SYNTHETIC_PAYLOAD = {
   phone: "555-019-4273", // NANP 555 exchange is reserved for fictional use, never a real line
   internalIp: "10.77.231.14",
   creditCard: "4000-1111-2222-3330",
+  medicalRecordNumber: "MRN-SYN-778899", // matches ALL_UPPER_ID; shaped like a real MRN label value
 };
 
 /** One row per policy-4.2 data type for the pass/fail matrix -- field name, the single synthetic
@@ -181,5 +182,6 @@ export const MATRIX_FIELDS: Array<{ label: string; field: string; value: string 
   { label: "Phone", field: "PHONE", value: SYNTHETIC_PAYLOAD.phone },
   { label: "SSN", field: "SSN", value: SYNTHETIC_PAYLOAD.ssn },
   { label: "Credit card", field: "CARD", value: SYNTHETIC_PAYLOAD.creditCard },
+  { label: "Health record ID (PHI)", field: "MRN", value: SYNTHETIC_PAYLOAD.medicalRecordNumber },
   { label: "API key", field: "API_KEY", value: SYNTHETIC_PAYLOAD.apiKey },
 ];

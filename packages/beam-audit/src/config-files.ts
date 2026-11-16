@@ -2,11 +2,13 @@ import { readFileSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parse as parseToml } from '@iarna/toml';
 import { parse as parseJsonc, type ParseError } from 'jsonc-parser';
+import { parse as parseYaml } from 'yaml';
 import type { AuditContext } from './types.js';
 export function readConfiguration(file:string):any {
  if(statSync(file).size>2_000_000)throw new Error('Configuration exceeds 2 MB');
  const raw=readFileSync(file,'utf8');
  if(file.endsWith('.toml'))return parseToml(raw);
+ if(/\.ya?ml$/i.test(file)){const result=parseYaml(raw,{maxAliasCount:20});if(!result||typeof result!=='object'||Array.isArray(result))throw new Error('Invalid configuration');return result;}
  const errors:ParseError[]=[]; const result=parseJsonc(raw,errors,{allowTrailingComma:true});
  if(errors.length||!result||typeof result!=='object'||Array.isArray(result))throw new Error('Invalid configuration');return result;
 }
@@ -23,6 +25,11 @@ export function agentConfigurations(ctx:AuditContext){
  {name:'GitHub Copilot CLI',paths:[join(ctx.home,'.copilot/config.json')]},
  {name:'VS Code / Copilot / Cline / Roo',paths:[join(app,'Code/User/settings.json'),join(app,'Code/User/mcp.json'),join(app,'Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json'),join(app,'Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json'),...ctx.repos.flatMap(r=>[join(r,'.vscode/settings.json'),join(r,'.vscode/mcp.json')])]},
  {name:'OpenCode',paths:[join(ctx.home,'.config/opencode/opencode.json'),join(ctx.home,'.config/opencode/opencode.jsonc'),...ctx.repos.flatMap(r=>[join(r,'opencode.json'),join(r,'opencode.jsonc')])]},
+ {name:'Continue',paths:[join(ctx.home,'.continue/config.json'),join(ctx.home,'.continue/config.yaml'),...ctx.repos.flatMap(r=>[join(r,'.continue/config.json'),join(r,'.continue/config.yaml')])]},
+ {name:'Windsurf',paths:[join(ctx.home,'.codeium/windsurf/mcp_config.json'),join(app,'Windsurf/User/settings.json'),join(app,'Windsurf/User/mcp.json')]},
+ {name:'Aider',paths:[join(ctx.home,'.aider.conf.yml'),...ctx.repos.map(r=>join(r,'.aider.conf.yml'))]},
+ {name:'Amazon Q Developer CLI',paths:[join(ctx.home,'.aws/amazonq/mcp.json')]},
+ {name:'Zed',paths:[join(app,'Zed/settings.json')]},
  ];
 }
 

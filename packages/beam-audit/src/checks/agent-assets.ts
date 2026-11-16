@@ -1,9 +1,14 @@
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
-import { join, dirname, resolve, relative, isAbsolute } from 'node:path';
+import { join, dirname, resolve, relative, isAbsolute, basename, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { parse as parseYaml } from 'yaml';
 import { agentConfigurations, readConfiguration } from '../config-files.js';
 import { CONFIDENTIAL_MARKER, confidentHits } from '../detectors.js';
+// Same monorepo: use the real, already-shipped skill engine (richer than anything worth
+// reimplementing here -- it also runs the full rule-catalog.ts builtin rules against skill text,
+// not just the risk/injection subset) instead of maintaining a second copy in beam-audit.
+import { scanSkillDir } from '../../../../dist/skill-scan.js';
+import { discoverAllSkills } from '../../../../dist/skill-inventory.js';
 import type { AuditContext, Check } from '../types.js';
 function inScope(root:string,file:string):boolean { const r=relative(root,file);return !r.startsWith('..')&&!isAbsolute(r); }
 export function compareRelease(installed:string, minimum:string):number|null {
@@ -64,11 +69,70 @@ export function subagentChecks(ctx:AuditContext):Check[]{
  }catch{out.push({id:`subagent-unreadable-${file}`,category:'Scan coverage and evidence',policySection:'Scope',title:'Sub-agent definition not inspected',status:'skip',detail:'Definition is unreadable, oversized, linked, malformed, or has no supported metadata.',evidence:[file]});}
  return out.length?out:[{id:'subagent-discovery',category:'Third-party integrations and supply chain',policySection:'3 / 4.3',title:'Sub-agent definition discovery',status:'skip',detail:'No definitions found in supported user/project directories or Codex role references. Other versions, remote agents, and dynamic delegation remain unverified.'}];
 }
+// Mirrors the main beam-cli product's skill-inventory.ts discovery: a whole-filesystem walk (bounded
+// by a directory/time budget) that finds every folder containing a SKILL.md, not just the known
+// per-agent skill directories -- those are also where a nested/vendored skill or a project-local
+// skill would otherwise be missed.
+function classifySkillAgent(dir: string): string {
+ const p = dir.split(sep);
+ if (p.includes('.claude')) return 'Claude Code';
+ if (p.includes('.codex')) return 'Codex';
+ if (p.includes('.cursor')) return 'Cursor';
+ if (p.includes('.gemini')) return 'Gemini CLI';
+ if (p.includes('.copilot')) return 'GitHub Copilot CLI';
+ if (p.includes('.opencode')) return 'OpenCode';
+ if (p.includes('.windsurf') || p.includes('.codeium')) return 'Windsurf';
+ if (p.includes('.continue')) return 'Continue';
+ if (p.includes('.agents')) return 'Universal (.agents)';
+ return 'Unknown';
+}
+
+export async function skillChecks(ctx: AuditContext): Promise<Check[]> {
+ const out: Check[] = [];
+ const { found, truncated } = await discoverAllSkills({ roots: [...new Set([ctx.home, ...ctx.roots])] });
+ if (truncated) out.push({ id: 'skill-discovery-truncated', category: 'Scan coverage and evidence', policySection: 'Scope', title: 'Whole-filesystem skill discovery limit', status: 'warn', detail: 'The skill discovery walk hit its directory/time budget before finishing; some skills under the scanned roots may not have been found.' });
+ const bySkillName = new Map<string, Array<{ agent: string; dir: string; hash: string }>>();
+ for (const { dir } of found.slice(0, 500)) {
+  const agent = classifySkillAgent(dir);
+  const name = basename(dir);
+  let scan; try { scan = await scanSkillDir(dir, name); } catch { out.push({ id: `skill-unreadable-${dir}`, category: 'Scan coverage and evidence', policySection: 'Scope', title: 'Skill scan unavailable', status: 'skip', detail: 'The skill could not be scanned by the shared engine (unreadable, oversized, or malformed).', evidence: [dir] }); continue; }
+  const status: Check['status'] = scan.level === 'CRITICAL' || scan.level === 'HIGH' ? 'fail' : scan.level === 'MEDIUM' ? 'warn' : scan.findings.length ? 'warn' : 'pass';
+  const evidence = scan.findings.slice(0, 10).map(f => `${f.file}${f.line ? `:${f.line}` : ''} -- ${f.title} [${f.severity}]: ${f.evidence || '(no single-line evidence)'} -- ${f.explanation}`);
+  out.push({
+   id: `skill-risk-${dir}`, category: 'Third-party integrations and supply chain', policySection: '3 / 4.3 / 7',
+   title: `Skill risk scan: ${name} (${agent})`, status,
+   detail: `${scan.filesScanned} file(s) scanned${scan.skipped.length ? `, ${scan.skipped.length} skipped (oversized)` : ''}; risk score ${scan.score}/100 (${scan.level}); ${scan.findings.length} finding(s) using the shared beam-cli skill-risk engine (privilege escalation, persistence, credential/exfil access, obfuscation, dynamic/decode-then-execute code, download-and-run, unpinned installs, broad destructive commands, prompt-injection phrasing, and the general secret/PII rule set). Detection is heuristic pattern matching on the skill's own text and bundled scripts -- nothing in the skill was ever executed, and a clever rewording can still evade a pattern. See evidence for the exact file, line, and matched text.`,
+   evidence, fix: scan.findings.length ? 'Open each listed file/line and confirm the flagged command or phrasing is actually needed and intentional before trusting this skill.' : undefined,
+  });
+  const file = join(dir, 'SKILL.md');
+  try {
+   const text = readFileSync(file, 'utf8');
+   const front = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
+   const metadata: any = front ? parseYaml(front[1]!, { maxAliasCount: 20 }) : {};
+   const allowedTools = Array.isArray(metadata?.['allowed-tools']) ? metadata['allowed-tools'] as string[] : typeof metadata?.['allowed-tools'] === 'string' ? [metadata['allowed-tools']] : [];
+   const wildcard = allowedTools.some(t => typeof t === 'string' && (/\*/.test(t) || /^Bash$/i.test(t)));
+   const bad = wildcard && ctx.agentControls?.requireManualApproval;
+   out.push({ id: `skill-definition-${file}`, category: 'Third-party integrations and supply chain', policySection: '3 / 4.3', title: `Skill configuration: ${typeof metadata?.name === 'string' ? metadata.name : name}`, status: bad ? 'fail' : allowedTools.length ? 'warn' : 'skip', detail: allowedTools.length ? `Declared allowed-tools frontmatter: ${allowedTools.length} entrie(s)${wildcard ? ', including an unrestricted/wildcard tool grant' : ''}. A declaration does not prove the tool scope is actually enforced at runtime.` : 'No allowed-tools frontmatter field recognized; this Skill either declares no tool restriction or uses an unsupported metadata format.', evidence: [file] });
+  } catch { /* SKILL.md itself unreadable; scan above still ran against whatever files were readable */ }
+  const key = (typeof name === 'string' ? name : basename(dir)).toLowerCase();
+  bySkillName.set(key, [...(bySkillName.get(key) ?? []), { agent, dir, hash: scan.hash }]);
+ }
+ for (const [name, entries] of bySkillName) {
+  if (entries.length < 2) continue;
+  const hashes = new Set(entries.map(e => e.hash));
+  out.push({ id: `skill-cross-agent-${name}`, category: 'Third-party integrations and supply chain', policySection: '3', title: `Skill consistency across agents: ${name}`, status: hashes.size > 1 ? 'warn' : 'pass', detail: hashes.size > 1 ? `Found ${entries.length} installation(s) of a skill named "${name}" across ${new Set(entries.map(e => e.agent)).size} agent location(s) with differing content. A skill with the same name can carry different instructions per agent/location.` : `Found ${entries.length} installation(s) of a skill named "${name}" with identical content across agent locations.`, evidence: entries.map(e => `${e.agent}: ${e.dir}`) });
+ }
+ if (!found.length) out.push({ id: 'skill-discovery', category: 'Third-party integrations and supply chain', policySection: '3', title: 'Skill discovery', status: 'skip', detail: 'No SKILL.md definitions found in the scanned roots.' });
+ return out;
+}
 export function agentInstructionChecks(ctx:AuditContext):Check[]{
  const out:Check[]=[];
  const candidates=[join(ctx.home,'.claude/CLAUDE.md'),join(ctx.home,'.codex/AGENTS.md'),join(ctx.home,'.codex/AGENTS.override.md'),join(ctx.home,'.gemini/GEMINI.md'),...ctx.repos.flatMap(r=>['AGENTS.md','AGENTS.override.md','CLAUDE.md','GEMINI.md','.github/copilot-instructions.md','.windsurfrules','.clinerules'].map(n=>join(r,n)))];
  for(const repo of ctx.repos)for(const relativeRoot of ['.cursor/rules','.github/instructions','.roo/rules']){const root=join(repo,relativeRoot);try{for(const name of readdirSync(root).slice(0,200))if(/\.(?:md|mdc|txt)$/i.test(name))candidates.push(join(root,name));}catch{}}
- for(const root of [join(ctx.home,'.agents/skills'),join(ctx.home,'.claude/skills'),join(ctx.home,'.codex/skills'),...ctx.repos.flatMap(r=>[join(r,'.agents/skills'),join(r,'.claude/skills')])])try{for(const name of readdirSync(root).slice(0,200)){const dir=join(root,name);if(!lstatSync(dir).isSymbolicLink())candidates.push(join(dir,'SKILL.md'));}}catch{}
+ // SKILL.md is intentionally NOT scanned here: skillChecks() already runs the real, far more
+ // capable shared skill-risk engine (full rule-catalog + injection rules, not just this file's
+ // three regexes) against every SKILL.md. Scanning it again here with the weaker heuristic would
+ // just add a near-always-"not recognized" duplicate card that dilutes the real skill findings.
  for(const file of candidates)if(existsSync(file))try{const st=lstatSync(file);if(!st.isFile()||st.size>262144)throw new Error('limit');const text=readFileSync(file,'utf8');
  const suspicious=/ignore (?:all |previous )?(?:security|safety|polic(?:y|ies))|disable (?:all )?(?:guardrails|security checks)|exfiltrat/i.test(text);
  const credentials=confidentHits(text).some(h=>['API_KEY','OAUTH_TOKEN','PRIVATE_KEY'].includes(h.kind));

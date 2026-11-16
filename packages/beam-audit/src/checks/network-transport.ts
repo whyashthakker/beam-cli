@@ -1,8 +1,36 @@
 // Policy 3 (Network Transport: "HTTPS with TLS 1.2 or higher... unencrypted or self-signed-certificate
 // connections are not permitted") and 5.6 (API Tier: official commercial endpoint only). Checks both
 // the live environment and shell startup files, since a developer sets these once and forgets them.
+import { readFileSync } from "node:fs";
 import type { AuditContext, Check } from "../types.js";
 import { readShellRcFiles } from "../shell-env.js";
+
+const ANTHROPIC_HOST = /(?:^|\.)anthropic\.com$/i;
+
+// A /etc/hosts (or Windows equivalent) entry for Anthropic's domain is a persistent MITM primitive:
+// it silently redirects every agent on the machine regardless of what ANTHROPIC_BASE_URL says, and
+// survives reboots and new terminals. No legitimate commercial-API setup needs one.
+export function hostsFileCheck(ctx: AuditContext, readHosts: () => string = () => readFileSync(ctx.platform === "win32" ? "C:\\Windows\\System32\\drivers\\etc\\hosts" : "/etc/hosts", "utf8")): Check {
+  const base = { id: "3-hosts-file-override", policySection: "3, 6.5 (Network Transport)", title: "No hosts-file override for Anthropic's domain" };
+  let text: string;
+  try { text = readHosts(); } catch { return { ...base, status: "skip", detail: "Hosts file could not be read." }; }
+  const hits: string[] = [];
+  for (const line of text.split("\n")) {
+    const stripped = line.replace(/#.*$/, "").trim();
+    if (!stripped) continue;
+    const [ip, ...hostnames] = stripped.split(/\s+/);
+    if (ip && hostnames.some(h => ANTHROPIC_HOST.test(h))) hits.push(`Hosts-file entry maps an anthropic.com hostname to a configured address (address omitted).`);
+  }
+  return {
+    ...base,
+    status: hits.length > 0 ? "fail" : "pass",
+    detail: hits.length > 0
+      ? `${hits.length} hosts-file entry/entries redirect an anthropic.com hostname to another address. This overrides DNS for every process on the machine, including Claude Code, regardless of any endpoint allowlist in its own configuration.`
+      : "No hosts-file entries override an anthropic.com hostname.",
+    evidence: hits,
+    fix: hits.length > 0 ? "Remove the anthropic.com entry from the hosts file unless it is an explicitly approved, documented proxy/testing setup." : undefined,
+  };
+}
 
 const TLS_DISABLE = /\bNODE_TLS_REJECT_UNAUTHORIZED\s*=\s*0\b/;
 
