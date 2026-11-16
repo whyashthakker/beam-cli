@@ -56,11 +56,11 @@
     ]
   },
   "scripts": {
-    "build": "test -f packages/beam-audit/dist/run.d.ts || (tsc -p tsconfig.json || true) >/dev/null 2>&1; npm run build --workspace beam-audit && tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "build": "test -f packages/beam-audit/dist/run.d.ts || (tsc -p tsconfig.json || true) >/dev/null 2>&1; npm --prefix packages/beam-audit run build && tsc -p tsconfig.json && chmod +x dist/cli.js",
     "build:watch": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "build:binaries": "npm run build && node scripts/build-binaries.mjs",
     "dev": "tsx src/cli.ts",
-    "audit": "npm run build --workspace beam-audit && node packages/beam-audit/dist/cli.js",
+    "audit": "npm --prefix packages/beam-audit run build && node packages/beam-audit/dist/cli.js",
     "test": "node --no-warnings --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
     "test:watch": "node --no-warnings --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit",
