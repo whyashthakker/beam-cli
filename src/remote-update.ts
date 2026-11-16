@@ -24,9 +24,9 @@ export async function runRemoteUpdate(deps: RemoteUpdateDeps = {}): Promise<Remo
   let version: string | undefined;
   try {
     const response = await fetch(`${identity.apiBase}/v1/device/update`, { headers, signal: AbortSignal.timeout(8000) });
-    if (!response.ok) return { status: "none" }; // a collector from before this route
+    if (!response.ok) return { status: "failed", reason: `Update poll returned HTTP ${response.status}` };
     version = ((await response.json()) as { update?: { version?: string } | null }).update?.version;
-  } catch { return { status: "none" }; }
+  } catch (error) { return { status: "failed", reason: `Update poll failed: ${error instanceof Error ? error.message : String(error)}` }; }
   if (!version || !/^\d+\.\d+\.\d+$/.test(version)) return { status: "none" };
   if (compareVersions(version, current) <= 0) return { status: "current", version };
 

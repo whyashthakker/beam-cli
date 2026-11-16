@@ -30,11 +30,11 @@ export async function runRemoteAudit(deps: RemoteAuditDeps = {}): Promise<Remote
   let requestedBy: string | undefined;
   try {
     const response = await fetch(`${identity.apiBase}/v1/device/update`, { headers, signal: AbortSignal.timeout(8000) });
-    if (!response.ok) return { status: "none" }; // a collector from before this route
+    if (!response.ok) return { status: "failed", reason: `Audit poll returned HTTP ${response.status}` };
     const data = (await response.json()) as { auditRequested?: boolean; auditRequestedBy?: string };
     requested = Boolean(data.auditRequested);
     requestedBy = data.auditRequestedBy;
-  } catch { return { status: "none" }; }
+  } catch (error) { return { status: "failed", reason: `Audit poll failed: ${error instanceof Error ? error.message : String(error)}` }; }
   if (!requested) return { status: "none" };
 
   // beam-audit sets process.exitCode on its own when it finds a failing check -- harmless for its

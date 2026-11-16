@@ -134,25 +134,32 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
   // Keep the cached policy fresh so `beam hook` can enforce it without a network call.
   let policyTimer: NodeJS.Timeout | undefined;
   const identity = await readIdentity();
-  if (identity) {
-    // The same minute-long poll also picks up skill removals and file requests queued in the dashboard (skill-remote.ts).
-    let skillActionsBusy = false;
-    const poll = () => {
-      void syncPolicy().catch(() => {});
-      if (skillActionsBusy) return;
-      skillActionsBusy = true;
-      // An update an administrator queued installs here; a supervised service then exits so its manager starts the new version.
-      void (async () => {
-        const update = await runRemoteUpdate().catch(() => null);
-        await runSkillActions().catch(() => {});
-        await runRemoteAudit().catch(() => null);
-        if (update?.status === "updated" && supervised()) process.exit(0);
-      })().finally(() => { skillActionsBusy = false; });
-    };
-    poll();
-    policyTimer = setInterval(poll, 60_000);
-    policyTimer.unref?.();
-  }
+  // Always start polling: enrollment may happen after the service starts.
+  // Each task has its own guard so a long audit cannot stall updates or skill actions.
+  const busy = new Set<string>();
+  const runTask = (name: string, task: () => Promise<unknown>) => {
+    if (busy.has(name)) return;
+    busy.add(name);
+    void task().catch((error: unknown) => {
+      console.error(`[beam] ${name} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }).finally(() => { busy.delete(name); });
+  };
+  const poll = () => {
+    runTask("policy sync", () => syncPolicy());
+    runTask("remote update", async () => {
+      const result = await runRemoteUpdate();
+      if (result.status === "failed") console.error(`[beam] remote update failed: ${result.reason}`);
+      if (result.status === "updated" && supervised()) process.exit(0);
+    });
+    runTask("skill actions", () => runSkillActions());
+    runTask("remote audit", async () => {
+      const result = await runRemoteAudit();
+      if (result.status === "failed") console.error(`[beam] remote audit failed: ${result.reason}`);
+    });
+  };
+  poll();
+  policyTimer = setInterval(poll, 60_000);
+  policyTimer.unref?.();
 
   // Watches for beam's own hooks disappearing from an agent's config outside any beam command
   // (hand-edited or wiped config file) -- see tamper.ts. Runs regardless of enrollment so a
