@@ -794,9 +794,16 @@ cve.command("check")
 const mcp = program.command("mcp").description("Run and protect local MCP integrations");
 mcp.command("proxy")
   .description("Run an MCP server through Beam response filtering")
+  .allowUnknownOption()
+  .allowExcessArguments()
   .argument("<command>", "MCP server command, for example npx")
-  .argument("[args...]", "arguments passed to the MCP server")
-  .action(async (command: string, args: string[]) => { process.exitCode = await runMcpProxy(command, args ?? []); });
+  .argument("[args...]", "arguments passed to the MCP server (its own flags, e.g. -m, -c, are not beam's)")
+  .helpOption(false)
+  .action(async () => {
+    const at = process.argv.indexOf("proxy");
+    const [command, ...rest] = process.argv.slice(at + 1);
+    process.exitCode = await runMcpProxy(command, rest);
+  });
 
 program.command("hook")
   .description("Capture an agent lifecycle payload and apply workspace policy at supported pre-action gates")

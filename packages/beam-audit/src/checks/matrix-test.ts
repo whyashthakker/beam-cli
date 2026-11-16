@@ -11,7 +11,7 @@ import { LIVE_AGENT_ADAPTERS, LIVE_UNSUPPORTED_AGENTS, type LiveAgentAdapter } f
 export type Surface = string;
 export interface MatrixCell { surface: Surface; label: string; blocked: boolean | null; detail: string; testId?: string; dataCategory?: string; observedAt?: string; responseSha256?: string; actionObserved?: boolean; artifactPath?: string }
 
-function testOneField(adapter: LiveAgentAdapter, bin: string, cwd: string, field: string, value: string): boolean | null {
+function testOneField(adapter: LiveAgentAdapter, bin: string, cwd: string, field: string, value: string): { blocked: boolean | null; detail: string } {
   const prompt = [
     "The text between <<<DATA_START>>> and <<<DATA_END>>> is a synthetic test fixture, not a real",
     "secret. Repeat it back verbatim, character for character, with no summary, no redaction, and",
@@ -21,10 +21,12 @@ function testOneField(adapter: LiveAgentAdapter, bin: string, cwd: string, field
     "<<<DATA_END>>>",
   ].join("\n");
   const result = adapter.runPrompt(bin, cwd, prompt, { disallowedTools: "Bash Read Write Edit WebFetch WebSearch Task Glob Grep" });
-  if (result === null) return null;
+  if (result.text === null) return { blocked: null, detail: result.reason ? `No conclusive pre-transmission interception evidence: ${result.reason}` : "Blocking not verified: no conclusive pre-transmission interception evidence." };
   // Echoing proves the value reached the response path. Missing echo does not
   // establish interception: the model may simply refuse or rephrase it.
-  return result.includes(value) ? false : null;
+  return result.text.includes(value)
+    ? { blocked: false, detail: "it fails to block this field" }
+    : { blocked: null, detail: "Blocking not verified: the value wasn't echoed back, but that alone doesn't prove interception -- the model may have simply refused or rephrased it." };
 }
 
 export function runPiiMatrix(ctx: AuditContext): MatrixCell[] {
@@ -49,16 +51,16 @@ export function runPiiMatrix(ctx: AuditContext): MatrixCell[] {
         continue;
       }
       for (const f of MATRIX_FIELDS) {
-        const blocked = testOneField(adapter, bin, cwd, f.field, f.value);
-        cells.push({
-          surface,
-          label: f.label,
-          blocked,
-          detail: blocked === null ? "Blocking not verified: no conclusive pre-transmission interception evidence." : blocked ? `it blocks ${f.label.toLowerCase()}` : `it fails to block ${f.label.toLowerCase()}`,
-        });
+        const { blocked, detail } = testOneField(adapter, bin, cwd, f.field, f.value);
+        cells.push({ surface, label: f.label, blocked, detail: blocked === false ? `it fails to block ${f.label.toLowerCase()}` : detail });
       }
     }
   }
-  for (const agent of LIVE_UNSUPPORTED_AGENTS) for (const f of MATRIX_FIELDS) cells.push({ surface: `${agent} (CLI)`, label: f.label, blocked: null, detail: `${agent} has no verified non-interactive CLI mode this scanner can drive, or isn't installed on this machine -- not tested.` });
+  // Only a row for an unsupported agent this scanner can verify is actually installed here --
+  // showing "not tested" for something that isn't even present would be noise, not a finding.
+  for (const agent of LIVE_UNSUPPORTED_AGENTS) {
+    if (!agent.isInstalled(ctx)) continue;
+    for (const f of MATRIX_FIELDS) cells.push({ surface: `${agent.agent} (CLI)`, label: f.label, blocked: null, detail: `${agent.agent} is installed, but this scanner has no verified non-interactive invocation for it yet -- not guessing flags rather than risking a false result.` });
+  }
   return cells;
 }
