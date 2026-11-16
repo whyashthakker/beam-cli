@@ -1,5 +1,7 @@
 import type { Check, Status } from "./types.js";
 import type { MatrixCell, Surface } from "./checks/matrix-test.js";
+import { categoryFor } from "./categories.js";
+import { beamPolicyFor } from "./policy-catalog.js";
 
 export interface NamedMatrix { title: string; cells: MatrixCell[] }
 
@@ -28,7 +30,8 @@ export function formatReport(checks: Check[], matrices: NamedMatrix[] = []): str
     ...matrices.flatMap(formatMatrix),
   ];
   for (const c of checks) {
-    lines.push(` ${ICON[c.status]} ${c.status.toUpperCase().padEnd(4)}  ${c.title}  (policy ${c.policySection})`);
+    const policy = beamPolicyFor(c.category ?? categoryFor(c));
+    lines.push(` ${ICON[c.status]} ${c.status.toUpperCase().padEnd(4)}  ${c.title}  (${policy.id}: ${policy.title})`);
     lines.push(`          ${c.detail}`);
     if (c.evidence?.length) for (const e of c.evidence.slice(0, 10)) lines.push(`          - ${e}`);
     if (c.fix && c.status !== "pass") lines.push(`          Fix: ${c.fix}`);

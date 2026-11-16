@@ -5,6 +5,7 @@ import { CATEGORIES, categoryFor } from "./categories.js";
 import type { Check, Status } from "./types.js";
 import type { MatrixCell, Surface } from "./checks/matrix-test.js";
 import type { NamedMatrix } from "./report.js";
+import { beamPolicyFor } from "./policy-catalog.js";
 
 const STATUS_LABEL: Record<Status, string> = { fail: "Fail", pass: "Pass", warn: "Warn", skip: "Not checkable" };
 const STATUS_TOKEN: Record<Status, string> = { fail: "danger", pass: "success", warn: "warning", skip: "muted" };
@@ -145,13 +146,14 @@ function card(c: Check, options: { showScore?: boolean } = {}): string {
   const why = options.showScore
     ? `<details class="check-why"><summary>Why</summary><p class="detail">${esc(c.detail)}</p>${evidence}${fix}</details>`
     : `<p class="detail">${esc(c.detail)}</p>${evidence}${fix}`;
+  const policy = beamPolicyFor(c.category ?? categoryFor(c));
   return `
   <div class="check-row">
     <div class="check-head">
       ${badge(STATUS_TOKEN[c.status], STATUS_LABEL[c.status])}
       ${scoreBadge}
       <h3>${esc(c.title)}</h3>
-      <span class="policy">policy ${esc(c.policySection)}</span>
+      <span class="policy" title="${esc(policy.description)}">${esc(policy.id)}: ${esc(policy.title)}</span>
     </div>
     ${why}
   </div>`;
@@ -163,7 +165,7 @@ export function renderHtmlReport(checks: Check[], matrices: NamedMatrix[], meta:
   const counts = { fail: 0, pass: 0, warn: 0, skip: 0 };
   for (const c of checks) counts[c.status]++;
   const fails = sorted.filter(c => c.status === "fail");
-  const categories = new Map<string, Check[]>(CATEGORIES.map(name => [name, []]));
+  const categories = new Map(CATEGORIES.map(name => [name, [] as Check[]]));
   for (const c of checks) { const name = categoryFor(c); categories.set(name, [...(categories.get(name) ?? []), c]); }
   const categoryId = (name: string) => `category-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
   const categoryOverview = [...categories].map(([name, items]) => {
@@ -173,8 +175,9 @@ export function renderHtmlReport(checks: Check[], matrices: NamedMatrix[], meta:
     const skipped = items.filter(c => c.status === "skip").length;
     const token = failed ? "danger" : warnings ? "warning" : skipped || !items.length ? "muted" : "success";
     const state = failed ? "Needs attention" : warnings ? "Review" : skipped || !items.length ? "Partial" : "Clean";
+    const policy = beamPolicyFor(name);
     return `<a class="tile" data-tone="${token}" href="#${categoryId(name)}">
-      <div class="tile-head"><strong>${esc(name)}</strong>${badge(token, state, true)}</div>
+      <div class="tile-head"><strong title="${esc(policy.description)}">${esc(policy.id)}: ${esc(name)}</strong>${badge(token, state, true)}</div>
       <span class="tile-counts">${failed} fail · ${warnings} review · ${passing} pass · ${skipped} not checked</span>
     </a>`;
   }).join("");
@@ -182,8 +185,9 @@ export function renderHtmlReport(checks: Check[], matrices: NamedMatrix[], meta:
     const questionSection = name === "AI agent discovery and configuration"
       ? `<p class="eyebrow" style="margin-top:4px">Breakdown by question</p>${agentDiscoveryQuestionSection(checks, meta)}<p class="eyebrow" style="margin-top:22px">All checks in this category</p>`
       : "";
+    const policy = beamPolicyFor(name);
     return `<section class="panel category-section" id="${categoryId(name)}">
-      <div class="panel-title"><h2>${esc(name)}</h2><span class="panel-title-meta">${items.length} checks</span></div>
+      <div class="panel-title"><h2 title="${esc(policy.description)}">${esc(policy.id)}: ${esc(name)}</h2><span class="panel-title-meta">${items.length} checks</span></div>
       <div class="panel-body">${questionSection}<div class="check-list">${items.map(c => card(c)).join("")}</div></div>
     </section>`;
   }).join("");
