@@ -1,3 +1,4 @@
+import { recordPollStatus } from "./poll-status.js";
 import { drainHookSpool } from "./hook-spool.js";
 import { normalize as normalizeHookEvent } from "./core.js";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
@@ -145,15 +146,19 @@ export async function startServer(options: StartServerOptions = {}): Promise<{ u
     }).finally(() => { busy.delete(name); });
   };
   const poll = () => {
+    void recordPollStatus({ pid: process.pid, lastPoll: new Date().toISOString(), nextPoll: new Date(Date.now() + 60_000).toISOString() });
     runTask("policy sync", () => syncPolicy());
     runTask("remote update", async () => {
+      void recordPollStatus({ update: "checking" });
       const result = await runRemoteUpdate();
+      void recordPollStatus({ update: result.reason ? `${result.status}: ${result.reason}` : result.status });
       if (result.status === "failed") console.error(`[beam] remote update failed: ${result.reason}`);
       if (result.status === "updated" && supervised()) process.exit(0);
     });
     runTask("skill actions", () => runSkillActions());
     runTask("remote audit", async () => {
       const result = await runRemoteAudit();
+      void recordPollStatus({ audit: result.reason ? `${result.status}: ${result.reason}` : result.status });
       if (result.status === "failed") console.error(`[beam] remote audit failed: ${result.reason}`);
     });
   };

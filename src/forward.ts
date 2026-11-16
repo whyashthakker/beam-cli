@@ -218,14 +218,33 @@ export type AuditReportToForward = { generatedAt: string; platform?: string; che
 export async function forwardAuditReport(report: AuditReportToForward, requestedBy?: string): Promise<{ sent: boolean; reason?: string }> {
   const identity = await readIdentity();
   if (!identity) return { sent: false, reason: "not enrolled" };
+  // Match ingestion limits while retaining every check and its status.
+  const bound = (value: unknown, max: number) => typeof value === "string" ? value.slice(0, max) : value;
+  const checks = report.checks.map((raw) => {
+    const check = raw as Record<string, unknown>;
+    return { ...check, id: bound(check.id, 300), category: bound(check.category, 100),
+      policySection: bound(check.policySection, 50), title: bound(check.title, 300),
+      detail: bound(check.detail, 4000), fix: bound(check.fix, 2000),
+      evidence: Array.isArray(check.evidence) ? check.evidence.slice(0, 50).map(value => bound(value, 2000)) : check.evidence };
+  });
+  const matrices = report.matrices?.map((raw) => {
+    const matrix = raw as { title: string; cells: Record<string, unknown>[] };
+    return { ...matrix, title: bound(matrix.title, 200), cells: matrix.cells.map(cell => ({
+      ...cell, surface: bound(cell.surface, 200), label: bound(cell.label, 200),
+      detail: bound(cell.detail, 2000), testId: bound(cell.testId, 200),
+    })) };
+  });
   try {
     const response = await fetch(`${identity.apiBase}/v1/audit`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${identity.deviceSecret}`, ...versionHeaders() },
-      body: JSON.stringify({ id: randomUUID(), generatedAt: report.generatedAt, platform: report.platform, checks: report.checks, matrices: report.matrices, requestedBy }),
+      body: JSON.stringify({ id: randomUUID(), generatedAt: report.generatedAt, platform: report.platform, checks, matrices, requestedBy }),
       signal: AbortSignal.timeout(60_000),
     });
-    return response.ok ? { sent: true } : { sent: false, reason: `collector returned ${response.status}` };
+    if (response.ok) return { sent: true };
+    let detail = "";
+    try { const body = await response.json() as { error?: unknown }; if (typeof body.error === "string") detail = body.error.slice(0, 400); } catch {}
+    return { sent: false, reason: `collector returned ${response.status}${detail ? `: ${detail}` : ""}` };
   } catch (error) {
     return { sent: false, reason: error instanceof Error ? error.message : String(error) };
   }

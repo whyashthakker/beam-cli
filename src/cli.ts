@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { printPollStatus } from "./poll-status.js";
 import { ensureWorkspaceConfig } from "./workspace-config.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -347,10 +348,15 @@ program.command("uninstall")
     console.log("\n✔ Beam has been removed from this device.");
   });
 
+program.command("status")
+  .description("Show collector connectivity, background polling, audit and update status")
+  .action(async () => { await printPollStatus(); });
+
 program.command("sync")
   .description("Pull the latest policy from your Beam workspace into ~/.beam/data/policy.json")
   .action(async () => {
     const result = await syncPolicy();
+    await printPollStatus();
     if (result.status === "not-enrolled") throw new Error("This device is not enrolled. Run 'beam setup'.");
     if (result.status === "unreachable") throw new Error("Could not reach the Beam workspace. Check the network or 'beam whoami'.");
     console.log(result.status === "updated" ? `✔ Policy v${result.version} synced → ${result.path}` : "✔ Policy already up to date.");

@@ -1,3 +1,5 @@
+import { Worker } from "node:worker_threads";
+import { recordPollStatus } from "./poll-status.js";
 import { readIdentity } from "./enroll.js";
 import { forwardAuditReport } from "./forward.js";
 import { versionHeaders } from "./version.js";
@@ -40,10 +42,21 @@ export async function runRemoteAudit(deps: RemoteAuditDeps = {}): Promise<Remote
   // beam-audit sets process.exitCode on its own when it finds a failing check -- harmless for its
   // own one-shot CLI, but this runs inside the long-lived background service process, so that
   // would silently change the service's eventual exit code for an unrelated reason. Restore it.
+  await recordPollStatus({ audit: "running" });
   const previousExitCode = process.exitCode;
   try {
-    const run = deps.runAudit ?? (await import("beam-audit")).runAudit;
-    const report = await run(["--live", "--online", "--whole-pc"]);
+    const report = deps.runAudit
+      ? await deps.runAudit(["--live", "--online", "--whole-pc"])
+      : await new Promise<Awaited<ReturnType<NonNullable<RemoteAuditDeps["runAudit"]>>>>((resolve, reject) => {
+          const worker = new Worker(new URL("./audit-worker.js", import.meta.url));
+          worker.once("message", (message) => {
+            void worker.terminate();
+            if (message.error) reject(new Error(message.error));
+            else resolve(message.report);
+          });
+          worker.once("error", reject);
+          worker.once("exit", (code) => reject(new Error(`Audit worker exited before returning a report (code ${code})`)));
+        });
     const forwarded = await forwardAuditReport(report, requestedBy);
     if (!forwarded.sent) return { status: "failed", reason: forwarded.reason };
     return { status: "ran" };
