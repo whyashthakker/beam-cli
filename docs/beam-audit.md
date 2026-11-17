@@ -31,10 +31,13 @@ use `--full --vscode-cdp http://127.0.0.1:9222`.
 
 ## Run
 
+`beam-audit` ships as a second bin inside the `@agent-beam/beam` package (not a standalone npm
+package of its own), so it needs that package installed, not its own name on the registry:
+
 ```
-npx beam-audit
-# or, scoped to specific folders:
-npx beam-audit --root ~/Projects --root ~/Work
+npx -p @agent-beam/beam beam-audit
+# or, once beam itself is installed globally:
+beam-audit --root ~/Projects --root ~/Work
 ```
 
 From inside this repo (before it's published), use the root `npm run audit` script -- but note
@@ -127,7 +130,7 @@ No claim of exhaustive whole-PC inspection is made: other users, inaccessible fi
 machines, containers, ignored/deep folders, and unsupported agents may be outside discovery.
 OSV advisory matching and GitHub classic default-branch protection inspection are available with `--online`. Account MFA/SSO, central log retention/tamper resistance, and provider rulesets still require external evidence.
 
-Run regression checks with `node --import tsx --test packages/beam-audit/tests/scanner.test.ts`
+Run regression checks with `node --import tsx --test tests/audit/scanner.test.ts`
 from the repository root; typecheck with `npm run typecheck --workspace beam-audit`.
 
 ## Run the complete category audit locally

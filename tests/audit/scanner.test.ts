@@ -4,9 +4,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { evaluatePolicy, loadPolicy } from '../src/policy.js';
-import { agentPostureChecks } from '../src/checks/agent-posture.js';
-import { repositoryEnforcementChecks } from '../src/checks/repository-enforcement.js';
+import { evaluatePolicy, loadPolicy } from '../../src/audit/policy.js';
+import { agentPostureChecks } from '../../src/audit/checks/agent-posture.js';
+import { repositoryEnforcementChecks } from '../../src/audit/checks/repository-enforcement.js';
 const fixture = () => mkdtempSync(join(tmpdir(), 'beam-audit-test-'));
 test('required controls fail closed for missing and skipped evidence', () => {
  const result = evaluatePolicy([{ id: 'x', title: 'x', policySection: 'test', status: 'skip', detail: '' }], { version: 1, requiredChecks: ['x', 'missing'] });
@@ -34,13 +34,13 @@ test('effective hooks and committed credential patterns are inspected', () => {
  } finally { rmSync(dir, {recursive: true, force: true}); }
 });
 
-import { discoverReposDetailed } from '../src/discover-repos.js';
-import { mcpChecks } from '../src/checks/mcp.js';
-import { loggingChecks } from '../src/checks/logging.js';
-import { vulnerabilityChecks } from '../src/checks/vulnerabilities.js';
-import { platformSecurityChecks } from '../src/checks/platform-security.js';
-import { categorySummary, CATEGORIES } from '../src/categories.js';
-import { renderHtmlReport } from '../src/report-html.js';
+import { discoverReposDetailed } from '../../src/audit/discover-repos.js';
+import { mcpChecks } from '../../src/audit/checks/mcp.js';
+import { loggingChecks } from '../../src/audit/checks/logging.js';
+import { vulnerabilityChecks } from '../../src/audit/checks/vulnerabilities.js';
+import { platformSecurityChecks } from '../../src/audit/checks/platform-security.js';
+import { categorySummary, CATEGORIES } from '../../src/audit/categories.js';
+import { renderHtmlReport } from '../../src/audit/report-html.js';
 const context=(home:string)=>({home,repos:[] as string[],roots:[home],platform:process.platform,log:()=>{}});
 test('discovery includes hidden repositories and reports depth/cap/inaccessible roots',()=>{
  const dir=fixture();try{mkdirSync(join(dir,'.hidden/repo/.git'),{recursive:true});mkdirSync(join(dir,'nested/.git'),{recursive:true});
@@ -79,8 +79,8 @@ test('HTML overview has all eleven categories, escapes content, and labels missi
  assert.equal(categorySummary(checks).length,11);const html=renderHtmlReport(checks,[],{roots:['/fixture'],repoCount:0,generatedAt:'test',liveTestsRun:false});
  for(const name of CATEGORIES)assert.ok(html.includes(name));assert.ok(!html.includes('<script>bad</script>'));assert.ok(html.includes('&lt;script&gt;'));assert.ok(html.includes('Live agent tests were skipped'));
 });
-import {remoteEnforcementChecks} from '../src/checks/remote-enforcement.js';
-import {releaseChecks} from '../src/checks/vulnerabilities.js';
+import {remoteEnforcementChecks} from '../../src/audit/checks/remote-enforcement.js';
+import {releaseChecks} from '../../src/audit/checks/vulnerabilities.js';
 test('GitHub protection needs reviews, status checks and admin enforcement',()=>{
  const ctx={...context('/fixture'),repos:['/fixture'],online:true};
  const checks=remoteEnforcementChecks(ctx,(command,args)=>({status:0,stdout:command==='git'?'git@github.com:example/project.git':JSON.stringify(args[1]?.endsWith('/protection')?{required_status_checks:{contexts:['security']},required_pull_request_reviews:{required_approving_review_count:1},enforce_admins:{enabled:false}}:{default_branch:'main'})}));
@@ -94,7 +94,7 @@ test('release comparison warns about drift and handles unavailable registry evid
  assert.equal((await releaseChecks(ctx,async()=>{throw new Error('offline');}))[0]?.status,'skip');
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
-import {looseFileChecks} from '../src/checks/loose-files.js';
+import {looseFileChecks} from '../../src/audit/checks/loose-files.js';
 test('non-repository scan deduplicates overlapping roots and emits completion progress',async()=>{
  const dir=fixture();try{mkdirSync(join(dir,'child'));writeFileSync(join(dir,'child','config.json'),'{"test":true}');const messages:string[]=[];
  const checks=await looseFileChecks({...context(dir),roots:[dir,join(dir,'child')],log:m=>messages.push(m)});

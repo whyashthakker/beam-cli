@@ -2,8 +2,8 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {existsSync} from 'node:fs';
 import {chromium} from 'playwright-core';
-import {EXTENSION_PROBES} from '../src/extension-probes.js';
-import {classifyExtensionEvidence,validateCdpEndpoint,testExtensionFrame,type ExtensionAdapter} from '../src/checks/extension-ui.js';
+import {EXTENSION_PROBES} from '../../src/audit/extension-probes.js';
+import {classifyExtensionEvidence,validateCdpEndpoint,testExtensionFrame,type ExtensionAdapter} from '../../src/audit/checks/extension-ui.js';
 
 test('synthetic probes cover all seven prohibited categories',()=>{
  assert.equal(new Set(EXTENSION_PROBES.map(p=>p.category)).size,7);
@@ -47,7 +47,7 @@ test('audit-owned transcript requires an exact match and supports reused respons
  const result=await testExtensionFrame(page.mainFrame(),adapter,probes,1000,()=>{},{userMessages:['owned audit prompt'],assistantMessages:['owned audit reply']});assert.ok(result.every(c=>c.blocked===false));assert.ok(result.every(c=>c.testId&&c.responseSha256));
  }finally{await browser.close();}
 });
-import { testExtensionReview } from '../src/checks/extension-review.js';
+import { testExtensionReview } from '../../src/audit/checks/extension-review.js';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { tmpdir } from 'node:os';

@@ -1,6 +1,6 @@
 {
   "name": "@agent-beam/beam",
-  "version": "0.2.45",
+  "version": "0.2.46",
   "description": "Local-first observation and heuristic risk scanning for AI coding agents (Claude Code, Codex, Cursor, Copilot CLI, Gemini). Redacts secrets, flags risky tool calls, scans skills and MCP configs offline.",
   "keywords": [
     "ai agent security",
@@ -32,11 +32,9 @@
   "license": "AGPL-3.0-only",
   "preferGlobal": true,
   "type": "module",
-  "workspaces": [
-    "packages/*"
-  ],
   "bin": {
-    "beam": "dist/cli.js"
+    "beam": "dist/cli.js",
+    "beam-audit": "dist/audit/cli.js"
   },
   "exports": {
     "./monitor": {
@@ -56,12 +54,13 @@
     ]
   },
   "scripts": {
-    "build": "test -f packages/beam-audit/dist/run.d.ts || (tsc -p tsconfig.json || true) >/dev/null 2>&1; npm --prefix packages/beam-audit run build && tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "build": "tsc -p tsconfig.json && chmod +x dist/cli.js dist/audit/cli.js",
     "build:watch": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "build:binaries": "npm run build && node scripts/build-binaries.mjs",
     "dev": "tsx src/cli.ts",
-    "audit": "npm --prefix packages/beam-audit run build && node packages/beam-audit/dist/cli.js",
-    "test": "node --no-warnings --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand",
+    "audit": "tsx src/audit/cli.ts",
+    "test": "node --no-warnings --experimental-vm-modules node_modules/jest/bin/jest.js --runInBand && npm run test:audit",
+    "test:audit": "node --import tsx --test tests/audit/*.test.ts",
     "test:watch": "node --no-warnings --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prepublishOnly": "npm run validate:skills && npm run typecheck && npm test && npm run build && node --expose-gc scripts/stress-report.mjs --out stress-report.json",
@@ -80,9 +79,10 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.2.0",
-    "beam-audit": "^0.1.0",
+    "@iarna/toml": "^2.2.5",
     "commander": "^13.0.0",
     "jsonc-parser": "^3.3.1",
+    "playwright-core": "^1.65.0",
     "smol-toml": "^1.9.1",
     "yaml": "^2.9.1"
   },

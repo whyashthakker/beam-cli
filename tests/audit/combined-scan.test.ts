@@ -5,9 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { parseArgs } from '../src/args.js';
-import { runExtensionStage } from '../src/extension-stage.js';
-import { DEFAULT_EXTENSION_ADAPTERS } from '../src/checks/extension-ui.js';
+import { parseArgs } from '../../src/audit/args.js';
+import { runExtensionStage } from '../../src/audit/extension-stage.js';
+import { DEFAULT_EXTENSION_ADAPTERS } from '../../src/audit/checks/extension-ui.js';
 
 test('launching VS Code adds to the normal scan; extension-only remains explicit', () => {
   const normal = parseArgs(['--launch-vscode']);
@@ -45,7 +45,7 @@ test('extension launch failure produces untested rows instead of losing workstat
 test('CLI emits workstation findings and both extension surfaces in one HTML/JSON report', () => {
   const dir = mkdtempSync(join(tmpdir(), 'beam-combined-test-'));
   try {
-    const cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
+    const cli = fileURLToPath(new URL('../../dist/audit/cli.js', import.meta.url));
     const result = spawnSync(process.execPath, [cli, '--root', dir, '--vscode-cdp', 'http://127.0.0.1:1', '--max-files', '10', '--html', join(dir, 'report.html'), '--json', join(dir, 'report.json')], { encoding: 'utf8', timeout: 30000, env: { ...process.env, HOME: dir, USERPROFILE: dir, PATH: dir } });
     assert.ok(result.status === 0 || result.status === 1, result.stderr);
     const report = JSON.parse(readFileSync(join(dir, 'report.json'), 'utf8'));

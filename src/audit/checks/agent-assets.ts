@@ -3,11 +3,11 @@ import { join, dirname, resolve, relative, isAbsolute, basename, sep } from 'nod
 import { parse as parseYaml } from 'yaml';
 import { agentConfigurations, readConfiguration } from '../config-files.js';
 import { CONFIDENTIAL_MARKER, confidentHits } from '../detectors.js';
-// Same monorepo: use the real, already-shipped skill engine (richer than anything worth
-// reimplementing here -- it also runs the full rule-catalog.ts builtin rules against skill text,
-// not just the risk/injection subset) instead of maintaining a second copy in beam-audit.
-import { scanSkillDir } from '../../../../dist/skill-scan.js';
-import { discoverAllSkills } from '../../../../dist/skill-inventory.js';
+// Same package: use the real skill engine (richer than anything worth reimplementing here -- it
+// also runs the full rule-catalog.ts builtin rules against skill text, not just the risk/injection
+// subset) instead of maintaining a second copy under audit/.
+import { scanSkillDir } from '../../skill-scan.js';
+import { discoverAllSkills } from '../../skill-inventory.js';
 import type { AuditContext, Check } from '../types.js';
 function inScope(root:string,file:string):boolean { const r=relative(root,file);return !r.startsWith('..')&&!isAbsolute(r); }
 export function compareRelease(installed:string, minimum:string):number|null {

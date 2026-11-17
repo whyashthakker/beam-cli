@@ -3,16 +3,16 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,writeFileSync,rmSync,chmodSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {agentControlChecks,literalCredential} from '../src/checks/agent-controls.js';
-import {resolveFileSettings,resolvedSettingsChecks} from '../src/checks/resolved-settings.js';
-import {extensionInventoryChecks,subagentChecks,agentInstructionChecks,compareRelease} from '../src/checks/agent-assets.js';
-import {agentAuthenticationChecks} from '../src/checks/agent-auth.js';
-import {agentMemoryAndPluginChecks} from '../src/checks/agent-memory-plugins.js';
-import {mcpChecks} from '../src/checks/mcp.js';
-import {loadPolicy,evaluatePolicy} from '../src/policy.js';
-import {reviewProofResult} from '../src/checks/review-matrix.js';
-import {exitCode} from '../src/report.js';
-import type {AuditContext} from '../src/types.js';
+import {agentControlChecks,literalCredential} from '../../src/audit/checks/agent-controls.js';
+import {resolveFileSettings,resolvedSettingsChecks} from '../../src/audit/checks/resolved-settings.js';
+import {extensionInventoryChecks,subagentChecks,agentInstructionChecks,compareRelease} from '../../src/audit/checks/agent-assets.js';
+import {agentAuthenticationChecks} from '../../src/audit/checks/agent-auth.js';
+import {agentMemoryAndPluginChecks} from '../../src/audit/checks/agent-memory-plugins.js';
+import {mcpChecks} from '../../src/audit/checks/mcp.js';
+import {loadPolicy,evaluatePolicy} from '../../src/audit/policy.js';
+import {reviewProofResult} from '../../src/audit/checks/review-matrix.js';
+import {exitCode} from '../../src/audit/report.js';
+import type {AuditContext} from '../../src/audit/types.js';
 const ctx=(home:string):AuditContext=>({home,roots:[home],repos:[],platform:'linux',environment:{},log:()=>{}});
 function fixture(run:(home:string)=>void){const home=mkdtempSync(join(tmpdir(),'beam-agent-controls-'));try{run(home);}finally{rmSync(home,{recursive:true,force:true});}}
 function file(home:string,path:string,value:string){const parts=path.split('/');parts.pop();mkdirSync(join(home,...parts),{recursive:true});writeFileSync(join(home,path),value);}
@@ -88,7 +88,7 @@ test('synthetic data echoes alone do not establish an organization-policy failur
  assert.equal(exitCode([],[{title:'Actual extension UI policy 4.2',cells:[{surface:'VS Code · Claude extension',label:'Email',blocked:false,detail:'synthetic'}]}]),0);
  assert.equal(exitCode([],[{title:'Review requirements policy 4.3',cells:[{surface:'Claude Code (CLI)',label:'No blind execution',blocked:false,detail:'executed'}]}]),1);
 });
-import {bypassArguments} from '../src/checks/agent-processes.js';
+import {bypassArguments} from '../../src/audit/checks/agent-processes.js';
 test('runtime bypass argument checks return flag names without prompts or values',()=>{
  const flags=bypassArguments(['codex','exec','--sandbox','danger-full-access','--approval-policy=never','-c','approval_policy="never"','PRIVATE_USER_PROMPT']);assert.ok(flags.includes('--sandbox'));assert.ok(flags.includes('--approval-policy'));assert.ok(flags.includes('configuration override'));assert.ok(!JSON.stringify(flags).includes('PRIVATE_USER_PROMPT'));
  assert.deepEqual(bypassArguments(['claude','--','--dangerously-skip-permissions']),[]);assert.deepEqual(bypassArguments(['claude','-p','Please explain --yolo safely']),[]);

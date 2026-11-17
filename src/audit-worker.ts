@@ -1,5 +1,5 @@
 import { parentPort } from "node:worker_threads";
-import { runAudit } from "beam-audit";
+import { runAudit } from "./audit/run.js";
 try {
   parentPort?.postMessage({ report: await runAudit(["--live", "--online", "--whole-pc"]) });
 } catch (error) {

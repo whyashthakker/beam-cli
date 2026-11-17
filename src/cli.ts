@@ -855,7 +855,7 @@ program.command("audit")
   .argument("[args...]", "arguments passed to beam-audit")
   .helpOption(false)
   .action(async () => {
-    const { runAudit } = await import("beam-audit");
+    const { runAudit } = await import("./audit/run.js");
     const at = process.argv.indexOf("audit");
     const args = process.argv.slice(at + 1);
     const report = await runAudit(args);
