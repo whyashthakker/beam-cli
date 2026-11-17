@@ -55,7 +55,7 @@ test('required prompt hook must be nonempty and memory defaults remain unverifie
 test('extension identity approval and minimum releases are checked without claiming authenticity',()=>fixture(home=>{
  file(home,'.vscode/extensions/test/package.json',JSON.stringify({publisher:'GitHub',name:'copilot',version:'1.2.3'}));
  const checks=extensionInventoryChecks({...ctx(home),agentControls:{allowedExtensions:['github.copilot'],minimumExtensionVersions:{'github.copilot':'1.3.0'}}});
- assert.ok(checks.some(c=>c.id==='inventory-GitHub Copilot'));assert.equal(checks.find(c=>c.id.startsWith('extension-inventory-'))?.status,'pass');assert.equal(checks.find(c=>c.id.startsWith('extension-version-'))?.status,'fail');assert.equal(compareRelease('1.3.0-beta','1.2.0'),null);
+ assert.ok(checks.some(c=>c.id==='inventory-GitHub Copilot'));assert.equal(checks.find(c=>c.id==='extension-inventory')?.status,'pass');assert.equal(checks.find(c=>c.id==='extension-version')?.status,'fail');assert.equal(compareRelease('1.3.0-beta','1.2.0'),null);
 }));
 test('credential caches report access bits and method metadata without token contents',()=>fixture(home=>{
  const secret='PRIVATE_TOKEN_CONTENT_DO_NOT_PRINT';file(home,'.codex/auth.json',JSON.stringify({auth_mode:'chatgpt',tokens:{access_token:secret}}));chmodSync(join(home,'.codex/auth.json'),0o644);

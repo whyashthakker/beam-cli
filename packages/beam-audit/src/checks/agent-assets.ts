@@ -1,6 +1,5 @@
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { join, dirname, resolve, relative, isAbsolute, basename, sep } from 'node:path';
-import { createHash } from 'node:crypto';
 import { parse as parseYaml } from 'yaml';
 import { agentConfigurations, readConfiguration } from '../config-files.js';
 import { CONFIDENTIAL_MARKER, confidentHits } from '../detectors.js';
@@ -18,10 +17,20 @@ export function compareRelease(installed:string, minimum:string):number|null {
  for(let i=0;i<3;i++)if(a[i]!==b[i])return a[i]!<b[i]!?-1:1;
  return 0;
 }
+// One row for "installed extensions" and one for "required release versions" across the whole
+// machine, not one full block per extension -- a profile with 40 extensions used to produce 40
+// near-identical "Installed extension: x" blocks (same boilerplate detail, differing only by
+// manifest hash), which read as noise rather than a report. Aggregated the same way
+// repository-enforcement.ts's checks are: worst status wins, affected extensions go in
+// `evidence` as plain "id@version" (the hash/path evidence per extension wasn't adding anything
+// the aggregate reader needed), and `detail` carries the counts.
 export function extensionInventoryChecks(ctx:AuditContext):Check[]{
  const out:Check[]=[];
  const reportedAgents=new Set<string>();
  const identities:Record<string,string>={"anthropic.claude-code":"Claude Code","openai.chatgpt":"Codex","github.copilot":"GitHub Copilot","github.copilot-chat":"GitHub Copilot","saoudrizwan.claude-dev":"Cline","rooveterinaryinc.roo-cline":"Roo Code","continue.continue":"Continue","amazonwebservices.amazon-q-vscode":"Amazon Q","codeium.codeium":"Windsurf / Codeium","tabnine.tabnine-vscode":"Tabnine"};
+ const allowed=ctx.agentControls?.allowedExtensions;
+ const extensions:{id:string;version:string}[]=[];
+ const belowMinimum:string[]=[];const unverifiedMinimum:string[]=[];let minimumChecked=0;
  for(const root of [join(ctx.home,'.vscode/extensions'),join(ctx.home,'.vscode-insiders/extensions'),join(ctx.home,'.cursor/extensions')]){
   let names:string[];try{names=readdirSync(root);}catch{continue;}
   for(const name of names.slice(0,1000))try{
@@ -32,14 +41,33 @@ export function extensionInventoryChecks(ctx:AuditContext):Check[]{
    if(!/^[\w-]+\.[\w-]+$/.test(id))continue;
    const agent=identities[id.toLowerCase()];
    if(agent&&!reportedAgents.has(agent)){reportedAgents.add(agent);out.push({id:`inventory-${agent}`,category:'AI agent discovery and configuration',policySection:'3',title:`${agent}: extension installation signal`,status:'warn',detail:'A matching extension manifest is installed. Activation, genuine publisher identity and account ownership are not verified.',evidence:[file]});}
-   const allowed=ctx.agentControls?.allowedExtensions;
-   out.push({id:`extension-inventory-${root}-${name}`,category:'AI agent discovery and configuration',policySection:'3',title:`Installed extension: ${id}`,status:allowed?allowed.some(x=>x.toLowerCase()===id)?'pass':'fail':'warn',detail:`Manifest version: ${/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(pkg.version)?pkg.version:'unrecognized'}. ${allowed?'Compared declared identity with the organization extension allowlist.':'No organization extension allowlist supplied.'} Installation does not prove activation, publisher authenticity, or whether the extension transmits source code.`,evidence:[file,`Manifest SHA-256: ${createHash('sha256').update(text).digest('hex')}`]});
+   extensions.push({id,version:/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(pkg.version)?pkg.version:'unrecognized'});
    const minimum=Object.entries(ctx.agentControls?.minimumExtensionVersions??{}).find(([key])=>key.toLowerCase()===id)?.[1];
-   if(minimum){const compared=compareRelease(pkg.version,minimum);out.push({id:`extension-version-${root}-${name}`,category:'Updates and vulnerability management',policySection:'3',title:`Required extension release: ${id}`,status:compared===null?'skip':compared<0?'fail':'pass',detail:compared===null?'Release format or prerelease cannot be safely compared.':`Compared installed manifest release with configured minimum ${minimum}. Active version and Marketplace provenance were not independently verified.`,evidence:[file]});}
+   if(minimum){minimumChecked++;const compared=compareRelease(pkg.version,minimum);
+    if(compared===null)unverifiedMinimum.push(`${id}@${pkg.version} (cannot compare against required ${minimum})`);
+    else if(compared<0)belowMinimum.push(`${id}@${pkg.version} (required ${minimum})`);}
   }catch{/* Non-extension, unreadable or invalid manifest. */}
   if(names.length>1000)out.push({id:`extension-cap-${root}`,category:'Scan coverage and evidence',policySection:'Scope',title:'Extension manifest inspection cap',status:'warn',detail:'Only the first 1000 directory entries were inspected.',evidence:[root]});
  }
- return out.length?out:[{id:'extension-inventory-unavailable',category:'AI agent discovery and configuration',policySection:'3',title:'Installed extension manifest discovery',status:'skip',detail:'No readable extension manifests found in supported VS Code, Insiders, or Cursor locations. Remote extension hosts and other profiles may have additional installations.'}];
+ if(extensions.length===0)return out.length?out:[{id:'extension-inventory-unavailable',category:'AI agent discovery and configuration',policySection:'3',title:'Installed extension manifest discovery',status:'skip',detail:'No readable extension manifests found in supported VS Code, Insiders, or Cursor locations. Remote extension hosts and other profiles may have additional installations.'}];
+
+ const disallowed=allowed?extensions.filter(e=>!allowed.some(x=>x.toLowerCase()===e.id)):[];
+ out.push({id:'extension-inventory',category:'AI agent discovery and configuration',policySection:'3',title:'Installed extensions',
+  status:allowed?disallowed.length?'fail':'pass':'warn',
+  detail:`${extensions.length} extension${extensions.length===1?'':'s'} installed. `
+   +(allowed?`${disallowed.length} not on the organization extension allowlist.`:'No organization extension allowlist supplied.')
+   +' Installation does not prove activation, publisher authenticity, or whether the extension transmits source code.',
+  evidence:(allowed?disallowed:extensions).map(e=>`${e.id}@${e.version}`).slice(0,100)});
+
+ if(minimumChecked>0)out.push({id:'extension-version',category:'Updates and vulnerability management',policySection:'3',title:'Required extension release versions',
+  status:belowMinimum.length?'fail':unverifiedMinimum.length?'skip':'pass',
+  detail:`${minimumChecked} installed extension${minimumChecked===1?' has':'s have'} a configured minimum release. `
+   +(belowMinimum.length?`${belowMinimum.length} below the required minimum.`:'None below their required minimum.')
+   +(unverifiedMinimum.length?` ${unverifiedMinimum.length} could not be compared (unrecognized release format).`:'')
+   +' Active version and Marketplace provenance were not independently verified.',
+  evidence:[...belowMinimum,...unverifiedMinimum].slice(0,100)});
+
+ return out;
 }
 export function subagentChecks(ctx:AuditContext):Check[]{
  const out:Check[]=[];const files=new Set<string>();

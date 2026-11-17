@@ -30,7 +30,7 @@ test('effective hooks and committed credential patterns are inspected', () => {
  writeFileSync(join(dir, 'leak.txt'), 'token=ghp_' + 'A'.repeat(36)); git('add', '.'); git('-c', 'core.hooksPath=/dev/null', 'commit', '-m', 'fixture');
  const hook = join(dir, '.git/hooks/pre-commit'); writeFileSync(hook, '#!/bin/sh\ngitleaks protect\n'); chmodSync(hook, 0o755);
  const result = repositoryEnforcementChecks({home: dir, repos: [dir], roots: [dir], platform: process.platform, log: () => {}});
- assert.equal(result.find(c => c.id.startsWith('effective-hook-'))?.status, 'warn'); assert.equal(result.find(c => c.id.startsWith('history-'))?.status, 'fail'); assert.ok(!JSON.stringify(result).includes('A'.repeat(36)));
+ assert.equal(result.find(c => c.id === 'effective-hook')?.status, 'warn'); assert.equal(result.find(c => c.id === 'history')?.status, 'fail'); assert.ok(!JSON.stringify(result).includes('A'.repeat(36)));
  } finally { rmSync(dir, {recursive: true, force: true}); }
 });
 

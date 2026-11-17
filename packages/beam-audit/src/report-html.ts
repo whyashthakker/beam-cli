@@ -87,7 +87,7 @@ function matrixSection(matrix: NamedMatrix): string {
 // still shows every check under its categoryFor() home.
 export interface AgentQuestion { id: string; question: string; match: (c: Check) => boolean; }
 export const AGENT_DISCOVERY_QUESTIONS: AgentQuestion[] = [
-  { id: "q-agents-detected", question: "Which AI agents were detected, and where (CLI config vs. editor extension)?", match: c => /^(inventory-|editor-configuration-|extension-inventory-)/.test(c.id) },
+  { id: "q-agents-detected", question: "Which AI agents were detected, and where (CLI config vs. editor extension)?", match: c => /^(inventory-|editor-configuration-|extension-inventory)/.test(c.id) },
   { id: "q-official-client", question: "Are the detected agents official, or could they be unofficial/forked clients?", match: c => c.id.startsWith("3.5-unofficial-client") },
   { id: "q-mcp-count-safety", question: "How many MCP servers are configured, and are they structurally safe (pinned, approved origin, no auto-trust)?", match: c => c.id.startsWith("mcp-") && !c.id.startsWith("mcp-tools-") && c.id !== "mcp-tool-introspection" },
   { id: "q-mcp-tools", question: "What tools does each MCP server expose -- how many are write-mode, and could any read tool reach customer/PII data?", match: c => c.id.startsWith("mcp-tools-") || c.id === "mcp-tool-introspection" },

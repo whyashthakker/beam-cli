@@ -15,3 +15,6 @@ npm-debug.log*
 /stress-report.json
 # Local reference copies of third-party benchmarks; not distributed (see safety-bench/THIRD_PARTY.md)
 /safety-bench/vendor/
+# Per-machine workspace config beam creates on first run (ensureWorkspaceConfig) -- never shared
+# repo state; committing it makes every clone/CI run inherit whatever review policy it holds.
+/.beam/
